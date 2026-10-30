@@ -54,7 +54,7 @@ case "$(uname -m)" in
 esac
 
 if [ "$NO_MENU" != "1" ] && [ ! -r /dev/tty ]; then
-    fail "Interactive terminal is required for installation."
+    fail "Interactive terminal is required."
 fi
 
 if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
@@ -74,11 +74,34 @@ if [ -f "$CONFIG" ]; then
     EXISTING=1
     cp -p "$CONFIG" "$TMP/config.backup.json"
 
-    ROLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("role",""))' "$CONFIG")"
-    NODE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("node_id",""))' "$CONFIG")"
-    OLD_USER="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("admin_username",""))' "$CONFIG")"
-    OLD_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panel_port",0))' "$CONFIG")"
-    OLD_DOMAIN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panel_url",""))' "$CONFIG")"
+    python3 - "$CONFIG" > "$TMP/old-values" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    c = json.load(f)
+
+for key in ("role", "node_id", "admin_username", "panel_url"):
+    value = str(c.get(key, "") or "")
+    print(value.replace("\n", ""))
+
+try:
+    port = int(c.get("panel_port", 0) or 0)
+except (TypeError, ValueError):
+    port = 0
+
+print(port)
+print("yes" if c.get("admin_salt") and c.get("admin_hash") else "no")
+PY
+
+    mapfile -t OLD_VALUES < "$TMP/old-values"
+
+    ROLE="${OLD_VALUES[0]:-}"
+    NODE_ID="${OLD_VALUES[1]:-}"
+    OLD_USER="${OLD_VALUES[2]:-}"
+    OLD_DOMAIN="${OLD_VALUES[3]:-}"
+    OLD_PORT="${OLD_VALUES[4]:-0}"
+    HAS_PASSWORD="${OLD_VALUES[5]:-no}"
 
     [ "$ROLE" = "master" ] || [ "$ROLE" = "agent" ] || fail "Existing role is invalid."
     [ -n "$NODE_ID" ] || fail "Existing Node ID is missing."
@@ -86,11 +109,12 @@ else
     ROLE=""
     NODE_ID=""
     OLD_USER=""
-    OLD_PORT="0"
     OLD_DOMAIN=""
+    OLD_PORT="0"
+    HAS_PASSWORD="no"
 fi
 
-log "Configuring server"
+log "Configuring administrator"
 
 if [ "$EXISTING" -eq 0 ]; then
     [ "$NO_MENU" != "1" ] || fail "First installation requires an interactive terminal."
@@ -107,45 +131,47 @@ if [ "$EXISTING" -eq 0 ]; then
         2) ROLE="agent" ;;
         *) fail "Invalid role." ;;
     esac
+fi
 
+ADMIN_USER="$OLD_USER"
+
+if [ -z "$ADMIN_USER" ]; then
+    [ "$NO_MENU" != "1" ] || fail "Administrator username is missing. Run the installer interactively to repair the configuration."
     read_tty -p "Administrator username: " ADMIN_USER
-    [ -n "$ADMIN_USER" ] || fail "Administrator username is required."
-else
-    ADMIN_USER="$OLD_USER"
 fi
 
-if [ "$EXISTING" -eq 1 ]; then
-    HAS_PASSWORD="$(python3 -c '
-import json,sys
-c=json.load(open(sys.argv[1]))
-print("yes" if c.get("admin_salt") and c.get("admin_hash") else "no")
-' "$CONFIG")"
-else
-    HAS_PASSWORD="no"
-fi
+ADMIN_USER="$(printf '%s' "$ADMIN_USER" | tr -d '\r\n')"
+[ -n "$ADMIN_USER" ] || fail "Administrator username is required."
+[ "${#ADMIN_USER}" -le 64 ] || fail "Administrator username is too long."
 
-if [ "$HAS_PASSWORD" = "yes" ] && [ "$NO_MENU" = "1" ]; then
-    log "Preserving existing administrator credentials"
-elif [ "$HAS_PASSWORD" = "yes" ]; then
-    read_tty -p "Keep existing administrator password? [Y/n]: " KEEP_PASSWORD
-    KEEP_PASSWORD="${KEEP_PASSWORD:-Y}"
-    if [[ "$KEEP_PASSWORD" =~ ^[Yy]$ ]]; then
+KEEP_PASSWORD_FLAG="no"
+
+if [ "$HAS_PASSWORD" = "yes" ]; then
+    if [ "$NO_MENU" = "1" ]; then
         KEEP_PASSWORD_FLAG="yes"
+        log "Preserving existing administrator credentials"
     else
-        KEEP_PASSWORD_FLAG="no"
+        read_tty -p "Keep existing administrator password? [Y/n]: " KEEP_PASSWORD
+        KEEP_PASSWORD="${KEEP_PASSWORD:-Y}"
+
+        if [[ "$KEEP_PASSWORD" =~ ^[Yy]$ ]]; then
+            KEEP_PASSWORD_FLAG="yes"
+        fi
     fi
-else
-    KEEP_PASSWORD_FLAG="no"
 fi
 
-if [ "$EXISTING" -eq 0 ] || [ "${KEEP_PASSWORD_FLAG:-yes}" = "no" ]; then
+if [ "$KEEP_PASSWORD_FLAG" = "no" ]; then
+    [ "$NO_MENU" != "1" ] || fail "Administrator password is missing. Run the installer interactively to complete setup."
+
     echo
     echo "Create administrator password (minimum 12 characters)."
+
     read_secret_tty -p "Password: " ADMIN_PASSWORD
     read_secret_tty -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
 
     [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ] || fail "Passwords do not match."
     [ "${#ADMIN_PASSWORD}" -ge 12 ] || fail "Password must contain at least 12 characters."
+    [ "${#ADMIN_PASSWORD}" -le 1024 ] || fail "Password is too long."
 fi
 
 log "Selecting application port"
@@ -196,21 +222,32 @@ install -m 0755 "${TMP}/${BIN_NAME}" "$BIN"
 
 log "Generating application configuration"
 
-if [ "$HAS_PASSWORD" = "yes" ] && [ "${KEEP_PASSWORD_FLAG:-yes}" = "yes" ]; then
-    python3 - "$CONFIG" "$TMP/config.new.json" "$APP_PORT" <<'PY'
+if [ "$KEEP_PASSWORD_FLAG" = "yes" ]; then
+    # Keep existing password hashes and repair missing configuration fields.
+    python3 - "$CONFIG" "$TMP/config.new.json" "$APP_PORT" "$ADMIN_USER" <<'PY'
 import json
+import os
 import sys
 
-src, dst, port = sys.argv[1:]
+src, dst, port, username = sys.argv[1:]
 with open(src) as f:
     cfg = json.load(f)
 
+cfg["admin_username"] = username
 cfg["panel_port"] = int(port)
 cfg["listen_addr"] = "0.0.0.0:" + port
+
+if not cfg.get("node_id"):
+    raise SystemExit("Existing Node ID is missing.")
+
+if not cfg.get("admin_salt") or not cfg.get("admin_hash"):
+    raise SystemExit("Existing administrator credentials are incomplete.")
 
 with open(dst, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
+
+os.chmod(dst, 0o600)
 PY
     install -m 0600 "$TMP/config.new.json" "$CONFIG"
 else
@@ -226,13 +263,17 @@ else
         || fail "Application configuration failed."
 
     if [ "$EXISTING" -eq 1 ]; then
+        # Preserve the identity of an existing node while repairing its config.
         python3 - "$TMP/config.backup.json" "$NEW_CONFIG" "$TMP/config.merged.json" <<'PY'
 import json
+import os
 import sys
 
 old_path, new_path, output_path = sys.argv
+
 with open(old_path) as f:
     old = json.load(f)
+
 with open(new_path) as f:
     new = json.load(f)
 
@@ -240,9 +281,15 @@ new["role"] = old["role"]
 new["node_id"] = old["node_id"]
 new["created_at"] = old.get("created_at", new.get("created_at"))
 
+# Preserve the previous public URL if one was configured.
+if old.get("panel_url"):
+    new["panel_url"] = old["panel_url"]
+
 with open(output_path, "w") as f:
     json.dump(new, f, indent=2)
     f.write("\n")
+
+os.chmod(output_path, 0o600)
 PY
         install -m 0600 "$TMP/config.merged.json" "$CONFIG"
     else
@@ -255,21 +302,23 @@ chmod 0600 "$CONFIG"
 
 log "Validating configuration"
 
-python3 - "$CONFIG" "$ROLE" "$APP_PORT" <<'PY'
+python3 - "$CONFIG" "$ROLE" "$APP_PORT" "$ADMIN_USER" <<'PY'
 import json
 import sys
 
-path, role, port = sys.argv[1:]
+path, role, port, username = sys.argv[1:]
+
 with open(path) as f:
     cfg = json.load(f)
 
-assert cfg.get("role") == role
-assert cfg.get("node_id")
-assert cfg.get("panel_port") == int(port)
-assert cfg.get("listen_addr") == "0.0.0.0:" + port
-assert cfg.get("admin_username")
-assert cfg.get("admin_salt")
-assert cfg.get("admin_hash")
+assert cfg.get("role") == role, "Role mismatch"
+assert cfg.get("node_id"), "Node ID missing"
+assert cfg.get("panel_port") == int(port), "Panel port mismatch"
+assert cfg.get("listen_addr") == "0.0.0.0:" + port, "Listen address mismatch"
+assert cfg.get("admin_username") == username, "Administrator username mismatch"
+assert cfg.get("admin_salt"), "Administrator salt missing"
+assert cfg.get("admin_hash"), "Administrator hash missing"
+
 print("Configuration validation successful.")
 PY
 
@@ -323,10 +372,10 @@ command -v curl >/dev/null 2>&1 || {
     exit 1
 }
 
-if [ ! -f "$CONFIG" ]; then
+[ -f "$CONFIG" ] || {
     echo "Configuration file not found."
     exit 1
-fi
+}
 
 echo
 echo "Configure domain and automatic HTTPS"
@@ -417,6 +466,7 @@ import os
 import sys
 
 path, domain = sys.argv[1:]
+
 with open(path) as f:
     cfg = json.load(f)
 
@@ -475,6 +525,11 @@ systemctl daemon-reload
 systemctl enable sahand-tunnel
 systemctl restart sahand-tunnel
 
+if ! systemctl is-active --quiet sahand-tunnel; then
+    journalctl -u sahand-tunnel -n 40 --no-pager || true
+    fail "Sahand Tunnel service failed to start."
+fi
+
 echo
 echo "======================================"
 echo "       SAHAND TUNNEL INSTALLED"
@@ -490,7 +545,7 @@ echo "Domain and HTTPS are optional."
 echo "To configure them later, run:"
 echo "  sahand-tunnel menu"
 echo
-echo "Make sure TCP port ${APP_PORT} is allowed in your firewall."
+echo "Allow TCP port ${APP_PORT} in your firewall."
 echo "For HTTPS, also allow TCP ports 80 and 443."
 echo
 echo "Installation completed successfully."
