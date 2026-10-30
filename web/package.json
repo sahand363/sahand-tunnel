@@ -1,10 +1,11 @@
+
 {
   "name": "sahand-tunnel-web",
   "private": true,
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "build": "tsc --noEmit && vite build"
+    "build": "tsc --noEmit && vite build",
     "dev": "vite"
   },
   "dependencies": {
