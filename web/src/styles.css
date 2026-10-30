@@ -447,7 +447,7 @@ select:focus-visible {
 
 .active-carrier-tag {
   color: var(--green);
-  font-weight: 500;
+  font-weight: 600;
 }
 
 .retry-tag {
@@ -677,6 +677,17 @@ select:focus-visible {
   color: var(--accent);
 }
 
+.port-chip {
+  padding: 2px 6px;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--input);
+  border: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
+}
+
 .sec-badge {
   padding: 2px 7px;
   border-radius: 6px;
@@ -725,6 +736,12 @@ select:focus-visible {
 .disc-fail {
   color: var(--muted);
   background: var(--input);
+}
+
+.save-feedback-inline {
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .switch {
@@ -803,6 +820,46 @@ select:focus-visible {
   color: var(--green);
 }
 
+.settings-actions-row {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.save-tunnel-btn {
+  height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 15px;
+  border-radius: 8px;
+  border: 1px solid #368bdb;
+  background: #2679ca;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.18s ease;
+}
+
+.save-tunnel-btn:hover {
+  background: #3288d9;
+}
+
+.save-tunnel-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.save-feedback-text {
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 600;
+}
+
 .analytics-section {
   max-width: 780px;
   margin: 0 auto;
@@ -863,13 +920,60 @@ select:focus-visible {
 }
 
 .chart-card {
-  padding: 24px 20px 18px;
+  padding: 22px 20px 18px;
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 13px;
 }
 
+.chart-layout {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.y-axis-labels {
+  height: 220px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding-bottom: 22px;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 48px;
+  user-select: none;
+}
+
+.chart-plot-area {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.y-grid-lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 198px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  pointer-events: none;
+}
+
+.y-grid-line {
+  width: 100%;
+  border-bottom: 1px dashed var(--border);
+  opacity: 0.65;
+}
+
 .bars-container {
+  position: relative;
+  z-index: 1;
   height: 220px;
   display: flex;
   align-items: flex-end;
