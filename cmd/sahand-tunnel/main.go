@@ -356,6 +356,24 @@ func runServer() error {
 	if cfg.NodeID == "" {
 		return errors.New("node ID is missing from configuration")
 	}
+	if cfg.PanelPort < 20000 || cfg.PanelPort > 60000 {
+	return errors.New("invalid panel port in configuration")
+}
+
+expectedListen := fmt.Sprintf("127.0.0.1:%d", cfg.PanelPort)
+if cfg.ListenAddr != expectedListen {
+	return errors.New("panel listen address does not match configured panel port")
+}
+
+host, _, err := net.SplitHostPort(cfg.ListenAddr)
+if err != nil {
+	return errors.New("invalid panel listen address")
+}
+
+ip := net.ParseIP(host)
+if ip == nil || !ip.IsLoopback() {
+	return errors.New("panel must listen on a loopback address")
+}
 	if cfg.AdminUsername == "" || cfg.AdminSalt == "" || cfg.AdminHash == "" {
 		return errors.New("administrator credentials are missing; run the installer to configure the panel")
 	}
@@ -412,10 +430,29 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+	if err != nil {
+		return "unknown"
 	}
-	return r.RemoteAddr
+
+	peerIP := net.ParseIP(host)
+	if peerIP == nil {
+		return "unknown"
+	}
+
+	// Trust forwarded headers only when the direct peer is loopback.
+	// This is expected when Caddy proxies requests to the local Go server.
+	if peerIP.IsLoopback() {
+		forwarded := r.Header.Get("X-Forwarded-For")
+		if forwarded != "" {
+			parts := strings.Split(forwarded, ",")
+			candidate := strings.TrimSpace(parts[0])
+			if ip := net.ParseIP(candidate); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+
+	return peerIP.String()
 }
 
 func allowLogin(ip string) bool {
@@ -521,10 +558,12 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+
+if err := r.ParseForm(); err != nil {
+	http.Error(w, "invalid request", http.StatusBadRequest)
+	return
+}
 
 	cfg, _, err := loadExistingConfig(configPath())
 	if err != nil {
