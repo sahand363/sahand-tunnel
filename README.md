@@ -1,60 +1,61 @@
 
 # Sahand Tunnel
 
-A modular tunnel management system for connecting multiple servers.
+A lightweight tunnel management system for Ubuntu servers.
 
-## Features
+## Installation
 
-- Master and Agent installation roles
-- Web-based management panel
-- Independent server identity
-- Automatic connection discovery (planned)
-- Multiple TCP and UDP transport methods (planned)
-- Automatic configuration synchronization (planned)
-- Inbound port forwarding (planned)
-- Local server analytics (planned)
+Run the following command on your Ubuntu server:
 
-## Technology
+```bash
+curl -fsSL https://raw.githubusercontent.com/sahand363/sahand-tunnel/main/install.sh | sudo bash
+```
 
-- Go
-- Linux / Ubuntu
-- HTTP API
-- Web Dashboard
+The installer will:
+
+- Detect CPU architecture
+- Download the precompiled binary from GitHub Releases
+- Verify SHA256 checksum
+- Install Sahand Tunnel
+- Configure systemd
+- Open the SSH management menu
+
+## Supported Architectures
+
+- Linux AMD64
+- Linux ARM64
+
+## Installation Roles
+
+- Master
+- Agent
+
+## SSH Management
+
+```bash
+sahand-tunnel menu
+```
+
+## Service Management
+
+```bash
+systemctl status sahand-tunnel
+systemctl restart sahand-tunnel
+systemctl stop sahand-tunnel
+```
+
+## Update
+
+```bash
+sahand-tunnel-update
+```
 
 ## Development
 
-### Install Go
+Builds and releases are handled by GitHub Actions.
 
-Install Go 1.22 or newer.
+No Go compiler is required on production servers.
 
-### Build
+## Project
 
-```bash
-go build -o sahand-tunnel ./cmd/sahand-tunnel
-```
-
-### Initialize Master
-
-```bash
-./sahand-tunnel init --role master
-```
-
-### Initialize Agent
-
-```bash
-./sahand-tunnel init --role agent
-```
-
-### Start
-
-```bash
-./sahand-tunnel serve
-```
-
-Default panel address:
-
-http://127.0.0.1:8080
-
-## License
-
-To be determined.
+https://github.com/sahand363/sahand-tunnel
