@@ -15,6 +15,7 @@ SERVICE="/etc/systemd/system/sahand-tunnel.service"
 CADDYFILE="/etc/caddy/Caddyfile"
 
 NO_MENU="${SAHAND_NO_MENU:-0}"
+
 EXISTING=0
 
 log() {
@@ -98,7 +99,20 @@ if [ "$EXISTING" -eq 0 ]; then
     echo "2. Agent"
     echo
 
-    read -r -p "Select [1]: " ROLE_CHOICE
+    read_tty -p "Select [1]: " ROLE_CHOICE
+    if [ "$NO_MENU" != "1" ] && [ ! -r /dev/tty ]; then
+    echo "Interactive terminal is required for installation." >&2
+    exit 1
+fi
+
+read_tty() {
+    read -r "$@" </dev/tty
+}
+
+read_secret_tty() {
+    read -r -s "$@" </dev/tty
+    echo
+}
     ROLE_CHOICE="${ROLE_CHOICE:-1}"
 
     case "$ROLE_CHOICE" in
@@ -107,7 +121,7 @@ if [ "$EXISTING" -eq 0 ]; then
         *) fail "Invalid role selection." ;;
     esac
 
-    read -r -p "Administrator username: " ADMIN_USER
+    read_tty -p "Administrator username: " ADMIN_USER
     [ -n "$ADMIN_USER" ] || fail "Administrator username is required."
 
 else
@@ -117,10 +131,10 @@ else
         DOMAIN="${OLD_DOMAIN#https://}"
         ADMIN_USER="$OLD_USER"
     else
-        read -r -p "Domain [${OLD_DOMAIN#https://}]: " DOMAIN
+        read_tty -p "Domain [${OLD_DOMAIN#https://}]: " DOMAIN
         DOMAIN="${DOMAIN:-${OLD_DOMAIN#https://}}"
 
-        read -r -p "Administrator username [${OLD_USER}]: " ADMIN_USER
+        read_tty -p "Administrator username [${OLD_USER}]: " ADMIN_USER
         ADMIN_USER="${ADMIN_USER:-$OLD_USER}"
     fi
 
@@ -128,7 +142,7 @@ else
 fi
 
 if [ "$EXISTING" -eq 0 ]; then
-    read -r -p "Enter panel domain (example: panel.example.com): " DOMAIN
+    read_tty -p "Enter panel domain (example: panel.example.com): " DOMAIN
 fi
 
 DOMAIN="${DOMAIN#https://}"
@@ -240,10 +254,8 @@ if [ "$EXISTING" -eq 1 ]; then
         echo
         echo "Create administrator credentials for this existing installation."
 
-        read -r -s -p "New administrator password (minimum 12 characters): " ADMIN_PASSWORD
-        echo
-        read -r -s -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
-        echo
+        read_secret_tty -p "Password: " ADMIN_PASSWORD
+        read_secret_tty -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
 
         [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ] || fail "Passwords do not match."
         [ "${#ADMIN_PASSWORD}" -ge 12 ] || fail "Password must contain at least 12 characters."
@@ -284,10 +296,8 @@ else
     echo
     echo "Create administrator password (minimum 12 characters)."
 
-    read -r -s -p "Password: " ADMIN_PASSWORD
-    echo
-    read -r -s -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
-    echo
+    read_secret_tty -p "Password: " ADMIN_PASSWORD
+    read_secret_tty -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
 
     [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ] || fail "Passwords do not match."
     [ "${#ADMIN_PASSWORD}" -ge 12 ] || fail "Password must contain at least 12 characters."
