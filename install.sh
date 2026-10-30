@@ -254,13 +254,41 @@ install -m 0755 "${TMP}/${BIN_NAME}" "$BIN"
 
 log "Configuring application"
 
+
 if [ "$EXISTING" -eq 1 ]; then
-    # Keep existing identity and password hash.
-    python3 - "$CONFIG" "$TMP/config.new.json" "$PANEL_URL" "$APP_PORT" "$DOMAIN" <<'PY'
+    HAS_PASSWORD="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print("yes" if c.get("admin_salt") and c.get("admin_hash") else "no")' "$CONFIG")"
+
+    if [ "$HAS_PASSWORD" = "no" ]; then
+        [ "$NO_MENU" != "1" ] || fail "Administrator password must be configured interactively before unattended updates."
+
+        echo
+        echo "Create administrator credentials for this existing installation."
+        read -r -p "Administrator username [${OLD_USER:-admin}]: " ADMIN_USER
+        ADMIN_USER="${ADMIN_USER:-${OLD_USER:-admin}}"
+
+        read -r -s -p "New administrator password (minimum 12 characters): " ADMIN_PASSWORD
+        echo
+        read -r -s -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
+        echo
+
+        [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ] || fail "Passwords do not match."
+        [ "${#ADMIN_PASSWORD}" -ge 12 ] || fail "Password must contain at least 12 characters."
+
+        printf '%s\n' "$ADMIN_PASSWORD" | "$BIN" init \
+            --role "$ROLE" \
+            --listen "127.0.0.1:${APP_PORT}" \
+            --panel-url "$PANEL_URL" \
+            --admin-user "$ADMIN_USER" \
+            --admin-password-stdin \
+            || fail "Could not configure administrator credentials."
+
+        unset ADMIN_PASSWORD ADMIN_PASSWORD_CONFIRM
+    else
+        python3 - "$CONFIG" "$TMP/config.new.json" "$PANEL_URL" "$APP_PORT" <<'PY'
 import json
 import sys
 
-src, dst, panel_url, port, domain = sys.argv[1:]
+src, dst, panel_url, port = sys.argv[1:]
 
 with open(src) as f:
     cfg = json.load(f)
@@ -273,7 +301,8 @@ with open(dst, "w") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
 PY
-    install -m 0600 "$TMP/config.new.json" "$CONFIG"
+        install -m 0600 "$TMP/config.new.json" "$CONFIG"
+    fi
 else
     if [ "$NO_MENU" = "1" ]; then
         fail "Cannot perform unattended first installation."
@@ -299,6 +328,7 @@ else
 
     unset ADMIN_PASSWORD ADMIN_PASSWORD_CONFIRM
 fi
+
 
 chmod 0600 "$CONFIG"
 
