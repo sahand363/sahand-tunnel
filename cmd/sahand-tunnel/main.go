@@ -34,14 +34,15 @@ const (
 )
 
 type Config struct {
-	Role          string    `json:"role"`
-	NodeID        string    `json:"node_id"`
-	ListenAddr    string    `json:"listen_addr"`
-	PanelURL      string    `json:"panel_url,omitempty"`
-	AdminUsername string    `json:"admin_username,omitempty"`
-	AdminSalt     string    `json:"admin_salt,omitempty"`
-	AdminHash     string    `json:"admin_hash,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
+    Role          string    `json:"role"`
+    NodeID        string    `json:"node_id"`
+    ListenAddr    string    `json:"listen_addr"`
+    PanelURL      string    `json:"panel_url,omitempty"`
+    PanelPort     int       `json:"panel_port,omitempty"`
+    AdminUsername string    `json:"admin_username,omitempty"`
+    AdminSalt     string    `json:"admin_salt,omitempty"`
+    AdminHash     string    `json:"admin_hash,omitempty"`
+    CreatedAt     time.Time `json:"created_at"`
 }
 
 type NodeInfo struct {
