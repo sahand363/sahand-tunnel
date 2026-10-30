@@ -233,15 +233,17 @@ if ! getent ahostsv4 "$DOMAIN" >/dev/null 2>&1; then
     fail "Domain does not resolve. Configure its DNS A record first."
 fi
 
-SERVER_IP="$(curl -4 -fsS --max-time 10 https://api.ipify.org || true)"
+SERVER_IP="$(curl -4 -fsS --max-time 10 https://api.ipify.org)" \
+    || fail "Could not determine server public IPv4 address."
 
-if [ -n "$SERVER_IP" ]; then
-    if ! getent ahostsv4 "$DOMAIN" \
-        | awk '{print $1}' \
-        | grep -Fxq "$SERVER_IP"; then
+[ -n "$SERVER_IP" ] \
+    || fail "Server public IPv4 address is empty."
 
-        fail "Domain A record does not point to this server's public IPv4 address."
-    fi
+if ! getent ahostsv4 "$DOMAIN" \
+    | awk '{print $1}' \
+    | grep -Fxq "$SERVER_IP"; then
+
+    fail "Domain A record does not point to this server's public IPv4 address."
 fi
 
 # ============================================================
@@ -420,9 +422,6 @@ else
     [ "${#ADMIN_PASSWORD}" -ge 12 ] \
         || fail "Password must contain at least 12 characters."
 
-    # Build into a temporary config so an existing config
-    # is never overwritten by the init command.
-
     NEW_CONFIG="${TMP}/config.generated.json"
 
     printf '%s\n' "$ADMIN_PASSWORD" \
@@ -438,8 +437,6 @@ else
     unset ADMIN_PASSWORD ADMIN_PASSWORD_CONFIRM
 
     if [ "$EXISTING" -eq 1 ]; then
-
-        # Preserve original identity and creation date.
 
         python3 - "$TMP/config.backup.json" "$NEW_CONFIG" "$TMP/config.merged.json" <<'PY'
 import json
