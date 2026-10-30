@@ -230,6 +230,7 @@ import os
 import sys
 
 src, dst, port, username = sys.argv[1:]
+
 with open(src) as f:
     cfg = json.load(f)
 
@@ -269,7 +270,8 @@ import json
 import os
 import sys
 
-old_path, new_path, output_path = sys.argv
+# sys.argv[0] is the Python script name; actual arguments start at index 1.
+old_path, new_path, output_path = sys.argv[1:]
 
 with open(old_path) as f:
     old = json.load(f)
