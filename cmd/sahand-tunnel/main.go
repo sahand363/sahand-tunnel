@@ -25,7 +25,6 @@ import (
 	"io/fs"
 	"log"
 	"math/big"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -301,6 +300,17 @@ func randomHex(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func randomIntN(max int) int {
+	if max <= 0 {
+		return 0
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
+	if err != nil {
+		return 0
+	}
+	return int(n.Int64())
 }
 
 func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
@@ -1365,7 +1375,7 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig) bool {
 	defer tlsConn.Close()
 
 	// Add random-length jitter padding to avoid static handshake fingerprint
-	padLen := 32 + rand.IntN(128)
+	padLen := 32 + randomIntN(128)
 	padHex, _ := randomHex(padLen)
 
 	pkt := SyncPacket{
@@ -1497,7 +1507,7 @@ func startDiscoveryLoop(peerID string) {
 				}
 				// Silent micro-delay between probes to prevent port-scan burst signature
 				if tc.Implemented {
-					time.Sleep(time.Duration(90+rand.IntN(140)) * time.Millisecond)
+					time.Sleep(time.Duration(90+randomIntN(140)) * time.Millisecond)
 				}
 			}
 
@@ -1539,7 +1549,7 @@ func startDiscoveryLoop(peerID string) {
 			}
 
 			// Random retry delay between 10 and 30 minutes per spec
-			retryMins := 10 + rand.IntN(21)
+			retryMins := 10 + randomIntN(21)
 			retryDuration := time.Duration(retryMins) * time.Minute
 			nextRetry := time.Now().UTC().Add(retryDuration)
 			updatedPeer.Status = "RETRY SCHEDULED"
