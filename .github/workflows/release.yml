@@ -17,19 +17,34 @@ permissions:
 
 jobs:
   test:
-    name: Test
+    name: Frontend and Go Tests
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.22.x"
 
-      - name: Run tests
+      - name: Run Go tests
         run: go test ./...
 
   build:
@@ -43,6 +58,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm install
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
 
       - name: Setup Go
         uses: actions/setup-go@v5
