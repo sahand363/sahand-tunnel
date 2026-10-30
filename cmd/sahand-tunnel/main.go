@@ -298,6 +298,125 @@ func handleDashboard(cfg Config) http.HandlerFunc {
 	}
 }
 
+
+func runMenu() {
+	reader := bufio.NewReader(os.Stdin)
+
+	for {
+		fmt.Println()
+		fmt.Println("================================")
+		fmt.Println("       SAHAND TUNNEL")
+		fmt.Println("================================")
+
+		cfg, err := loadConfig(configPath())
+
+		if err != nil {
+			fmt.Println("Installation: NOT CONFIGURED")
+		} else {
+			fmt.Println("Role:", strings.ToUpper(cfg.Role))
+			fmt.Println("Node ID:", cfg.NodeID)
+		}
+
+		fmt.Println("Version:", AppVersion)
+		fmt.Println("--------------------------------")
+		fmt.Println("1. Configure Installation")
+		fmt.Println("2. Start Service")
+		fmt.Println("3. Restart Service")
+		fmt.Println("4. Stop Service")
+		fmt.Println("5. Service Status")
+		fmt.Println("6. View Logs")
+		fmt.Println("7. Update")
+		fmt.Println("0. Exit")
+		fmt.Println("--------------------------------")
+		fmt.Print("Select option: ")
+
+		choice, _ := reader.ReadString('\n')
+		choice = strings.TrimSpace(choice)
+
+		switch choice {
+		case "1":
+			if _, err := os.Stat(configPath()); err == nil {
+				fmt.Println("Configuration already exists.")
+				fmt.Println("Role changes are not supported from this menu.")
+				break
+			}
+
+			fmt.Println()
+			fmt.Println("Select installation role:")
+			fmt.Println("1. Master")
+			fmt.Println("2. Agent")
+			fmt.Print("Role: ")
+
+			role, _ := reader.ReadString('\n')
+			role = strings.TrimSpace(role)
+
+			switch role {
+			case "1":
+				runInit([]string{"--role", "master"})
+			case "2":
+				runInit([]string{"--role", "agent"})
+			default:
+				fmt.Println("Invalid role.")
+			}
+
+		case "2":
+			runSystemctl("enable", "--now", "sahand-tunnel")
+
+		case "3":
+			runSystemctl("restart", "sahand-tunnel")
+
+		case "4":
+			runSystemctl("stop", "sahand-tunnel")
+
+		case "5":
+			runSystemctl("status", "sahand-tunnel")
+
+		case "6":
+			cmd := exec.Command(
+				"journalctl",
+				"-u", "sahand-tunnel",
+				"-n", "50",
+				"--no-pager",
+			)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			_ = cmd.Run()
+
+		case "7":
+			cmd := exec.Command(
+				"/usr/local/bin/sahand-tunnel-update",
+			)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Println("Update failed:", err)
+			}
+
+		case "0":
+			fmt.Println("Goodbye.")
+			return
+
+		default:
+			fmt.Println("Invalid option.")
+		}
+
+		fmt.Println()
+		fmt.Print("Press Enter to continue...")
+		_, _ = reader.ReadString('\n')
+	}
+}
+
+func runSystemctl(args ...string) {
+	cmd := exec.Command("systemctl", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		fmt.Println("Service command failed:", err)
+	}
+}
+
+
 const dashboardHTML = `
 <!DOCTYPE html>
 <html lang="en">
