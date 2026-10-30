@@ -20,10 +20,9 @@ import (
 	"time"
 )
 
-const (
-	AppName    = "sahand-tunnel"
-	AppVersion = "0.1.0"
-)
+const AppName = "sahand-tunnel"
+
+var AppVersion = "0.1.0"
 
 type Config struct {
 	Role       string    `json:"role"`
