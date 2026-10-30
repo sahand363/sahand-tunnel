@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 REPO="sahand363/sahand-tunnel"
 VERSION_URL="https://github.com/${REPO}/releases/download/dev"
+RAW_INSTALLER="https://raw.githubusercontent.com/${REPO}/main/install.sh"
 
 BIN="/usr/local/bin/sahand-tunnel"
 CONFIG_DIR="/etc/sahand-tunnel"
@@ -12,12 +13,9 @@ CONFIG="${CONFIG_DIR}/config.json"
 
 SERVICE="/etc/systemd/system/sahand-tunnel.service"
 CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_SERVICE="/etc/systemd/system/caddy.service"
 
-APP_PORT=""
-DOMAIN=""
-ADMIN_USER=""
 NO_MENU="${SAHAND_NO_MENU:-0}"
+EXISTING=0
 
 log() {
     echo
@@ -34,9 +32,7 @@ if [ "$EUID" -ne 0 ]; then
     fail "Please run this installer as root."
 fi
 
-if [ "$(uname -s)" != "Linux" ]; then
-    fail "Only Linux is supported."
-fi
+[ "$(uname -s)" = "Linux" ] || fail "Only Linux is supported."
 
 if [ -f /etc/os-release ]; then
     . /etc/os-release
@@ -54,173 +50,154 @@ esac
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 
 if ! command -v curl >/dev/null 2>&1; then
-    log "Installing curl and certificates"
     apt-get update
     apt-get install -y curl ca-certificates
 fi
 
-TMP="$(mktemp -d)"
-BACKUP=""
+if ! command -v python3 >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y python3
+fi
 
-cleanup() {
-    rm -rf "$TMP"
-}
-trap cleanup EXIT
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"
-chmod 700 "$CONFIG_DIR" "$DATA_DIR"
+chmod 0700 "$CONFIG_DIR" "$DATA_DIR"
 
 log "Checking existing installation"
 
-EXISTING=0
-
 if [ -f "$CONFIG" ]; then
     EXISTING=1
-    cp "$CONFIG" "$TMP/config.backup.json"
+
+    cp -p "$CONFIG" "$TMP/config.backup.json"
 
     ROLE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("role",""))' "$CONFIG")"
     NODE_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("node_id",""))' "$CONFIG")"
     OLD_DOMAIN="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panel_url",""))' "$CONFIG")"
     OLD_USER="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("admin_username",""))' "$CONFIG")"
+    OLD_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panel_port",0))' "$CONFIG")"
 
-    if [ -z "$ROLE" ] || [ -z "$NODE_ID" ]; then
-        fail "Existing configuration is incomplete. Backup it before continuing."
-    fi
+    [ "$ROLE" = "master" ] || [ "$ROLE" = "agent" ] || fail "Existing role is invalid."
+    [ -n "$NODE_ID" ] || fail "Existing Node ID is missing."
 else
     ROLE=""
     NODE_ID=""
     OLD_DOMAIN=""
     OLD_USER=""
+    OLD_PORT="0"
 fi
 
-log "Panel access configuration"
+log "Configuring server role"
 
-if [ "$NO_MENU" = "1" ] && [ "$EXISTING" -eq 1 ]; then
-    DOMAIN="${OLD_DOMAIN#https://}"
-    ADMIN_USER="$OLD_USER"
+if [ "$EXISTING" -eq 0 ]; then
+    [ "$NO_MENU" != "1" ] || fail "First installation requires an interactive terminal."
 
-    [ -n "$DOMAIN" ] || fail "Existing panel domain is missing."
-    [ -n "$ADMIN_USER" ] || fail "Existing administrator username is missing."
-else
-    echo "Choose panel access method:"
-    echo "1. Domain + valid HTTPS"
-    echo "2. Server IP + HTTPS (not available yet)"
+    echo "Select server role:"
+    echo "1. Master"
+    echo "2. Agent"
     echo
 
-    read -r -p "Select [1]: " ACCESS_METHOD
-    ACCESS_METHOD="${ACCESS_METHOD:-1}"
+    read -r -p "Select [1]: " ROLE_CHOICE
+    ROLE_CHOICE="${ROLE_CHOICE:-1}"
 
-    [ "$ACCESS_METHOD" = "1" ] || fail "Only Domain + HTTPS is supported in this release."
+    case "$ROLE_CHOICE" in
+        1) ROLE="master" ;;
+        2) ROLE="agent" ;;
+        *) fail "Invalid role selection." ;;
+    esac
 
-    if [ "$EXISTING" -eq 1 ]; then
+    read -r -p "Administrator username: " ADMIN_USER
+    [ -n "$ADMIN_USER" ] || fail "Administrator username is required."
+
+else
+    log "Existing role: ${ROLE}"
+
+    if [ "$NO_MENU" = "1" ]; then
+        DOMAIN="${OLD_DOMAIN#https://}"
+        ADMIN_USER="$OLD_USER"
+    else
         read -r -p "Domain [${OLD_DOMAIN#https://}]: " DOMAIN
         DOMAIN="${DOMAIN:-${OLD_DOMAIN#https://}}"
-    else
-        read -r -p "Enter your panel domain (example: panel.example.com): " DOMAIN
-    fi
 
-    DOMAIN="${DOMAIN#https://}"
-    DOMAIN="${DOMAIN#http://}"
-    DOMAIN="${DOMAIN%%/*}"
-    DOMAIN="${DOMAIN%%:*}"
-
-    [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || fail "Invalid domain name."
-    [[ "$DOMAIN" == *.* ]] || fail "Enter a fully qualified domain name."
-
-    if [ "$EXISTING" -eq 1 ]; then
         read -r -p "Administrator username [${OLD_USER}]: " ADMIN_USER
         ADMIN_USER="${ADMIN_USER:-$OLD_USER}"
-    else
-        read -r -p "Administrator username: " ADMIN_USER
     fi
 
-    [ -n "$ADMIN_USER" ] || fail "Administrator username is required."
+    [ -n "$ADMIN_USER" ] || fail "Administrator username is missing."
 fi
+
+if [ "$EXISTING" -eq 0 ]; then
+    read -r -p "Enter panel domain (example: panel.example.com): " DOMAIN
+fi
+
+DOMAIN="${DOMAIN#https://}"
+DOMAIN="${DOMAIN#http://}"
+DOMAIN="${DOMAIN%%/*}"
+DOMAIN="${DOMAIN%%:*}"
+DOMAIN="${DOMAIN,,}"
+
+[[ "$DOMAIN" =~ ^[a-z0-9.-]+$ ]] || fail "Invalid domain."
+[[ "$DOMAIN" == *.* ]] || fail "Enter a fully qualified domain name."
 
 PANEL_URL="https://${DOMAIN}"
 
-log "Checking DNS"
+if [ "$NO_MENU" = "1" ] && [ "$EXISTING" -eq 1 ]; then
+    [ -n "$OLD_DOMAIN" ] || fail "Existing panel domain is missing."
+fi
 
-python3 - "$DOMAIN" <<'PY'
-import socket
-import sys
+log "Checking domain DNS"
 
-domain = sys.argv[1]
-
-try:
-    addresses = sorted({
-        item[4][0]
-        for item in socket.getaddrinfo(domain, None)
-    })
-except Exception as exc:
-    print("DNS lookup failed:", exc)
-    sys.exit(1)
-
-if not addresses:
-    print("No DNS records found.")
-    sys.exit(1)
-
-print("Resolved addresses:")
-for address in addresses:
-    print(" -", address)
-PY
-
-DNS_RESULT=$?
-
-if [ "$DNS_RESULT" -ne 0 ]; then
-    fail "Domain DNS is not resolving. Configure its A record and try again."
+if ! getent ahostsv4 "$DOMAIN" >/dev/null 2>&1; then
+    fail "Domain does not resolve. Configure its DNS A record first."
 fi
 
 SERVER_IP="$(curl -4 -fsS --max-time 10 https://api.ipify.org || true)"
 
 if [ -n "$SERVER_IP" ]; then
-    if ! python3 - "$DOMAIN" "$SERVER_IP" <<'PY'
-import socket
-import sys
-
-domain, server_ip = sys.argv[1], sys.argv[2]
-
-try:
-    ips = {
-        item[4][0]
-        for item in socket.getaddrinfo(domain, None)
-    }
-except Exception:
-    sys.exit(1)
-
-if server_ip not in ips:
-    print("Warning: domain does not resolve to this server's IPv4 address.")
-    print("Expected:", server_ip)
-    print("Found:", ", ".join(sorted(ips)))
-    sys.exit(1)
-PY
-    then
-        fail "Domain A record does not point to this server."
+    if ! getent ahostsv4 "$DOMAIN" | awk '{print $1}' | grep -Fxq "$SERVER_IP"; then
+        fail "Domain A record does not point to this server's public IPv4 address."
     fi
 fi
 
-log "Selecting persistent random panel port"
+log "Selecting persistent application port"
 
-if [ "$EXISTING" -eq 1 ]; then
-    APP_PORT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("panel_port",""))' "$CONFIG")"
+if [[ "$OLD_PORT" =~ ^[0-9]+$ ]] && [ "$OLD_PORT" -ge 20000 ] && [ "$OLD_PORT" -le 60000 ]; then
+    APP_PORT="$OLD_PORT"
+else
+    APP_PORT="$(python3 - <<'PY'
+import random
+import socket
+
+for _ in range(100):
+    port = random.randint(20000, 60000)
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", port))
+        print(port)
+        break
+    except OSError:
+        pass
+    finally:
+        s.close()
+else:
+    raise SystemExit("Could not find an available port")
+PY
+)" || fail "Could not select an application port."
 fi
 
-if ! [[ "$APP_PORT" =~ ^[0-9]+$ ]] || [ "$APP_PORT" -lt 20000 ] || [ "$APP_PORT" -gt 60000 ]; then
-    APP_PORT="$(shuf -i 20000-60000 -n 1)"
-fi
-
-echo "Local application port: ${APP_PORT}"
+echo "Application port: ${APP_PORT}"
 
 log "Installing required packages"
 
 apt-get update
-apt-get install -y curl ca-certificates gnupg debian-keyring debian-archive-keyring apt-transport-https python3
+apt-get install -y curl ca-certificates python3 gnupg debian-keyring debian-archive-keyring apt-transport-https
 
 if ! command -v caddy >/dev/null 2>&1; then
     log "Installing Caddy"
 
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 
     curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
         -o /etc/apt/sources.list.d/caddy-stable.list
@@ -232,28 +209,27 @@ if ! command -v caddy >/dev/null 2>&1; then
     apt-get install -y caddy
 fi
 
-log "Downloading Sahand Tunnel"
+log "Downloading application"
 
 BIN_NAME="sahand-tunnel-linux-${ARCH}"
 
 curl -fL "${VERSION_URL}/${BIN_NAME}" -o "${TMP}/${BIN_NAME}" \
-    || fail "Could not download application binary."
+    || fail "Application download failed."
 
 curl -fL "${VERSION_URL}/SHA256SUMS" -o "${TMP}/SHA256SUMS" \
-    || fail "Could not download checksum file."
+    || fail "Checksum download failed."
 
 grep -E "  ${BIN_NAME}$" "${TMP}/SHA256SUMS" > "${TMP}/checksum" \
-    || fail "Binary checksum not found."
+    || fail "Checksum entry not found."
 
 (
     cd "$TMP"
     sha256sum -c checksum
-) || fail "Binary checksum verification failed."
+) || fail "Checksum verification failed."
 
 install -m 0755 "${TMP}/${BIN_NAME}" "$BIN"
 
 log "Configuring application"
-
 
 if [ "$EXISTING" -eq 1 ]; then
     HAS_PASSWORD="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print("yes" if c.get("admin_salt") and c.get("admin_hash") else "no")' "$CONFIG")"
@@ -263,8 +239,6 @@ if [ "$EXISTING" -eq 1 ]; then
 
         echo
         echo "Create administrator credentials for this existing installation."
-        read -r -p "Administrator username [${OLD_USER:-admin}]: " ADMIN_USER
-        ADMIN_USER="${ADMIN_USER:-${OLD_USER:-admin}}"
 
         read -r -s -p "New administrator password (minimum 12 characters): " ADMIN_PASSWORD
         echo
@@ -280,9 +254,10 @@ if [ "$EXISTING" -eq 1 ]; then
             --panel-url "$PANEL_URL" \
             --admin-user "$ADMIN_USER" \
             --admin-password-stdin \
-            || fail "Could not configure administrator credentials."
+            || fail "Administrator configuration failed."
 
         unset ADMIN_PASSWORD ADMIN_PASSWORD_CONFIRM
+
     else
         python3 - "$CONFIG" "$TMP/config.new.json" "$PANEL_URL" "$APP_PORT" <<'PY'
 import json
@@ -303,13 +278,11 @@ with open(dst, "w") as f:
 PY
         install -m 0600 "$TMP/config.new.json" "$CONFIG"
     fi
-else
-    if [ "$NO_MENU" = "1" ]; then
-        fail "Cannot perform unattended first installation."
-    fi
 
+else
     echo
     echo "Create administrator password (minimum 12 characters)."
+
     read -r -s -p "Password: " ADMIN_PASSWORD
     echo
     read -r -s -p "Confirm password: " ADMIN_PASSWORD_CONFIRM
@@ -319,7 +292,7 @@ else
     [ "${#ADMIN_PASSWORD}" -ge 12 ] || fail "Password must contain at least 12 characters."
 
     printf '%s\n' "$ADMIN_PASSWORD" | "$BIN" init \
-        --role "${ROLE:-master}" \
+        --role "$ROLE" \
         --listen "127.0.0.1:${APP_PORT}" \
         --panel-url "$PANEL_URL" \
         --admin-user "$ADMIN_USER" \
@@ -327,12 +300,29 @@ else
         || fail "Application configuration failed."
 
     unset ADMIN_PASSWORD ADMIN_PASSWORD_CONFIRM
-fi
 
+    python3 - "$CONFIG" "$TMP/config.new.json" "$APP_PORT" <<'PY'
+import json
+import sys
+
+src, dst, port = sys.argv[1:]
+
+with open(src) as f:
+    cfg = json.load(f)
+
+cfg["panel_port"] = int(port)
+
+with open(dst, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+PY
+
+    install -m 0600 "$TMP/config.new.json" "$CONFIG"
+fi
 
 chmod 0600 "$CONFIG"
 
-log "Creating application service"
+log "Creating systemd service"
 
 cat > "$SERVICE" <<EOF
 [Unit]
@@ -358,7 +348,7 @@ ReadWritePaths=${DATA_DIR} ${CONFIG_DIR}
 WantedBy=multi-user.target
 EOF
 
-log "Configuring Caddy HTTPS reverse proxy"
+log "Configuring Caddy"
 
 mkdir -p /etc/caddy
 
@@ -371,12 +361,10 @@ EOF
 
 chmod 0644 "$CADDYFILE"
 
-log "Validating Caddy configuration"
-
 caddy validate --config "$CADDYFILE" --adapter caddyfile \
     || fail "Caddy configuration validation failed."
 
-log "Starting application and Caddy"
+log "Starting services"
 
 systemctl daemon-reload
 systemctl enable sahand-tunnel
@@ -385,13 +373,12 @@ systemctl restart sahand-tunnel
 systemctl enable caddy
 systemctl restart caddy
 
-log "Waiting for HTTPS certificate"
+log "Waiting for HTTPS and application health"
 
 CERT_OK=0
 
 for i in $(seq 1 60); do
-    if curl -fsS --max-time 5 "https://${DOMAIN}/api/v1/health" \
-        -o "$TMP/health.json"; then
+    if curl -fsS --max-time 5 "https://${DOMAIN}/api/v1/health" -o "$TMP/health.json"; then
         if grep -q '"status":"ok"' "$TMP/health.json"; then
             CERT_OK=1
             break
@@ -404,18 +391,16 @@ if [ "$CERT_OK" -ne 1 ]; then
     echo
     echo "Caddy logs:"
     journalctl -u caddy -n 50 --no-pager || true
-    fail "HTTPS certificate or panel health check failed. Panel is not ready."
+    fail "HTTPS certificate or application health check failed."
 fi
 
-log "Installing update helper"
+log "Installing update command"
 
-cat > /usr/local/bin/sahand-tunnel-update <<'EOF'
+cat > /usr/local/bin/sahand-tunnel-update <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-curl -fsSL \
-  https://raw.githubusercontent.com/sahand363/sahand-tunnel/main/install.sh \
-  | SAHAND_NO_MENU=1 bash
+curl -fsSL "${RAW_INSTALLER}" | SAHAND_NO_MENU=1 bash
 EOF
 
 chmod 0755 /usr/local/bin/sahand-tunnel-update
@@ -426,16 +411,20 @@ echo "       SAHAND TUNNEL INSTALLED"
 echo "======================================"
 echo
 echo "Panel: ${PANEL_URL}"
+echo "Role: ${ROLE}"
 echo "Application port: ${APP_PORT}"
-echo "Role: ${ROLE:-master}"
 echo
-echo "Service status:"
+
 systemctl is-active sahand-tunnel
 systemctl is-active caddy
+
+echo
+echo "Installation completed successfully."
 echo
 
 if [ "$NO_MENU" != "1" ]; then
     export SAHAND_CONFIG="$CONFIG"
+
     if [ -r /dev/tty ]; then
         exec "$BIN" menu </dev/tty
     else
