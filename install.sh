@@ -251,6 +251,7 @@ if [ "$EXISTING" -eq 1 ]; then
         printf '%s\n' "$ADMIN_PASSWORD" | "$BIN" init \
             --role "$ROLE" \
             --listen "127.0.0.1:${APP_PORT}" \
+            --panel-port "$APP_PORT" \
             --panel-url "$PANEL_URL" \
             --admin-user "$ADMIN_USER" \
             --admin-password-stdin \
@@ -294,6 +295,7 @@ else
     printf '%s\n' "$ADMIN_PASSWORD" | "$BIN" init \
         --role "$ROLE" \
         --listen "127.0.0.1:${APP_PORT}" \
+        --panel-port "$APP_PORT" \
         --panel-url "$PANEL_URL" \
         --admin-user "$ADMIN_USER" \
         --admin-password-stdin \
