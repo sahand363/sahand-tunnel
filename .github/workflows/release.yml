@@ -1,0 +1,67 @@
+
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Linux Binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: |
+          mkdir -p dist
+
+          for ARCH in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$ARCH \
+            go build \
+              -trimpath \
+              -ldflags="-s -w -X main.AppVersion=${GITHUB_REF_NAME}" \
+              -o dist/sahand-tunnel-linux-$ARCH \
+              ./cmd/sahand-tunnel
+          done
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          sha256sum sahand-tunnel-linux-* > SHA256SUMS
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sahand-tunnel-linux
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/* \
+            --title "Sahand Tunnel ${GITHUB_REF_NAME}" \
+            --generate-notes
