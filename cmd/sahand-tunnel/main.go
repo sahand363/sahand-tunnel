@@ -20,6 +20,7 @@ import (
 	"time"
 	"bufio"
     "os/exec"
+	"io"
 )
 
 const AppName = "sahand-tunnel"
@@ -330,8 +331,17 @@ func runMenu() {
 		fmt.Println("--------------------------------")
 		fmt.Print("Select option: ")
 
-		choice, _ := reader.ReadString('\n')
-		choice = strings.TrimSpace(choice)
+		choice, err := reader.ReadString('\n')
+if err != nil {
+    if err == io.EOF {
+        fmt.Println("\nInput closed. Exiting menu.")
+    } else {
+        fmt.Println("\nInput error:", err)
+    }
+    return
+}
+
+choice = strings.TrimSpace(choice)
 
 		switch choice {
 		case "1":
@@ -347,8 +357,12 @@ func runMenu() {
 			fmt.Println("2. Agent")
 			fmt.Print("Role: ")
 
-			role, _ := reader.ReadString('\n')
-			role = strings.TrimSpace(role)
+			role, err := reader.ReadString('\n')
+if err != nil {
+    fmt.Println("Could not read installation role:", err)
+    return
+}
+role = strings.TrimSpace(role)
 
 			switch role {
 			case "1":
