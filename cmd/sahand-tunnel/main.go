@@ -3,48 +3,45 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"html/template"
+	"html"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
-const AppName = "sahand-tunnel"
-
-var AppVersion = "0.2.0"
-
 const (
-	sessionCookie = "sahand_session"
-	sessionTTL    = 12 * time.Hour
-	passwordRounds = 200000
+	AppName       = "sahand-tunnel"
+	AppVersion    = "0.2.1"
+	defaultListen = "127.0.0.1:18080"
+	passwordRounds = 310000
+	sessionTTL     = 12 * time.Hour
 )
 
 type Config struct {
-	Role           string    `json:"role"`
-	NodeID         string    `json:"node_id"`
-	ListenAddr     string    `json:"listen_addr"`
-	PanelURL       string    `json:"panel_url,omitempty"`
-	AdminUsername  string    `json:"admin_username,omitempty"`
-	AdminSalt      string    `json:"admin_salt,omitempty"`
-	AdminHash      string    `json:"admin_hash,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	Role          string    `json:"role"`
+	NodeID        string    `json:"node_id"`
+	ListenAddr    string    `json:"listen_addr"`
+	PanelURL      string    `json:"panel_url,omitempty"`
+	AdminUsername string    `json:"admin_username,omitempty"`
+	AdminSalt     string    `json:"admin_salt,omitempty"`
+	AdminHash     string    `json:"admin_hash,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type NodeInfo struct {
@@ -52,16 +49,20 @@ type NodeInfo struct {
 	Role       string `json:"role"`
 	NodeID     string `json:"node_id"`
 	Status     string `json:"status"`
+	PanelURL   string `json:"panel_url"`
 }
 
 type Session struct {
 	ExpiresAt time.Time
 }
 
-var sessions = struct {
-	sync.Mutex
-	items map[string]Session
-}{items: make(map[string]Session)}
+var (
+	sessionsMu sync.Mutex
+	sessions   = make(map[string]Session)
+
+	loginMu sync.Mutex
+	loginAttempts = make(map[string][]time.Time)
+)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -70,136 +71,235 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "version":
+		fmt.Printf("%s %s\n", AppName, AppVersion)
+
+	case "init":
+		if err := runInit(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+
+	case "serve":
+		if err := runServer(); err != nil {
+			log.Fatal(err)
+		}
+
 	case "menu":
 		runMenu()
-	case "init":
-		runInit(os.Args[2:])
-	case "serve":
-		runServer()
-	case "version":
-		fmt.Println(AppName, AppVersion)
+
 	default:
 		printUsage()
+		os.Exit(1)
 	}
 }
 
 func printUsage() {
-	fmt.Println(AppName, AppVersion)
+	fmt.Println("Sahand Tunnel")
 	fmt.Println()
-	fmt.Println("Commands:")
-	fmt.Println("  init --role master|agent")
-	fmt.Println("  serve")
-	fmt.Println("  menu")
-	fmt.Println("  version")
+	fmt.Println("Usage:")
+	fmt.Println("  sahand-tunnel init [options]")
+	fmt.Println("  sahand-tunnel serve")
+	fmt.Println("  sahand-tunnel menu")
+	fmt.Println("  sahand-tunnel version")
 }
 
 func configPath() string {
-	path := os.Getenv("SAHAND_CONFIG")
-	if path == "" {
-		path = "./data/config.json"
+	if p := os.Getenv("SAHAND_CONFIG"); p != "" {
+		return p
 	}
-	return path
+	return "./data/config.json"
 }
 
-func randomHex(size int) (string, error) {
-	data := make([]byte, size)
-	if _, err := rand.Read(data); err != nil {
+func randomHex(bytesCount int) (string, error) {
+	b := make([]byte, bytesCount)
+	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(data), nil
+	return hex.EncodeToString(b), nil
 }
 
-func generateNodeID() (string, error) {
-	return randomHex(16)
-}
+// PBKDF2-HMAC-SHA256 implementation.
+func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
+	const hashLen = 32
+	blocks := (keyLen + hashLen - 1) / hashLen
+	result := make([]byte, 0, blocks*hashLen)
 
-// Password hashing using an iterated HMAC-SHA256 construction.
-func passwordHash(password, salt string) string {
-	key := []byte(password)
-	saltBytes := []byte(salt)
+	for block := 1; block <= blocks; block++ {
+		mac := hmac.New(sha256.New, password)
+		mac.Write(salt)
+		mac.Write([]byte{
+			byte(block >> 24),
+			byte(block >> 16),
+			byte(block >> 8),
+			byte(block),
+		})
+		u := mac.Sum(nil)
+		t := make([]byte, len(u))
+		copy(t, u)
 
-	mac := hmac.New(sha256.New, key)
-	mac.Write(saltBytes)
-	result := mac.Sum(nil)
-
-	for i := 1; i < passwordRounds; i++ {
-		mac = hmac.New(sha256.New, key)
-		mac.Write(result)
-		result = mac.Sum(nil)
+		for i := 1; i < iterations; i++ {
+			mac = hmac.New(sha256.New, password)
+			mac.Write(u)
+			u = mac.Sum(nil)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		result = append(result, t...)
 	}
 
-	return hex.EncodeToString(result)
+	return result[:keyLen]
 }
 
-func runInit(args []string) {
-	fs := flag.NewFlagSet("init", flag.ExitOnError)
+func hashPassword(password string) (string, string, error) {
+	salt, err := randomHex(16)
+	if err != nil {
+		return "", "", err
+	}
+
+	saltBytes, err := hex.DecodeString(salt)
+	if err != nil {
+		return "", "", err
+	}
+
+	hash := pbkdf2SHA256([]byte(password), saltBytes, passwordRounds, 32)
+	return salt, hex.EncodeToString(hash), nil
+}
+
+func verifyPassword(password, saltHex, hashHex string) bool {
+	salt, err := hex.DecodeString(saltHex)
+	if err != nil {
+		return false
+	}
+
+	expected, err := hex.DecodeString(hashHex)
+	if err != nil || len(expected) != 32 {
+		return false
+	}
+
+	actual := pbkdf2SHA256([]byte(password), salt, passwordRounds, 32)
+	return subtle.ConstantTimeCompare(actual, expected) == 1
+}
+
+func readPasswordFromStdin() (string, error) {
+	reader := bufio.NewReader(os.Stdin)
+	password, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	password = strings.TrimRight(password, "\r\n")
+
+	if len(password) < 12 {
+		return "", errors.New("administrator password must contain at least 12 characters")
+	}
+	if len(password) > 1024 {
+		return "", errors.New("administrator password is too long")
+	}
+	return password, nil
+}
+
+func loadExistingConfig(path string) (Config, bool, error) {
+	var cfg Config
+
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cfg, false, nil
+	}
+	if err != nil {
+		return cfg, false, err
+	}
+
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, false, fmt.Errorf("cannot read existing configuration: %w", err)
+	}
+
+	return cfg, true, nil
+}
+
+func runInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 
 	role := fs.String("role", "", "master or agent")
-	addr := fs.String("listen", "127.0.0.1:18080", "Internal listen address")
-	panelURL := fs.String("panel-url", "", "Public panel URL")
-	adminUser := fs.String("admin-user", "", "Administrator username")
-	adminPassword := fs.String("admin-password", "", "Administrator password")
+	listen := fs.String("listen", defaultListen, "local application listen address")
+	panelURL := fs.String("panel-url", "", "public HTTPS panel URL")
+	adminUser := fs.String("admin-user", "", "administrator username")
+	passwordStdin := fs.Bool("admin-password-stdin", false, "read administrator password from stdin")
 
-	_ = fs.Parse(args)
-
-	*role = strings.ToLower(strings.TrimSpace(*role))
-	*adminUser = strings.TrimSpace(*adminUser)
-
-	if *role != "master" && *role != "agent" {
-		log.Fatal("Invalid role. Use master or agent.")
-	}
-
-	if *adminUser == "" || len(*adminPassword) < 12 {
-		log.Fatal("Administrator username and a password of at least 12 characters are required.")
-	}
-
-	if strings.TrimSpace(*panelURL) == "" {
-		log.Fatal("Panel URL is required.")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
 
 	path := configPath()
-
-	if _, err := os.Stat(path); err == nil {
-		log.Fatal("Configuration already exists. Refusing to overwrite.")
-	}
-
-	nodeID, err := generateNodeID()
+	cfg, exists, err := loadExistingConfig(path)
 	if err != nil {
-		log.Fatal(err)
-	}
-
-	salt, err := randomHex(16)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	cfg := Config{
-		Role:          *role,
-		NodeID:        nodeID,
-		ListenAddr:    *addr,
-		PanelURL:      strings.TrimRight(*panelURL, "/"),
-		AdminUsername: *adminUser,
-		AdminSalt:     salt,
-		AdminHash:     passwordHash(*adminPassword, salt),
-		CreatedAt:     time.Now().UTC(),
-	}
-
-	if err := saveConfig(path, cfg); err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("Installation initialized successfully.")
-	fmt.Println("Role:", cfg.Role)
-	fmt.Println("Node ID:", cfg.NodeID)
-	fmt.Println("Panel:", cfg.PanelURL)
-	fmt.Println("Config:", path)
-}
-
-func saveConfig(path string, cfg Config) error {
-	dir := filepath.Dir(path)
-
-	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
+	}
+
+	// Preserve the identity of an existing installation.
+	if !exists {
+		cfg.CreatedAt = time.Now().UTC()
+		cfg.NodeID, err = randomHex(16)
+		if err != nil {
+			return err
+		}
+	}
+
+	if *role != "" {
+		if *role != "master" && *role != "agent" {
+			return errors.New("role must be master or agent")
+		}
+		cfg.Role = *role
+	}
+	if cfg.Role == "" {
+		return errors.New("role is required: use --role master or --role agent")
+	}
+
+	if *listen != "" {
+		cfg.ListenAddr = *listen
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = defaultListen
+	}
+
+	if *panelURL != "" {
+		cfg.PanelURL = strings.TrimRight(*panelURL, "/")
+	}
+	if !strings.HasPrefix(cfg.PanelURL, "https://") {
+		return errors.New("a public HTTPS panel URL is required")
+	}
+
+	if *adminUser != "" {
+		cfg.AdminUsername = *adminUser
+	}
+	if cfg.AdminUsername == "" {
+		return errors.New("administrator username is required")
+	}
+
+	if *passwordStdin {
+		password, err := readPasswordFromStdin()
+		if err != nil {
+			return err
+		}
+
+		cfg.AdminSalt, cfg.AdminHash, err = hashPassword(password)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cfg.AdminSalt == "" || cfg.AdminHash == "" {
+		return errors.New("administrator password is required; use --admin-password-stdin")
+	}
+
+	if cfg.NodeID == "" {
+		cfg.NodeID, err = randomHex(16)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cfg.CreatedAt.IsZero() {
+		cfg.CreatedAt = time.Now().UTC()
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -207,103 +307,72 @@ func saveConfig(path string, cfg Config) error {
 		return err
 	}
 
-	tmp := path + ".tmp"
-
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
 
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 
+	fmt.Println("Installation configured successfully.")
+	fmt.Printf("Role: %s\n", cfg.Role)
+	fmt.Printf("Node ID: %s\n", cfg.NodeID)
+	fmt.Printf("Panel URL: %s\n", cfg.PanelURL)
+	fmt.Printf("Config: %s\n", path)
+
 	return nil
 }
 
-func loadConfig(path string) (Config, error) {
-	var cfg Config
-
-	data, err := os.ReadFile(path)
+func runServer() error {
+	cfg, _, err := loadExistingConfig(configPath())
 	if err != nil {
-		return cfg, err
-	}
-
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
+		return err
 	}
 
 	if cfg.Role != "master" && cfg.Role != "agent" {
-		return cfg, fmt.Errorf("invalid configured role")
+		return errors.New("invalid role in configuration")
 	}
-
-	if cfg.NodeID == "" || cfg.ListenAddr == "" {
-		return cfg, fmt.Errorf("incomplete configuration")
+	if cfg.NodeID == "" {
+		return errors.New("node ID is missing from configuration")
 	}
-
 	if cfg.AdminUsername == "" || cfg.AdminSalt == "" || cfg.AdminHash == "" {
-		return cfg, fmt.Errorf("administrator credentials are missing; run the secure configuration migration")
+		return errors.New("administrator credentials are missing; run the installer to configure the panel")
 	}
-
-	if cfg.PanelURL == "" {
-		return cfg, fmt.Errorf("panel URL is missing")
-	}
-
-	return cfg, nil
-}
-
-func runServer() {
-	cfg, err := loadConfig(configPath())
-	if err != nil {
-		log.Fatal("Cannot load configuration: ", err)
+	if !strings.HasPrefix(cfg.PanelURL, "https://") {
+		return errors.New("valid HTTPS panel URL is missing; run the installer again")
 	}
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/login", handleLogin(cfg))
-	mux.HandleFunc("/logout", handleLogout)
 	mux.HandleFunc("/api/v1/health", handleHealth)
-	mux.Handle("/api/v1/node", requireAuth(cfg, http.HandlerFunc(handleNode(cfg))))
-	mux.Handle("/", requireAuth(cfg, handleDashboard(cfg)))
+	mux.HandleFunc("/login", handleLogin)
+	mux.HandleFunc("/logout", requireAuth(handleLogout))
+	mux.HandleFunc("/api/v1/node", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		handleNode(w, r, cfg)
+	}))
+	mux.HandleFunc("/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		handleDashboard(w, r, cfg)
+	}))
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           securityHeaders(mux),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-	defer stop()
+	log.Printf("%s %s starting on %s", AppName, AppVersion, cfg.ListenAddr)
+	log.Printf("Public panel: %s", cfg.PanelURL)
 
-	go func() {
-		<-ctx.Done()
-
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-
-		_ = server.Shutdown(shutdownCtx)
-	}()
-
-	log.Println(AppName, AppVersion)
-	log.Println("Role:", cfg.Role)
-	log.Println("Node ID:", cfg.NodeID)
-	log.Println("Internal listener:", cfg.ListenAddr)
-	log.Println("Panel URL:", cfg.PanelURL)
-
-	err = server.ListenAndServe()
-	if err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
-	}
+	return server.ListenAndServe()
 }
 
 func securityHeaders(next http.Handler) http.Handler {
@@ -311,78 +380,49 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		next.ServeHTTP(w, r)
 	})
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(w, `{"status":"ok"}`)
 }
 
-func handleNode(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		writeJSON(w, http.StatusOK, NodeInfo{
-			AppVersion: AppVersion,
-			Role:       cfg.Role,
-			NodeID:     cfg.NodeID,
-			Status:     "online",
-		})
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
 	}
+	return r.RemoteAddr
 }
 
-func requireAuth(cfg Config, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/login" {
-			next.ServeHTTP(w, r)
-			return
+func allowLogin(ip string) bool {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+
+	now := time.Now()
+	recent := make([]time.Time, 0)
+
+	for _, t := range loginAttempts[ip] {
+		if now.Sub(t) < 10*time.Minute {
+			recent = append(recent, t)
 		}
+	}
 
-		cookie, err := r.Cookie(sessionCookie)
-		if err != nil || !validSession(cookie.Value) {
-			if strings.HasPrefix(r.URL.Path, "/api/") {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			http.Redirect(w, r, "/login", http.StatusSeeOther)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validSession(token string) bool {
-	sessions.Lock()
-	defer sessions.Unlock()
-
-	session, ok := sessions.items[token]
-	if !ok {
+	if len(recent) >= 5 {
+		loginAttempts[ip] = recent
 		return false
 	}
 
-	if time.Now().After(session.ExpiresAt) {
-		delete(sessions.items, token)
-		return false
-	}
-
+	recent = append(recent, now)
+	loginAttempts[ip] = recent
 	return true
 }
 
@@ -392,135 +432,268 @@ func createSession() (string, error) {
 		return "", err
 	}
 
-	sessions.Lock()
-	sessions.items[token] = Session{
-		ExpiresAt: time.Now().Add(sessionTTL),
-	}
-	sessions.Unlock()
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
 
+	now := time.Now()
+	for key, session := range sessions {
+		if now.After(session.ExpiresAt) {
+			delete(sessions, key)
+		}
+	}
+
+	sessions[token] = Session{
+		ExpiresAt: now.Add(sessionTTL),
+	}
 	return token, nil
 }
 
-func handleLogin(cfg Config) http.HandlerFunc {
-	tmpl := template.Must(template.New("login").Parse(loginHTML))
+func validSession(r *http.Request) bool {
+	cookie, err := r.Cookie("sahand_session")
+	if err != nil {
+		return false
+	}
 
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	session, ok := sessions[cookie.Value]
+	if !ok {
+		return false
+	}
+
+	if time.Now().After(session.ExpiresAt) {
+		delete(sessions, cookie.Value)
+		return false
+	}
+
+	return true
+}
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			if cookie, err := r.Cookie(sessionCookie); err == nil && validSession(cookie.Value) {
-				http.Redirect(w, r, "/", http.StatusSeeOther)
+		if !validSession(r) {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_ = tmpl.Execute(w, nil)
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "Invalid request", http.StatusBadRequest)
-			return
-		}
-
-		username := r.FormValue("username")
-		password := r.FormValue("password")
-
-		userOK := subtle.ConstantTimeCompare(
-			[]byte(username),
-			[]byte(cfg.AdminUsername),
-		) == 1
-
-		calculated := passwordHash(password, cfg.AdminSalt)
-		passwordOK := subtle.ConstantTimeCompare(
-			[]byte(calculated),
-			[]byte(cfg.AdminHash),
-		) == 1
-
-		if !userOK || !passwordOK {
-			time.Sleep(700 * time.Millisecond)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = tmpl.Execute(w, "Invalid username or password.")
-			return
-		}
-
-		token, err := createSession()
-		if err != nil {
-			http.Error(w, "Could not create session", http.StatusInternalServerError)
-			return
-		}
-
-		secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookie,
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   secure,
-			SameSite: http.SameSiteStrictMode,
-			MaxAge:   int(sessionTTL.Seconds()),
-		})
-
-		http.Redirect(w, r, "/", http.StatusSeeOther)
+		next(w, r)
 	}
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if validSession(r) {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, loginHTML)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ip := clientIP(r)
+	if !allowLogin(ip) {
+		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	cfg, _, err := loadExistingConfig(configPath())
+	if err != nil {
+		http.Error(w, "configuration error", http.StatusInternalServerError)
+		return
+	}
+
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+
+	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.AdminUsername)) == 1
+	passOK := verifyPassword(password, cfg.AdminSalt, cfg.AdminHash)
+
+	if !userOK || !passOK {
+		time.Sleep(500 * time.Millisecond)
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		return
+	}
+
+	token, err := createSession()
+	if err != nil {
+		http.Error(w, "could not create session", http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "sahand_session",
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Expires:  time.Now().Add(sessionTTL),
+		MaxAge:   int(sessionTTL.Seconds()),
+	})
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	if cookie, err := r.Cookie(sessionCookie); err == nil {
-		sessions.Lock()
-		delete(sessions.items, cookie.Value)
-		sessions.Unlock()
+	if cookie, err := r.Cookie("sahand_session"); err == nil {
+		sessionsMu.Lock()
+		delete(sessions, cookie.Value)
+		sessionsMu.Unlock()
 	}
 
 	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
+		Name:     "sahand_session",
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
 
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
-func handleDashboard(cfg Config) http.Handler {
-	tmpl := template.Must(template.New("dashboard").Parse(dashboardHTML))
+func handleNode(w http.ResponseWriter, r *http.Request, cfg Config) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
+	info := NodeInfo{
+		AppVersion: AppVersion,
+		Role:       cfg.Role,
+		NodeID:     cfg.NodeID,
+		Status:     "online",
+		PanelURL:   cfg.PanelURL,
+	}
 
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		data := map[string]string{
-			"Role":    strings.ToUpper(cfg.Role),
-			"NodeID":  cfg.NodeID,
-			"Version": AppVersion,
-			"PanelURL": cfg.PanelURL,
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-
-		if err := tmpl.Execute(w, data); err != nil {
-			log.Println("Dashboard error:", err)
-		}
-	})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(info)
 }
+
+func handleDashboard(w http.ResponseWriter, r *http.Request, cfg Config) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	page := strings.ReplaceAll(dashboardHTML, "{{PANEL_URL}}", html.EscapeString(cfg.PanelURL))
+	page = strings.ReplaceAll(page, "{{ROLE}}", html.EscapeString(strings.ToUpper(cfg.Role)))
+	page = strings.ReplaceAll(page, "{{NODE_ID}}", html.EscapeString(cfg.NodeID))
+	page = strings.ReplaceAll(page, "{{VERSION}}", html.EscapeString(AppVersion))
+
+	_, _ = io.WriteString(w, page)
+}
+
+const loginHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sahand Tunnel - Login</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#eef2ff;font-family:Arial,sans-serif}
+.card{width:min(420px,92%);padding:34px;background:#151d32;border:1px solid #293653;border-radius:18px}
+h1{margin:0 0 8px;font-size:25px}
+p{color:#aab6ce;margin-bottom:26px}
+label{display:block;margin:16px 0 7px;color:#cbd5e1;font-size:14px}
+input{width:100%;padding:13px;border-radius:9px;border:1px solid #34435f;background:#0c1427;color:white;font-size:15px}
+button{width:100%;margin-top:24px;padding:13px;border:0;border-radius:9px;background:#3977f6;color:white;font-weight:bold;font-size:15px;cursor:pointer}
+.small{margin-top:20px;text-align:center;font-size:12px;color:#7787a6}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Sahand Tunnel</h1>
+<p>Sign in to your server dashboard.</p>
+<form method="post" action="/login">
+<label>Username</label>
+<input name="username" autocomplete="username" required>
+<label>Password</label>
+<input name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button>
+</form>
+<div class="small">Secure server management</div>
+</div>
+</body>
+</html>`
+
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sahand Tunnel</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1020;color:#eef2ff;font-family:Arial,sans-serif}
+header{padding:22px 5%;background:#111a2e;border-bottom:1px solid #293653;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.brand{font-size:21px;font-weight:bold}
+.address{color:#8fa4c8;font-size:13px;margin-top:7px}
+.address a{color:#72a4ff;text-decoration:none}
+button{background:#263653;color:#eaf0ff;border:1px solid #3b4d6c;border-radius:8px;padding:10px 15px;cursor:pointer}
+main{max-width:1100px;margin:35px auto;padding:0 22px}
+h1{font-size:27px;margin-bottom:8px}
+.subtitle{color:#91a1bd;margin-bottom:28px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:17px}
+.card{background:#151f35;border:1px solid #293956;border-radius:14px;padding:22px}
+.label{color:#91a1bd;font-size:13px;margin-bottom:12px}
+.value{font-size:20px;font-weight:bold;overflow-wrap:anywhere}
+.online{color:#55d69a}
+.footer{color:#657795;text-align:center;margin:40px 0;font-size:12px}
+</style>
+</head>
+<body>
+<header>
+<div>
+<div class="brand">SAHAND TUNNEL</div>
+<div class="address">Panel address: <a href="{{PANEL_URL}}">{{PANEL_URL}}</a></div>
+</div>
+<form method="post" action="/logout">
+<button type="submit">Sign out</button>
+</form>
+</header>
+<main>
+<h1>Dashboard</h1>
+<div class="subtitle">Server overview and installation information</div>
+<div class="grid">
+<div class="card"><div class="label">Server status</div><div class="value online">● Online</div></div>
+<div class="card"><div class="label">Server role</div><div class="value">{{ROLE}}</div></div>
+<div class="card"><div class="label">Application version</div><div class="value">{{VERSION}}</div></div>
+<div class="card"><div class="label">Node ID</div><div class="value">{{NODE_ID}}</div></div>
+</div>
+<div class="footer">Sahand Tunnel · Secure server management</div>
+</main>
+</body>
+</html>`
 
 func runMenu() {
 	reader := bufio.NewReader(os.Stdin)
@@ -530,18 +703,6 @@ func runMenu() {
 		fmt.Println("================================")
 		fmt.Println("       SAHAND TUNNEL")
 		fmt.Println("================================")
-
-		cfg, err := loadConfig(configPath())
-		if err != nil {
-			fmt.Println("Installation: NOT CONFIGURED")
-		} else {
-			fmt.Println("Role:", strings.ToUpper(cfg.Role))
-			fmt.Println("Node ID:", cfg.NodeID)
-			fmt.Println("Panel:", cfg.PanelURL)
-		}
-
-		fmt.Println("Version:", AppVersion)
-		fmt.Println("--------------------------------")
 		fmt.Println("1. Configure Installation")
 		fmt.Println("2. Start Service")
 		fmt.Println("3. Restart Service")
@@ -550,22 +711,18 @@ func runMenu() {
 		fmt.Println("6. View Logs")
 		fmt.Println("7. Update")
 		fmt.Println("0. Exit")
-		fmt.Println("--------------------------------")
-		fmt.Print("Select option: ")
+		fmt.Print("\nSelect an option: ")
 
 		choice, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				fmt.Println("\nInput closed. Exiting menu.")
-			} else {
-				fmt.Println("\nInput error:", err)
-			}
+		if err != nil && !errors.Is(err, io.EOF) {
+			fmt.Println("Input error:", err)
 			return
 		}
+		choice = strings.TrimSpace(choice)
 
-		switch strings.TrimSpace(choice) {
+		switch choice {
 		case "1":
-			fmt.Println("Use the installer to configure a secure installation.")
+			fmt.Println("Use the installer to configure or upgrade this installation.")
 		case "2":
 			runSystemctl("enable", "--now", "sahand-tunnel")
 		case "3":
@@ -573,32 +730,38 @@ func runMenu() {
 		case "4":
 			runSystemctl("stop", "sahand-tunnel")
 		case "5":
-			runSystemctl("status", "sahand-tunnel")
+			runSystemctl("status", "sahand-tunnel", "--no-pager")
 		case "6":
-			cmd := exec.Command("journalctl", "-u", "sahand-tunnel", "-n", "50", "--no-pager")
+			runSystemctl("status", "sahand-tunnel", "--no-pager", "-l")
+			fmt.Println("\nRecent logs:")
+			runSystemctl("show", "-p", "ExecMainStatus", "sahand-tunnel")
+			cmd := exec.Command("journalctl", "-u", "sahand-tunnel", "-n", "40", "--no-pager")
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			_ = cmd.Run()
 		case "7":
-			cmd := exec.Command("/usr/local/bin/sahand-tunnel-update")
+			cmd := exec.Command("sahand-tunnel-update")
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
 				fmt.Println("Update failed:", err)
 			}
 		case "0":
-			fmt.Println("Goodbye.")
 			return
+		case "":
+			if errors.Is(err, io.EOF) {
+				return
+			}
 		default:
 			fmt.Println("Invalid option.")
 		}
 
-		fmt.Println()
-		fmt.Print("Press Enter to continue...")
-		_, err = reader.ReadString('\n')
-		if err != nil {
+		if errors.Is(err, io.EOF) {
 			return
 		}
+
+		fmt.Print("\nPress Enter to continue...")
+		_, _ = reader.ReadString('\n')
 	}
 }
 
@@ -606,111 +769,7 @@ func runSystemctl(args ...string) {
 	cmd := exec.Command("systemctl", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	if err := cmd.Run(); err != nil {
-		fmt.Println("Service command failed:", err)
+		fmt.Println("Command failed:", err)
 	}
 }
-
-const loginHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sahand Tunnel Login</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#e5e7eb;font-family:Arial,sans-serif}
-.box{width:min(92%,400px);padding:32px;background:#151c2e;border:1px solid #273449;border-radius:16px}
-h1{font-size:23px;margin-top:0}
-p{color:#94a3b8;font-size:14px}
-input{width:100%;padding:13px;margin:8px 0 16px;background:#0b1020;border:1px solid #334155;border-radius:8px;color:white}
-button{width:100%;padding:13px;border:0;border-radius:8px;background:#2563eb;color:white;font-weight:bold;cursor:pointer}
-.error{color:#f87171}
-</style>
-</head>
-<body>
-<div class="box">
-<h1>SAHAND TUNNEL</h1>
-<p>Administrator sign in</p>
-{{if .}}<p class="error">{{.}}</p>{{end}}
-<form method="POST" action="/login">
-<label>Username</label>
-<input name="username" autocomplete="username" required>
-<label>Password</label>
-<input name="password" type="password" autocomplete="current-password" required>
-<button type="submit">Sign in</button>
-</form>
-</div>
-</body>
-</html>
-`
-
-const dashboardHTML = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sahand Tunnel</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#0b1020;color:#e5e7eb;font-family:Arial,sans-serif}
-.container{max-width:1100px;margin:auto;padding:24px}
-.header{display:flex;justify-content:space-between;align-items:center;gap:15px;flex-wrap:wrap;margin-bottom:20px}
-.logo{font-size:23px;font-weight:bold}
-.role{background:#172554;color:#93c5fd;padding:8px 14px;border-radius:8px;font-size:12px}
-.address{background:#151c2e;border:1px solid #273449;border-radius:12px;padding:16px;margin-bottom:24px;overflow-wrap:anywhere}
-.address a{color:#60a5fa;text-decoration:none}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
-.card{background:#151c2e;border:1px solid #273449;border-radius:14px;padding:22px;min-height:135px}
-.card h3{margin-top:0;font-size:14px;color:#94a3b8}
-.value{font-size:20px;font-weight:bold}
-.status{color:#4ade80}
-.info{margin-top:22px;background:#151c2e;border-radius:14px;padding:22px;overflow-wrap:anywhere}
-.muted{color:#94a3b8;font-size:13px}
-button{padding:10px 16px;background:#273449;color:white;border:0;border-radius:8px;cursor:pointer}
-@media(max-width:700px){.grid{grid-template-columns:1fr}.container{padding:16px}}
-</style>
-</head>
-<body>
-<div class="container">
-<div class="header">
-<div class="logo">SAHAND TUNNEL</div>
-<div class="role">{{.Role}} PANEL</div>
-</div>
-
-<div class="address">
-<div class="muted">PANEL ADDRESS</div>
-<a href="{{.PanelURL}}">{{.PanelURL}}</a>
-</div>
-
-<div class="grid">
-<div class="card">
-<h3>Server Status</h3>
-<div class="value status">ONLINE</div>
-</div>
-<div class="card">
-<h3>Installation Role</h3>
-<div class="value">{{.Role}}</div>
-</div>
-<div class="card">
-<h3>Application Version</h3>
-<div class="value">{{.Version}}</div>
-</div>
-</div>
-
-<div class="info">
-<h3>Node Information</h3>
-<p class="muted">Unique Node ID</p>
-<div>{{.NodeID}}</div>
-<p class="muted">Sahand Tunnel is running successfully.</p>
-<form method="POST" action="/logout">
-<button type="submit">Sign out</button>
-</form>
-</div>
-</div>
-</body>
-</html>
-`
