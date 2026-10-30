@@ -35,11 +35,6 @@ jobs:
         working-directory: web
         run: npm run build
 
-      - name: Stage frontend assets for Go embed
-        run: |
-          mkdir -p cmd/sahand-tunnel/web
-          cp -r web/dist cmd/sahand-tunnel/web/
-
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
@@ -72,11 +67,6 @@ jobs:
       - name: Build frontend
         working-directory: web
         run: npm run build
-
-      - name: Stage frontend assets for Go embed
-        run: |
-          mkdir -p cmd/sahand-tunnel/web
-          cp -r web/dist cmd/sahand-tunnel/web/
 
       - name: Setup Go
         uses: actions/setup-go@v5
