@@ -129,5 +129,11 @@ echo
 
 if [ "${SAHAND_NO_MENU:-0}" != "1" ]; then
     export SAHAND_CONFIG="${CONFIG_DIR}/config.json"
-    exec "$BIN" menu
+
+    if [ -r /dev/tty ]; then
+        exec "$BIN" menu </dev/tty
+    else
+        echo "Interactive terminal not available."
+        echo "Run: sahand-tunnel menu"
+    fi
 fi
