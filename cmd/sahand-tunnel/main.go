@@ -222,6 +222,7 @@ func runInit(args []string) error {
 
 	role := fs.String("role", "", "master or agent")
 	listen := fs.String("listen", defaultListen, "local application listen address")
+	panelPort := fs.Int("panel-port", 0, "panel application port")
 	panelURL := fs.String("panel-url", "", "public HTTPS panel URL")
 	adminUser := fs.String("admin-user", "", "administrator username")
 	passwordStdin := fs.Bool("admin-password-stdin", false, "read administrator password from stdin")
@@ -261,6 +262,19 @@ func runInit(args []string) error {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = defaultListen
 	}
+	if *panelPort != 0 {
+    if *panelPort < 20000 || *panelPort > 60000 {
+        return errors.New("panel port must be between 20000 and 60000")
+    }
+    cfg.PanelPort = *panelPort
+}
+
+if cfg.PanelPort != 0 {
+    expectedListen := fmt.Sprintf("127.0.0.1:%d", cfg.PanelPort)
+    if cfg.ListenAddr != expectedListen {
+        return errors.New("panel port and listen address do not match")
+    }
+}
 
 	if *panelURL != "" {
 		cfg.PanelURL = strings.TrimRight(*panelURL, "/")
