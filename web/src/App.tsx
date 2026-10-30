@@ -13,6 +13,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  Save,
   Server,
   Settings2,
   Shield,
@@ -34,6 +35,7 @@ type MethodResult = {
 type LifelineEvent = {
   method_id: number;
   method_name: string;
+  port: number;
   security: number;
   latency_ms: number;
   direction: string;
@@ -69,6 +71,7 @@ type ServerPeer = {
   running: boolean;
   active_method_id: number;
   active_method: string;
+  active_port: number;
   active_security: number;
   active_latency_ms: number;
   next_retry_at?: string;
@@ -103,7 +106,7 @@ function securityTierClass(sec: number): string {
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("servers");
   const [role, setRole] = useState<Role>("master");
-  const [appVersion, setAppVersion] = useState("0.4.0");
+  const [appVersion, setAppVersion] = useState("0.4.1");
   const [servers, setServers] = useState<ServerPeer[]>([]);
   const [selectedServerID, setSelectedServerID] = useState<string>("");
 
@@ -115,8 +118,11 @@ export default function App() {
   const [copiedID, setCopiedID] = useState<string | null>(null);
   const [expandedHistoryID, setExpandedHistoryID] = useState<string | null>(null);
 
-  // Tunnels Tab State
+  // Tunnels Tab State & Drafts
   const [expandedTunnel, setExpandedTunnel] = useState<number | null>(null);
+  const [draftTunnels, setDraftTunnels] = useState<Record<string, TunnelConfig>>({});
+  const [savingTunnelKey, setSavingTunnelKey] = useState<string | null>(null);
+  const [savedNotice, setSavedNotice] = useState<Record<string, string>>({});
 
   // Analytics Tab State
   const [analyticsRange, setAnalyticsRange] = useState<7 | 30>(7);
@@ -169,7 +175,7 @@ export default function App() {
     fetchAnalytics();
     const timer = setInterval(() => {
       fetchState();
-    }, 4000);
+    }, 3500);
     return () => clearInterval(timer);
   }, []);
 
@@ -217,7 +223,10 @@ export default function App() {
     }
   }
 
-  async function handleServerAction(serverID: string, action: "play" | "pause" | "delete" | "regen_token") {
+  async function handleServerAction(
+    serverID: string,
+    action: "play" | "pause" | "delete" | "regen_token"
+  ) {
     await fetch("/api/v1/servers/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -232,36 +241,73 @@ export default function App() {
       setCopiedID(id);
       setTimeout(() => setCopiedID(null), 1800);
     } catch {
-      // Fallback ignored
+      // Clipboard fallback ignored
     }
   }
 
-  async function saveTunnelConfig(serverID: string, updated: TunnelConfig) {
-    if (role !== "master") return;
-    setServers((prev) =>
-      prev.map((srv) =>
-        srv.id === serverID
-          ? {
-              ...srv,
-              tunnels: srv.tunnels.map((t) => (t.id === updated.id ? updated : t)),
-            }
-          : srv
-      )
-    );
-    await fetch("/api/v1/tunnels", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ server_id: serverID, tunnel: updated }),
-    });
-    await fetchState();
+  function getDraftTunnel(serverID: string, tunnel: TunnelConfig): TunnelConfig {
+    const key = `${serverID}:${tunnel.id}`;
+    return draftTunnels[key] || tunnel;
   }
 
-  const selectedServer = servers.find((s) => s.id === selectedServerID) || servers[0] || null;
+  function updateDraftTunnel(serverID: string, updated: TunnelConfig) {
+    const key = `${serverID}:${updated.id}`;
+    setDraftTunnels((prev) => ({ ...prev, [key]: updated }));
+  }
+
+  async function commitTunnelConfig(serverID: string, updated: TunnelConfig) {
+    if (role !== "master") return;
+    const key = `${serverID}:${updated.id}`;
+    setSavingTunnelKey(key);
+
+    try {
+      const res = await fetch("/api/v1/tunnels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ server_id: serverID, tunnel: updated }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDraftTunnels((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        const verText = data.config_version ? ` (v${data.config_version})` : "";
+        setSavedNotice((prev) => ({
+          ...prev,
+          [key]: `Saved & Token Updated${verText}`,
+        }));
+        setTimeout(() => {
+          setSavedNotice((prev) => {
+            const next = { ...prev };
+            delete next[key];
+            return next;
+          });
+        }, 3200);
+        await fetchState();
+      }
+    } finally {
+      setSavingTunnelKey(null);
+    }
+  }
+
+  const selectedServer =
+    servers.find((s) => s.id === selectedServerID) || servers[0] || null;
   const visibleAnalytics = daysUsage.slice(-analyticsRange);
-  const maxDayBytes = Math.max(
-    1,
+  const rawMaxBytes = Math.max(
+    0,
     ...visibleAnalytics.map((d) => Math.max(d.rx_bytes, d.tx_bytes))
   );
+  // Minimum scale of 1 GB (1073741824 B) when empty so Y-axis always has clean labels
+  const chartScaleMax = rawMaxBytes > 0 ? rawMaxBytes : 1073741824;
+  const yAxisTicks = [
+    chartScaleMax,
+    Math.round(chartScaleMax * 0.75),
+    Math.round(chartScaleMax * 0.5),
+    Math.round(chartScaleMax * 0.25),
+    0,
+  ];
   const totalRx = visibleAnalytics.reduce((acc, d) => acc + d.rx_bytes, 0);
   const totalTx = visibleAnalytics.reduce((acc, d) => acc + d.tx_bytes, 0);
 
@@ -422,10 +468,17 @@ export default function App() {
                             {server.ip}
                             {server.active_method ? (
                               <span className="active-carrier-tag">
-                                • Method {String(server.active_method_id).padStart(2, "0")} ({server.active_method} {server.active_security}%) • {server.active_latency_ms}ms
+                                {" "}
+                                • Method {String(server.active_method_id).padStart(2, "0")} (
+                                {server.active_method} {server.active_security}%) • Port{" "}
+                                {server.active_port || 11300 + server.active_method_id} •{" "}
+                                {server.active_latency_ms}ms
                               </span>
                             ) : server.next_retry_at ? (
-                              <span className="retry-tag"> • Next retry at {server.next_retry_at}</span>
+                              <span className="retry-tag">
+                                {" "}
+                                • Next retry at {server.next_retry_at}
+                              </span>
                             ) : null}
                           </div>
                         </div>
@@ -447,7 +500,7 @@ export default function App() {
                           <button
                             className="icon-button"
                             onClick={() => copyToken(server.id, server.token)}
-                            title="Copy connection token"
+                            title="Copy connection token (includes current ports)"
                             aria-label="Copy connection token"
                           >
                             {copiedID === server.id ? <Check size={15} /> : <Copy size={15} />}
@@ -496,17 +549,26 @@ export default function App() {
                           <span>
                             Recent Working Methods ({server.recent_lifelines?.length || 0}/5)
                           </span>
-                          {historyOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                          {historyOpen ? (
+                            <ChevronDown size={14} />
+                          ) : (
+                            <ChevronRight size={14} />
+                          )}
                         </button>
 
                         <span className="sync-badge">
-                          {server.sync_state === "synced" ? "Config Synced" : "Pending Sync"}
+                          {copiedID === server.id
+                            ? "✓ Token Copied"
+                            : server.sync_state === "synced"
+                            ? `Token Ready (v${server.config_version})`
+                            : `Token Updated (v${server.config_version})`}
                         </span>
                       </div>
 
                       {historyOpen && (
                         <div className="lifeline-history-drawer">
-                          {!server.recent_lifelines || server.recent_lifelines.length === 0 ? (
+                          {!server.recent_lifelines ||
+                          server.recent_lifelines.length === 0 ? (
                             <div className="history-empty">
                               No successful connection methods recorded yet.
                             </div>
@@ -520,7 +582,8 @@ export default function App() {
                                   {item.security}%
                                 </span>
                                 <span className="history-meta">
-                                  {item.latency_ms}ms • {item.direction}
+                                  Port {item.port || 11300 + item.method_id} • {item.latency_ms}ms •{" "}
+                                  {item.direction}
                                 </span>
                                 <span className="history-time">{item.connected_at}</span>
                               </div>
@@ -586,6 +649,10 @@ export default function App() {
                   {selectedServer.tunnels.map((tunnel) => {
                     const expanded = expandedTunnel === tunnel.id;
                     const disc = tunnel.last_discovery;
+                    const draft = getDraftTunnel(selectedServer.id, tunnel);
+                    const tunnelKey = `${selectedServer.id}:${tunnel.id}`;
+                    const isSaving = savingTunnelKey === tunnelKey;
+                    const noticeText = savedNotice[tunnelKey];
 
                     return (
                       <article
@@ -606,11 +673,15 @@ export default function App() {
 
                             <span className="tunnel-title">{tunnel.name}</span>
 
+                            <span className="port-chip">:{tunnel.listen_port}</span>
+
                             <span className={`sec-badge ${securityTierClass(tunnel.security)}`}>
                               {tunnel.security}%
                             </span>
 
-                            <span className="proto-badge">{tunnel.traffic_type.toUpperCase()}</span>
+                            <span className="proto-badge">
+                              {tunnel.traffic_type.toUpperCase()}
+                            </span>
 
                             {disc?.tested_at && (
                               <span
@@ -622,6 +693,10 @@ export default function App() {
                                   ? `OK ${disc.latency_ms}ms`
                                   : disc.error_reason || "Failed"}
                               </span>
+                            )}
+
+                            {noticeText && !expanded && (
+                              <span className="save-feedback-inline">✓ {noticeText}</span>
                             )}
 
                             {expanded ? (
@@ -637,12 +712,12 @@ export default function App() {
                             }`}
                             onClick={() =>
                               role === "master" &&
-                              saveTunnelConfig(selectedServer.id, {
-                                ...tunnel,
+                              commitTunnelConfig(selectedServer.id, {
+                                ...draft,
                                 enabled: !tunnel.enabled,
                               })
                             }
-                            disabled={role === "agent"}
+                            disabled={role === "agent" || isSaving}
                             role="switch"
                             aria-checked={tunnel.enabled}
                             aria-label={`Toggle ${tunnel.name}`}
@@ -669,11 +744,11 @@ export default function App() {
                                   id={`lport-${tunnel.id}`}
                                   type="number"
                                   disabled={role === "agent"}
-                                  value={tunnel.listen_port}
+                                  value={draft.listen_port}
                                   onChange={(e) =>
-                                    saveTunnelConfig(selectedServer.id, {
-                                      ...tunnel,
-                                      listen_port: Number(e.target.value) || tunnel.listen_port,
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      listen_port: Number(e.target.value) || 0,
                                     })
                                   }
                                 />
@@ -687,27 +762,27 @@ export default function App() {
                                   id={`fport-${tunnel.id}`}
                                   disabled={role === "agent"}
                                   placeholder="2053, 2083"
-                                  value={tunnel.forward_ports}
+                                  value={draft.forward_ports}
                                   onChange={(e) =>
-                                    saveTunnelConfig(selectedServer.id, {
-                                      ...tunnel,
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
                                       forward_ports: e.target.value,
                                     })
                                   }
                                 />
                               </div>
 
-                              {tunnel.sni !== undefined && (
+                              {draft.sni !== undefined && (
                                 <div className="form-field">
                                   <label htmlFor={`sni-${tunnel.id}`}>TLS SNI</label>
                                   <input
                                     id={`sni-${tunnel.id}`}
                                     disabled={role === "agent"}
                                     placeholder="www.speedtest.net"
-                                    value={tunnel.sni}
+                                    value={draft.sni}
                                     onChange={(e) =>
-                                      saveTunnelConfig(selectedServer.id, {
-                                        ...tunnel,
+                                      updateDraftTunnel(selectedServer.id, {
+                                        ...draft,
                                         sni: e.target.value,
                                       })
                                     }
@@ -715,17 +790,17 @@ export default function App() {
                                 </div>
                               )}
 
-                              {tunnel.ws_path !== undefined && (
+                              {draft.ws_path !== undefined && (
                                 <div className="form-field">
                                   <label htmlFor={`path-${tunnel.id}`}>HTTP / WS PATH</label>
                                   <input
                                     id={`path-${tunnel.id}`}
                                     disabled={role === "agent"}
                                     placeholder="/ws"
-                                    value={tunnel.ws_path}
+                                    value={draft.ws_path}
                                     onChange={(e) =>
-                                      saveTunnelConfig(selectedServer.id, {
-                                        ...tunnel,
+                                      updateDraftTunnel(selectedServer.id, {
+                                        ...draft,
                                         ws_path: e.target.value,
                                       })
                                     }
@@ -733,7 +808,7 @@ export default function App() {
                                 </div>
                               )}
 
-                              {tunnel.speed_limit_mbps !== undefined && (
+                              {draft.speed_limit_mbps !== undefined && (
                                 <div className="form-field">
                                   <label htmlFor={`spd-${tunnel.id}`}>
                                     SPEED LIMIT (MB/S, 0=UNLIMITED)
@@ -742,10 +817,10 @@ export default function App() {
                                     id={`spd-${tunnel.id}`}
                                     disabled={role === "agent"}
                                     placeholder="0"
-                                    value={tunnel.speed_limit_mbps}
+                                    value={draft.speed_limit_mbps}
                                     onChange={(e) =>
-                                      saveTunnelConfig(selectedServer.id, {
-                                        ...tunnel,
+                                      updateDraftTunnel(selectedServer.id, {
+                                        ...draft,
                                         speed_limit_mbps: e.target.value,
                                       })
                                     }
@@ -764,6 +839,28 @@ export default function App() {
                                 </span>
                               </div>
                             </div>
+
+                            {role === "master" && (
+                              <div className="settings-actions-row">
+                                <button
+                                  type="button"
+                                  className="save-tunnel-btn"
+                                  disabled={isSaving}
+                                  onClick={() =>
+                                    commitTunnelConfig(selectedServer.id, draft)
+                                  }
+                                >
+                                  <Save size={14} />
+                                  <span>{isSaving ? "Saving..." : "Save Settings"}</span>
+                                </button>
+
+                                {noticeText && (
+                                  <span className="save-feedback-text">
+                                    ✓ {noticeText}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </div>
                         )}
                       </article>
@@ -806,26 +903,50 @@ export default function App() {
             </div>
 
             <div className="chart-card">
-              <div className="bars-container">
-                {visibleAnalytics.map((day) => {
-                  const rxPct = Math.max(3, Math.round((day.rx_bytes / maxDayBytes) * 100));
-                  const txPct = Math.max(3, Math.round((day.tx_bytes / maxDayBytes) * 100));
-                  const shortDate = day.date.slice(5);
+              <div className="chart-layout">
+                <div className="y-axis-labels">
+                  {yAxisTicks.map((val, i) => (
+                    <span key={i}>{formatBytes(val)}</span>
+                  ))}
+                </div>
 
-                  return (
-                    <div
-                      className="day-column"
-                      key={day.date}
-                      title={`${day.date} • ↓ ${formatBytes(day.rx_bytes)} | ↑ ${formatBytes(day.tx_bytes)}`}
-                    >
-                      <div className="day-bars">
-                        <div className="bar rx-bar" style={{ height: `${rxPct}%` }} />
-                        <div className="bar tx-bar" style={{ height: `${txPct}%` }} />
-                      </div>
-                      <span className="day-label">{shortDate}</span>
-                    </div>
-                  );
-                })}
+                <div className="chart-plot-area">
+                  <div className="y-grid-lines">
+                    {yAxisTicks.map((_, i) => (
+                      <div className="y-grid-line" key={i} />
+                    ))}
+                  </div>
+
+                  <div className="bars-container">
+                    {visibleAnalytics.map((day) => {
+                      const rxPct =
+                        day.rx_bytes > 0
+                          ? Math.max(4, Math.round((day.rx_bytes / chartScaleMax) * 100))
+                          : 2;
+                      const txPct =
+                        day.tx_bytes > 0
+                          ? Math.max(4, Math.round((day.tx_bytes / chartScaleMax) * 100))
+                          : 2;
+                      const shortDate = day.date.slice(5);
+
+                      return (
+                        <div
+                          className="day-column"
+                          key={day.date}
+                          title={`${day.date} • ↓ ${formatBytes(day.rx_bytes)} | ↑ ${formatBytes(
+                            day.tx_bytes
+                          )}`}
+                        >
+                          <div className="day-bars">
+                            <div className="bar rx-bar" style={{ height: `${rxPct}%` }} />
+                            <div className="bar tx-bar" style={{ height: `${txPct}%` }} />
+                          </div>
+                          <span className="day-label">{shortDate}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             </div>
           </section>
