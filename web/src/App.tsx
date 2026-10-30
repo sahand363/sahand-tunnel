@@ -1,371 +1,396 @@
+
 import { useEffect, useState } from "react";
 import {
   Activity,
-  ArrowDownToLine,
-  ArrowUpFromLine,
-  Cable,
-  Check,
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
   ChevronRight,
-  CircleHelp,
-  Cpu,
-  Globe,
-  LayoutDashboard,
-  LogOut,
-  Moon,
-  Network,
+  Globe2,
+  Pause,
   Play,
+  Plus,
   Server,
   Settings2,
-  ShieldCheck,
-  Sun,
+  Shield,
+  Trash2,
   Wifi,
+  X,
 } from "lucide-react";
-
-type NodeInfo = {
-  app_version: string;
-  role: "master" | "agent";
-  node_id: string;
-  status: string;
-  panel_url: string;
-};
 
 type Tab = "servers" | "tunnels" | "analytics";
 
+type ServerItem = {
+  id: number;
+  name: string;
+  ip: string;
+  running: boolean;
+};
+
+type TunnelItem = {
+  id: number;
+  name: string;
+  enabled: boolean;
+  port: string;
+};
+
+const initialTunnels: TunnelItem[] = Array.from(
+  { length: 30 },
+  (_, index) => ({
+    id: index + 1,
+    name: `Tunnel ${String(index + 1).padStart(2, "0")}`,
+    enabled: false,
+    port: "",
+  })
+);
+
 export default function App() {
-  const [tab, setTab] = useState<Tab>("servers");
-  const [node, setNode] = useState<NodeInfo | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [lightMode, setLightMode] = useState(false);
+  const [activeTab, setActiveTab] = useState<Tab>("servers");
+  const [servers, setServers] = useState<ServerItem[]>([]);
+  const [serverName, setServerName] = useState("");
+  const [serverIP, setServerIP] = useState("");
+  const [expandedTunnel, setExpandedTunnel] = useState<number | null>(null);
+  const [tunnels, setTunnels] = useState(initialTunnels);
+  const [darkMode, setDarkMode] = useState(true);
 
   useEffect(() => {
-    fetch("/api/v1/node", { credentials: "same-origin" })
-      .then((response) => {
-        if (!response.ok) throw new Error("Unable to load node information");
-        return response.json();
-      })
-      .then((data: NodeInfo) => setNode(data))
-      .catch(() => setNode(null))
-      .finally(() => setLoading(false));
-  }, []);
+    document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+  }, [darkMode]);
 
-  const role = node?.role?.toUpperCase() ?? "UNKNOWN";
+  function addServer(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const name = serverName.trim();
+    const ip = serverIP.trim();
+
+    if (!name || !ip) return;
+
+    setServers((current) => [
+      ...current,
+      {
+        id: Date.now(),
+        name,
+        ip,
+        running: false,
+      },
+    ]);
+
+    setServerName("");
+    setServerIP("");
+  }
+
+  function toggleServer(id: number) {
+    setServers((current) =>
+      current.map((server) =>
+        server.id === id
+          ? { ...server, running: !server.running }
+          : server
+      )
+    );
+  }
+
+  function removeServer(id: number) {
+    setServers((current) => current.filter((server) => server.id !== id));
+  }
+
+  function toggleTunnel(id: number) {
+    setTunnels((current) =>
+      current.map((tunnel) =>
+        tunnel.id === id
+          ? { ...tunnel, enabled: !tunnel.enabled }
+          : tunnel
+      )
+    );
+  }
+
+  function updateTunnelPort(id: number, port: string) {
+    setTunnels((current) =>
+      current.map((tunnel) =>
+        tunnel.id === id ? { ...tunnel, port } : tunnel
+      )
+    );
+  }
 
   return (
-    <div className={lightMode ? "app light" : "app"}>
-      <aside className="sidebar">
+    <div className="app-shell">
+      <header className="topbar">
         <div className="brand">
-          <div className="brand-icon"><Network size={21} /></div>
-          <div>
-            <div className="brand-name">SAHAND</div>
-            <div className="brand-subtitle">TUNNEL</div>
+          <div className="brand-mark">
+            <Shield size={19} strokeWidth={2.2} />
           </div>
+          <span>Sahand<span className="brand-light">Tunnel</span></span>
         </div>
 
-        <div className="nav-label">WORKSPACE</div>
-        <nav className="navigation">
+        <div className="topbar-right">
+          <div className="system-status">
+            <span className="status-dot" />
+            <span>LOCAL</span>
+          </div>
+
           <button
-            className={tab === "servers" ? "nav-item active" : "nav-item"}
-            onClick={() => setTab("servers")}
+            className="icon-button theme-button"
+            onClick={() => setDarkMode((value) => !value)}
+            aria-label="Change theme"
+            title="Change theme"
           >
-            <Server size={18} />
+            {darkMode ? <Globe2 size={17} /> : <Activity size={17} />}
+          </button>
+        </div>
+      </header>
+
+      <main className="main-content">
+        <nav className="tab-bar">
+          <button
+            className={`tab-button ${activeTab === "servers" ? "active" : ""}`}
+            onClick={() => setActiveTab("servers")}
+          >
+            <Server size={16} />
             <span>Servers</span>
-            {tab === "servers" && <ChevronRight size={15} />}
           </button>
 
           <button
-            className={tab === "tunnels" ? "nav-item active" : "nav-item"}
-            onClick={() => setTab("tunnels")}
+            className={`tab-button ${activeTab === "tunnels" ? "active" : ""}`}
+            onClick={() => setActiveTab("tunnels")}
           >
-            <Cable size={18} />
+            <Shield size={16} />
             <span>Tunnels</span>
-            {tab === "tunnels" && <ChevronRight size={15} />}
           </button>
 
           <button
-            className={tab === "analytics" ? "nav-item active" : "nav-item"}
-            onClick={() => setTab("analytics")}
+            className={`tab-button ${activeTab === "analytics" ? "active" : ""}`}
+            onClick={() => setActiveTab("analytics")}
           >
-            <Activity size={18} />
+            <Activity size={16} />
             <span>Analytics</span>
-            {tab === "analytics" && <ChevronRight size={15} />}
           </button>
         </nav>
 
-        <div className="sidebar-bottom">
-          <div className="security-note">
-            <ShieldCheck size={18} />
-            <div>
-              <strong>Secure connection</strong>
-              <span>Session protected</span>
+        {activeTab === "servers" && (
+          <section className="page-section">
+            <form className="add-server-form" onSubmit={addServer}>
+              <div className="form-field name-field">
+                <label htmlFor="server-name">NAME</label>
+                <input
+                  id="server-name"
+                  value={serverName}
+                  onChange={(event) => setServerName(event.target.value)}
+                  placeholder="Server name"
+                  autoComplete="off"
+                />
+              </div>
+
+              <div className="form-field ip-field">
+                <label htmlFor="server-ip">IP ADDRESS</label>
+                <input
+                  id="server-ip"
+                  value={serverIP}
+                  onChange={(event) => setServerIP(event.target.value)}
+                  placeholder="192.168.1.1"
+                  autoComplete="off"
+                />
+              </div>
+
+              <button className="add-button" type="submit">
+                <Plus size={17} />
+                <span>Add server</span>
+              </button>
+            </form>
+
+            <div className="section-divider" />
+
+            <div className="list-heading">
+              <span>YOUR SERVERS</span>
+              <span className="item-count">{servers.length}</span>
             </div>
-          </div>
-          <button className="theme-button" onClick={() => setLightMode(!lightMode)}>
-            {lightMode ? <Moon size={17} /> : <Sun size={17} />}
-            <span>{lightMode ? "Dark appearance" : "Light appearance"}</span>
-          </button>
-          <form action="/logout" method="post">
-            <button className="logout-button" type="submit">
-              <LogOut size={17} />
-              <span>Sign out</span>
-            </button>
-          </form>
-          <div className="sidebar-version">
-            Sahand Tunnel · {node?.app_version ?? "—"}
-          </div>
-        </div>
-      </aside>
 
-      <main className="main">
-        <header className="topbar">
-          <div className="breadcrumb">
-            <span>Workspace</span>
-            <ChevronRight size={14} />
-            <strong>
-              {tab === "servers" ? "Servers" : tab === "tunnels" ? "Tunnels" : "Analytics"}
-            </strong>
-          </div>
-          <div className="topbar-right">
-            <span className="role-badge">{role}</span>
-            <div className="user-avatar">S</div>
-          </div>
-        </header>
+            {servers.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">
+                  <Server size={23} />
+                </div>
+                <p>No servers added</p>
+              </div>
+            ) : (
+              <div className="server-list">
+                {servers.map((server) => (
+                  <article className="server-row" key={server.id}>
+                    <div className="server-symbol">
+                      <Server size={19} />
+                    </div>
 
-        <div className="content">
-          {tab === "servers" && (
-            <ServersPage node={node} loading={loading} />
-          )}
-          {tab === "tunnels" && <TunnelsPage />}
-          {tab === "analytics" && <AnalyticsPage />}
-        </div>
+                    <div className="server-info">
+                      <div className="server-name">{server.name}</div>
+                      <div className="server-address">{server.ip}</div>
+                    </div>
+
+                    <div className="server-state">
+                      <span
+                        className={`state-dot ${server.running ? "online" : ""}`}
+                      />
+                      <span>{server.running ? "Active" : "Paused"}</span>
+                    </div>
+
+                    <button
+                      className={`server-action ${server.running ? "pause" : "play"}`}
+                      onClick={() => toggleServer(server.id)}
+                      title={server.running ? "Pause" : "Play"}
+                      aria-label={server.running ? "Pause server" : "Start server"}
+                    >
+                      {server.running ? (
+                        <Pause size={16} />
+                      ) : (
+                        <Play size={16} />
+                      )}
+                    </button>
+
+                    <button
+                      className="icon-button delete-button"
+                      onClick={() => removeServer(server.id)}
+                      title="Remove server"
+                      aria-label="Remove server"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === "tunnels" && (
+          <section className="page-section">
+            <div className="list-heading tunnel-heading">
+              <span>TUNNEL METHODS</span>
+              <span className="item-count">30</span>
+            </div>
+
+            <div className="tunnel-list">
+              {tunnels.map((tunnel) => {
+                const expanded = expandedTunnel === tunnel.id;
+
+                return (
+                  <article
+                    className={`tunnel-card ${expanded ? "expanded" : ""}`}
+                    key={tunnel.id}
+                  >
+                    <div className="tunnel-row">
+                      <button
+                        className="tunnel-expand"
+                        onClick={() =>
+                          setExpandedTunnel(expanded ? null : tunnel.id)
+                        }
+                        aria-expanded={expanded}
+                      >
+                        <span className="tunnel-number">
+                          {String(tunnel.id).padStart(2, "0")}
+                        </span>
+
+                        <span className="tunnel-title">{tunnel.name}</span>
+
+                        {expanded ? (
+                          <ChevronDown size={17} />
+                        ) : (
+                          <ChevronRight size={17} />
+                        )}
+                      </button>
+
+                      <button
+                        className={`switch ${tunnel.enabled ? "switch-on" : ""}`}
+                        onClick={() => toggleTunnel(tunnel.id)}
+                        role="switch"
+                        aria-checked={tunnel.enabled}
+                        aria-label={`Toggle ${tunnel.name}`}
+                      >
+                        <span />
+                      </button>
+                    </div>
+
+                    {expanded && (
+                      <div className="tunnel-settings">
+                        <div className="settings-title">
+                          <Settings2 size={15} />
+                          <span>Settings</span>
+                        </div>
+
+                        <div className="settings-grid">
+                          <div className="form-field">
+                            <label htmlFor={`port-${tunnel.id}`}>
+                              LISTEN PORT
+                            </label>
+                            <input
+                              id={`port-${tunnel.id}`}
+                              inputMode="numeric"
+                              placeholder="Default"
+                              value={tunnel.port}
+                              onChange={(event) =>
+                                updateTunnelPort(tunnel.id, event.target.value)
+                              }
+                            />
+                          </div>
+
+                          <div className="setting-status">
+                            <span className="setting-label">STATUS</span>
+                            <span
+                              className={`setting-value ${
+                                tunnel.enabled ? "enabled-text" : ""
+                              }`}
+                            >
+                              {tunnel.enabled ? "Enabled" : "Disabled"}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          </section>
+        )}
+
+        {activeTab === "analytics" && (
+          <section className="page-section analytics-section">
+            <div className="traffic-grid">
+              <div className="traffic-card">
+                <div className="traffic-label">
+                  <ArrowDown size={16} />
+                  <span>DOWNLOAD</span>
+                </div>
+                <div className="traffic-value">—</div>
+                <div className="traffic-unit">Mbps</div>
+              </div>
+
+              <div className="traffic-card">
+                <div className="traffic-label">
+                  <ArrowUp size={16} />
+                  <span>UPLOAD</span>
+                </div>
+                <div className="traffic-value">—</div>
+                <div className="traffic-unit">Mbps</div>
+              </div>
+            </div>
+
+            <div className="traffic-total">
+              <div>
+                <span className="total-label">TOTAL DATA</span>
+                <div className="total-value">—</div>
+              </div>
+              <Wifi size={21} />
+            </div>
+
+            <div className="analytics-waiting">
+              <span className="status-dot" />
+              Traffic monitor not connected
+            </div>
+          </section>
+        )}
       </main>
+
+      <footer className="app-footer">
+        <span>SAHAND TUNNEL</span>
+        <span>0.3.0</span>
+      </footer>
     </div>
-  );
-}
-
-function PageHeading({
-  eyebrow,
-  title,
-  description,
-}: {
-  eyebrow: string;
-  title: string;
-  description: string;
-}) {
-  return (
-    <div className="page-heading">
-      <div className="eyebrow">{eyebrow}</div>
-      <h1>{title}</h1>
-      <p>{description}</p>
-    </div>
-  );
-}
-
-function ServersPage({
-  node,
-  loading,
-}: {
-  node: NodeInfo | null;
-  loading: boolean;
-}) {
-  return (
-    <>
-      <PageHeading
-        eyebrow="INFRASTRUCTURE"
-        title="Servers"
-        description="Manage your Sahand Tunnel nodes and connections."
-      />
-
-      <div className="overview-grid">
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box blue"><Server size={19} /></div>
-            <span className="muted-label">NODE STATUS</span>
-          </div>
-          <div className="metric">
-            {loading ? "Loading" : node ? "Online" : "Unavailable"}
-          </div>
-          <div className="metric-foot">
-            <span className={node ? "status-dot green" : "status-dot gray"} />
-            {node ? "Application is responding" : "Node information unavailable"}
-          </div>
-        </div>
-
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box violet"><Network size={19} /></div>
-            <span className="muted-label">SERVER ROLE</span>
-          </div>
-          <div className="metric">{loading ? "—" : node?.role?.toUpperCase() ?? "—"}</div>
-          <div className="metric-foot">Configured node role</div>
-        </div>
-
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box green"><Cpu size={19} /></div>
-            <span className="muted-label">APP VERSION</span>
-          </div>
-          <div className="metric">{node?.app_version ?? "—"}</div>
-          <div className="metric-foot">Installed application version</div>
-        </div>
-      </div>
-
-      <section className="section">
-        <div className="section-heading">
-          <div>
-            <h2>This server</h2>
-            <p>Identity and configuration information for this node.</p>
-          </div>
-          <span className="section-tag">LOCAL NODE</span>
-        </div>
-
-        <div className="panel details-panel">
-          <DetailRow label="Node ID" value={node?.node_id ?? "Not available"} />
-          <DetailRow label="Role" value={node?.role?.toUpperCase() ?? "Not available"} />
-          <DetailRow label="Version" value={node?.app_version ?? "Not available"} />
-          <DetailRow label="Panel URL" value={node?.panel_url || "Not configured"} />
-        </div>
-      </section>
-
-      <section className="section">
-        <div className="section-heading">
-          <div>
-            <h2>Node pairing</h2>
-            <p>Master and Agent registration will be managed here.</p>
-          </div>
-        </div>
-        <div className="panel empty-panel">
-          <div className="empty-icon"><Globe size={22} /></div>
-          <h3>Pairing interface not connected</h3>
-          <p>
-            Registration, token generation and peer discovery will appear here
-            after the backend pairing API is implemented.
-          </p>
-          <span className="coming-label">BACKEND INTEGRATION PENDING</span>
-        </div>
-      </section>
-    </>
-  );
-}
-
-function DetailRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="detail-row">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function TunnelsPage() {
-  return (
-    <>
-      <PageHeading
-        eyebrow="TRAFFIC MANAGEMENT"
-        title="Tunnels"
-        description="Configure traffic forwarding methods independently from connection discovery."
-      />
-
-      <div className="notice-panel">
-        <div className="notice-icon"><CircleHelp size={19} /></div>
-        <div>
-          <strong>Traffic engine is not connected yet</strong>
-          <p>
-            The forwarding controls will become active when the tunnel engine
-            and its driver APIs are implemented. No traffic is being forwarded
-            by this dashboard yet.
-          </p>
-        </div>
-      </div>
-
-      <div className="overview-grid two">
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box blue"><Wifi size={19} /></div>
-            <span className="muted-label">DISCOVERY METHODS</span>
-          </div>
-          <div className="metric">30 planned</div>
-          <div className="metric-foot">Each method will be tested independently</div>
-        </div>
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box violet"><Play size={19} /></div>
-            <span className="muted-label">TRAFFIC FORWARDING</span>
-          </div>
-          <div className="metric">Not active</div>
-          <div className="metric-foot">Waiting for engine integration</div>
-        </div>
-      </div>
-
-      <section className="section">
-        <div className="section-heading">
-          <div>
-            <h2>Connection methods</h2>
-            <p>Method-specific configuration and TCP/UDP capabilities.</p>
-          </div>
-          <span className="section-tag">PLANNED</span>
-        </div>
-        <div className="panel empty-panel">
-          <div className="empty-icon"><Settings2 size={22} /></div>
-          <h3>Driver catalog pending</h3>
-          <p>
-            The 30 method names, supported protocols, port settings and
-            independent traffic switches will be added after the driver
-            specifications are finalized.
-          </p>
-          <span className="coming-label">NOT YET CONFIGURABLE</span>
-        </div>
-      </section>
-    </>
-  );
-}
-
-function AnalyticsPage() {
-  return (
-    <>
-      <PageHeading
-        eyebrow="NETWORK INSIGHTS"
-        title="Analytics"
-        description="Monitor traffic usage on this server."
-      />
-
-      <div className="overview-grid two">
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box blue"><ArrowDownToLine size={19} /></div>
-            <span className="muted-label">INCOMING TRAFFIC</span>
-          </div>
-          <div className="metric">—</div>
-          <div className="metric-foot">Download · Data not available</div>
-        </div>
-        <div className="panel overview-card">
-          <div className="card-top">
-            <div className="icon-box violet"><ArrowUpFromLine size={19} /></div>
-            <span className="muted-label">OUTGOING TRAFFIC</span>
-          </div>
-          <div className="metric">—</div>
-          <div className="metric-foot">Upload · Data not available</div>
-        </div>
-      </div>
-
-      <section className="section">
-        <div className="section-heading">
-          <div>
-            <h2>Traffic history</h2>
-            <p>Usage history for this host only.</p>
-          </div>
-          <span className="section-tag">LOCAL NODE</span>
-        </div>
-        <div className="panel empty-panel chart-placeholder">
-          <div className="empty-icon"><Activity size={22} /></div>
-          <h3>No traffic history available</h3>
-          <p>
-            Real network measurements will be displayed after the traffic
-            accounting service is implemented. No sample or fabricated
-            statistics are shown.
-          </p>
-          <span className="coming-label">ANALYTICS ENGINE PENDING</span>
-        </div>
-      </section>
-    </>
   );
 }
