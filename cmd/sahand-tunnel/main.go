@@ -27,8 +27,8 @@ import (
 
 const (
 	AppName        = "sahand-tunnel"
-	AppVersion     = "0.2.1"
-	defaultListen  = "127.0.0.1:18080"
+	AppVersion     = "0.3.0"
+	defaultPort    = 18080
 	passwordRounds = 310000
 	sessionTTL     = 12 * time.Hour
 )
@@ -38,10 +38,10 @@ type Config struct {
 	NodeID        string    `json:"node_id"`
 	ListenAddr    string    `json:"listen_addr"`
 	PanelURL      string    `json:"panel_url,omitempty"`
-	PanelPort     int       `json:"panel_port,omitempty"`
-	AdminUsername string    `json:"admin_username,omitempty"`
-	AdminSalt     string    `json:"admin_salt,omitempty"`
-	AdminHash     string    `json:"admin_hash,omitempty"`
+	PanelPort     int       `json:"panel_port"`
+	AdminUsername string    `json:"admin_username"`
+	AdminSalt     string    `json:"admin_salt"`
+	AdminHash     string    `json:"admin_hash"`
 	CreatedAt     time.Time `json:"created_at"`
 }
 
@@ -74,20 +74,16 @@ func main() {
 	switch os.Args[1] {
 	case "version":
 		fmt.Printf("%s %s\n", AppName, AppVersion)
-
 	case "init":
 		if err := runInit(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
-
 	case "serve":
-		if err := runServer(); err != nil {
+		if err := runServer(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
-
 	case "menu":
 		runMenu()
-
 	default:
 		printUsage()
 		os.Exit(1)
@@ -111,48 +107,40 @@ func configPath() string {
 	return "./data/config.json"
 }
 
-func randomHex(bytesCount int) (string, error) {
-	b := make([]byte, bytesCount)
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
 }
 
-// PBKDF2-HMAC-SHA256 implementation.
 func pbkdf2SHA256(password, salt []byte, iterations, keyLen int) []byte {
 	const hashLen = 32
-
 	blocks := (keyLen + hashLen - 1) / hashLen
 	result := make([]byte, 0, blocks*hashLen)
 
 	for block := 1; block <= blocks; block++ {
 		mac := hmac.New(sha256.New, password)
-		mac.Write(salt)
-		mac.Write([]byte{
-			byte(block >> 24),
-			byte(block >> 16),
-			byte(block >> 8),
-			byte(block),
+		_, _ = mac.Write(salt)
+		_, _ = mac.Write([]byte{
+			byte(block >> 24), byte(block >> 16),
+			byte(block >> 8), byte(block),
 		})
-
 		u := mac.Sum(nil)
 		t := make([]byte, len(u))
 		copy(t, u)
 
 		for i := 1; i < iterations; i++ {
 			mac = hmac.New(sha256.New, password)
-			mac.Write(u)
+			_, _ = mac.Write(u)
 			u = mac.Sum(nil)
-
 			for j := range t {
 				t[j] ^= u[j]
 			}
 		}
-
 		result = append(result, t...)
 	}
-
 	return result[:keyLen]
 }
 
@@ -161,14 +149,8 @@ func hashPassword(password string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-
-	saltBytes, err := hex.DecodeString(salt)
-	if err != nil {
-		return "", "", err
-	}
-
+	saltBytes, _ := hex.DecodeString(salt)
 	hash := pbkdf2SHA256([]byte(password), saltBytes, passwordRounds, 32)
-
 	return salt, hex.EncodeToString(hash), nil
 }
 
@@ -177,41 +159,32 @@ func verifyPassword(password, saltHex, hashHex string) bool {
 	if err != nil {
 		return false
 	}
-
 	expected, err := hex.DecodeString(hashHex)
 	if err != nil || len(expected) != 32 {
 		return false
 	}
-
 	actual := pbkdf2SHA256([]byte(password), salt, passwordRounds, 32)
-
 	return subtle.ConstantTimeCompare(actual, expected) == 1
 }
 
 func readPasswordFromStdin() (string, error) {
 	reader := bufio.NewReader(os.Stdin)
-
 	password, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
 	}
-
 	password = strings.TrimRight(password, "\r\n")
-
 	if len(password) < 12 {
 		return "", errors.New("administrator password must contain at least 12 characters")
 	}
-
 	if len(password) > 1024 {
 		return "", errors.New("administrator password is too long")
 	}
-
 	return password, nil
 }
 
 func loadExistingConfig(path string) (Config, bool, error) {
 	var cfg Config
-
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return cfg, false, nil
@@ -219,39 +192,52 @@ func loadExistingConfig(path string) (Config, bool, error) {
 	if err != nil {
 		return cfg, false, err
 	}
-
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, false, fmt.Errorf("cannot read existing configuration: %w", err)
 	}
-
 	return cfg, true, nil
+}
+
+func saveConfig(path string, cfg Config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func runInit(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
-
 	role := fs.String("role", "", "master or agent")
-	listen := fs.String("listen", defaultListen, "local application listen address")
-	panelPort := fs.Int("panel-port", 0, "panel application port")
-	panelURL := fs.String("panel-url", "", "public HTTPS panel URL")
+	listen := fs.String("listen", "", "application listen address")
+	panelPort := fs.Int("panel-port", 0, "panel port")
+	panelURL := fs.String("panel-url", "", "optional public HTTPS panel URL")
 	adminUser := fs.String("admin-user", "", "administrator username")
-	passwordStdin := fs.Bool("admin-password-stdin", false, "read administrator password from stdin")
+	passwordStdin := fs.Bool("admin-password-stdin", false, "read password from stdin")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	path := configPath()
-
 	cfg, exists, err := loadExistingConfig(path)
 	if err != nil {
 		return err
 	}
 
-	// Preserve the identity of an existing installation.
 	if !exists {
 		cfg.CreatedAt = time.Now().UTC()
-
 		cfg.NodeID, err = randomHex(16)
 		if err != nil {
 			return err
@@ -264,47 +250,34 @@ func runInit(args []string) error {
 		}
 		cfg.Role = *role
 	}
-
-	if cfg.Role == "" {
+	if cfg.Role != "master" && cfg.Role != "agent" {
 		return errors.New("role is required: use --role master or --role agent")
+	}
+
+	if *panelPort != 0 {
+		if *panelPort < 1024 || *panelPort > 65535 {
+			return errors.New("panel port must be between 1024 and 65535")
+		}
+		cfg.PanelPort = *panelPort
+	}
+	if cfg.PanelPort == 0 {
+		cfg.PanelPort = defaultPort
 	}
 
 	if *listen != "" {
 		cfg.ListenAddr = *listen
 	}
-
 	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = defaultListen
-	}
-
-	if *panelPort != 0 {
-		if *panelPort < 20000 || *panelPort > 60000 {
-			return errors.New("panel port must be between 20000 and 60000")
-		}
-
-		cfg.PanelPort = *panelPort
-	}
-
-	if cfg.PanelPort != 0 {
-		expectedListen := fmt.Sprintf("127.0.0.1:%d", cfg.PanelPort)
-
-		if cfg.ListenAddr != expectedListen {
-			return errors.New("panel port and listen address do not match")
-		}
+		cfg.ListenAddr = fmt.Sprintf(":%d", cfg.PanelPort)
 	}
 
 	if *panelURL != "" {
 		cfg.PanelURL = strings.TrimRight(*panelURL, "/")
 	}
 
-	if !strings.HasPrefix(cfg.PanelURL, "https://") {
-		return errors.New("a public HTTPS panel URL is required")
-	}
-
 	if *adminUser != "" {
-		cfg.AdminUsername = *adminUser
+		cfg.AdminUsername = strings.TrimSpace(*adminUser)
 	}
-
 	if cfg.AdminUsername == "" {
 		return errors.New("administrator username is required")
 	}
@@ -314,13 +287,11 @@ func runInit(args []string) error {
 		if err != nil {
 			return err
 		}
-
 		cfg.AdminSalt, cfg.AdminHash, err = hashPassword(password)
 		if err != nil {
 			return err
 		}
 	}
-
 	if cfg.AdminSalt == "" || cfg.AdminHash == "" {
 		return errors.New("administrator password is required; use --admin-password-stdin")
 	}
@@ -331,92 +302,58 @@ func runInit(args []string) error {
 			return err
 		}
 	}
-
 	if cfg.CreatedAt.IsZero() {
 		cfg.CreatedAt = time.Now().UTC()
 	}
 
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return err
-	}
-
-	tmp := path + ".tmp"
-
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := saveConfig(path, cfg); err != nil {
 		return err
 	}
 
 	fmt.Println("Installation configured successfully.")
 	fmt.Printf("Role: %s\n", cfg.Role)
 	fmt.Printf("Node ID: %s\n", cfg.NodeID)
-	fmt.Printf("Panel URL: %s\n", cfg.PanelURL)
+	fmt.Printf("Panel port: %d\n", cfg.PanelPort)
+	if cfg.PanelURL != "" {
+		fmt.Printf("Panel URL: %s\n", cfg.PanelURL)
+	} else {
+		fmt.Println("Panel URL: not configured (HTTP/IP mode)")
+	}
 	fmt.Printf("Config: %s\n", path)
-
 	return nil
 }
 
 func runServer() error {
-	cfg, _, err := loadExistingConfig(configPath())
+	cfg, exists, err := loadExistingConfig(configPath())
 	if err != nil {
 		return err
 	}
-
+	if !exists {
+		return errors.New("configuration file does not exist; run the installer first")
+	}
 	if cfg.Role != "master" && cfg.Role != "agent" {
 		return errors.New("invalid role in configuration")
 	}
-
 	if cfg.NodeID == "" {
 		return errors.New("node ID is missing from configuration")
 	}
-
-	if cfg.PanelPort < 20000 || cfg.PanelPort > 60000 {
+	if cfg.PanelPort < 1024 || cfg.PanelPort > 65535 {
 		return errors.New("invalid panel port in configuration")
 	}
-
-	expectedListen := fmt.Sprintf("127.0.0.1:%d", cfg.PanelPort)
-
-	if cfg.ListenAddr != expectedListen {
-		return errors.New("panel listen address does not match configured panel port")
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = fmt.Sprintf(":%d", cfg.PanelPort)
 	}
-
-	host, _, err := net.SplitHostPort(cfg.ListenAddr)
-	if err != nil {
-		return errors.New("invalid panel listen address")
-	}
-
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return errors.New("panel must listen on a loopback address")
-	}
-
 	if cfg.AdminUsername == "" || cfg.AdminSalt == "" || cfg.AdminHash == "" {
-		return errors.New("administrator credentials are missing; run the installer to configure the panel")
-	}
-
-	if !strings.HasPrefix(cfg.PanelURL, "https://") {
-		return errors.New("valid HTTPS panel URL is missing; run the installer again")
+		return errors.New("administrator credentials are missing")
 	}
 
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/api/v1/health", handleHealth)
 	mux.HandleFunc("/login", handleLogin)
 	mux.HandleFunc("/logout", requireAuth(handleLogout))
-
 	mux.HandleFunc("/api/v1/node", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		handleNode(w, r, cfg)
 	}))
-
 	mux.HandleFunc("/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		handleDashboard(w, r, cfg)
 	}))
@@ -431,8 +368,11 @@ func runServer() error {
 	}
 
 	log.Printf("%s %s starting on %s", AppName, AppVersion, cfg.ListenAddr)
-	log.Printf("Public panel: %s", cfg.PanelURL)
-
+	if cfg.PanelURL != "" {
+		log.Printf("Public panel: %s", cfg.PanelURL)
+	} else {
+		log.Printf("Panel is available on port %d (HTTP mode)", cfg.PanelPort)
+	}
 	return server.ListenAndServe()
 }
 
@@ -442,13 +382,18 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		w.Header().Set(
-			"Content-Security-Policy",
-			"default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-		)
-
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	// Caddy sets this header when proxying HTTPS requests.
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -456,7 +401,6 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, `{"status":"ok"}`)
 }
@@ -466,27 +410,19 @@ func clientIP(r *http.Request) string {
 	if err != nil {
 		return "unknown"
 	}
-
 	peerIP := net.ParseIP(host)
 	if peerIP == nil {
 		return "unknown"
 	}
-
-	// Trust forwarded headers only when the direct peer is loopback.
-	// This is expected when Caddy proxies requests to the local Go server.
 	if peerIP.IsLoopback() {
 		forwarded := r.Header.Get("X-Forwarded-For")
-
 		if forwarded != "" {
-			parts := strings.Split(forwarded, ",")
-			candidate := strings.TrimSpace(parts[0])
-
+			candidate := strings.TrimSpace(strings.Split(forwarded, ",")[0])
 			if ip := net.ParseIP(candidate); ip != nil {
 				return ip.String()
 			}
 		}
 	}
-
 	return peerIP.String()
 }
 
@@ -496,41 +432,33 @@ func allowLogin(ip string) bool {
 
 	now := time.Now()
 	recent := make([]time.Time, 0)
-
 	for _, t := range loginAttempts[ip] {
 		if now.Sub(t) < 10*time.Minute {
 			recent = append(recent, t)
 		}
 	}
-
 	if len(recent) >= 5 {
 		loginAttempts[ip] = recent
 		return false
 	}
-
 	recent = append(recent, now)
 	loginAttempts[ip] = recent
 
-	// Remove expired entries for other IPs to prevent unbounded growth.
 	for key, attempts := range loginAttempts {
 		if key == ip {
 			continue
 		}
-
 		active := false
-
 		for _, attempt := range attempts {
 			if now.Sub(attempt) < 10*time.Minute {
 				active = true
 				break
 			}
 		}
-
 		if !active {
 			delete(loginAttempts, key)
 		}
 	}
-
 	return true
 }
 
@@ -539,22 +467,16 @@ func createSession() (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 
 	now := time.Now()
-
 	for key, session := range sessions {
 		if now.After(session.ExpiresAt) {
 			delete(sessions, key)
 		}
 	}
-
-	sessions[token] = Session{
-		ExpiresAt: now.Add(sessionTTL),
-	}
-
+	sessions[token] = Session{ExpiresAt: now.Add(sessionTTL)}
 	return token, nil
 }
 
@@ -563,7 +485,6 @@ func validSession(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 
@@ -571,12 +492,10 @@ func validSession(r *http.Request) bool {
 	if !ok {
 		return false
 	}
-
 	if time.Now().After(session.ExpiresAt) {
 		delete(sessions, cookie.Value)
 		return false
 	}
-
 	return true
 }
 
@@ -587,11 +506,9 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
 			return
 		}
-
 		next(w, r)
 	}
 }
@@ -602,26 +519,21 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
-
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, loginHTML)
 		return
 	}
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	ip := clientIP(r)
-
 	if !allowLogin(ip) {
 		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
 		return
 	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
-
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
@@ -635,10 +547,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	username := r.FormValue("username")
 	password := r.FormValue("password")
-
 	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.AdminUsername)) == 1
 	passOK := verifyPassword(password, cfg.AdminSalt, cfg.AdminHash)
-
 	if !userOK || !passOK {
 		time.Sleep(500 * time.Millisecond)
 		http.Error(w, "invalid username or password", http.StatusUnauthorized)
@@ -650,18 +560,12 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not create session", http.StatusInternalServerError)
 		return
 	}
-
+	secure := isHTTPS(r)
 	http.SetCookie(w, &http.Cookie{
-		Name:     "sahand_session",
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		Expires:  time.Now().Add(sessionTTL),
-		MaxAge:   int(sessionTTL.Seconds()),
+		Name: "sahand_session", Value: token, Path: "/",
+		HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode,
+		Expires: time.Now().Add(sessionTTL), MaxAge: int(sessionTTL.Seconds()),
 	})
-
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -670,23 +574,16 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	if cookie, err := r.Cookie("sahand_session"); err == nil {
 		sessionsMu.Lock()
 		delete(sessions, cookie.Value)
 		sessionsMu.Unlock()
 	}
-
 	http.SetCookie(w, &http.Cookie{
-		Name:     "sahand_session",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   -1,
+		Name: "sahand_session", Value: "", Path: "/",
+		HttpOnly: true, Secure: isHTTPS(r),
+		SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
-
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
@@ -695,15 +592,10 @@ func handleNode(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	info := NodeInfo{
-		AppVersion: AppVersion,
-		Role:       cfg.Role,
-		NodeID:     cfg.NodeID,
-		Status:     "online",
-		PanelURL:   cfg.PanelURL,
+		AppVersion: AppVersion, Role: cfg.Role, NodeID: cfg.NodeID,
+		Status: "online", PanelURL: cfg.PanelURL,
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(info)
 }
@@ -713,23 +605,24 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.NotFound(w, r)
 		return
 	}
-
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	page := strings.ReplaceAll(dashboardHTML, "{{PANEL_URL}}", html.EscapeString(cfg.PanelURL))
+	panelAddress := cfg.PanelURL
+	if panelAddress == "" {
+		panelAddress = "HTTP / port " + fmt.Sprint(cfg.PanelPort)
+	}
+	page := strings.ReplaceAll(dashboardHTML, "{{PANEL_URL}}", html.EscapeString(panelAddress))
 	page = strings.ReplaceAll(page, "{{ROLE}}", html.EscapeString(strings.ToUpper(cfg.Role)))
 	page = strings.ReplaceAll(page, "{{NODE_ID}}", html.EscapeString(cfg.NodeID))
 	page = strings.ReplaceAll(page, "{{VERSION}}", html.EscapeString(AppVersion))
-
 	_, _ = io.WriteString(w, page)
 }
 
-const loginHTML = ` + "`" + `<!DOCTYPE html>
+const loginHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -758,12 +651,12 @@ button{width:100%;margin-top:24px;padding:13px;border:0;border-radius:9px;backgr
 <input name="password" type="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button>
 </form>
-<div class="small">Secure server management</div>
+<div class="small">Server management</div>
 </div>
 </body>
-</html>` + "`" + `
+</html>`
 
-const dashboardHTML = ` + "`" + `<!DOCTYPE html>
+const dashboardHTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -775,7 +668,6 @@ body{margin:0;background:#0b1020;color:#eef2ff;font-family:Arial,sans-serif}
 header{padding:22px 5%;background:#111a2e;border-bottom:1px solid #293653;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
 .brand{font-size:21px;font-weight:bold}
 .address{color:#8fa4c8;font-size:13px;margin-top:7px}
-.address a{color:#72a4ff;text-decoration:none}
 button{background:#263653;color:#eaf0ff;border:1px solid #3b4d6c;border-radius:8px;padding:10px 15px;cursor:pointer}
 main{max-width:1100px;margin:35px auto;padding:0 22px}
 h1{font-size:27px;margin-bottom:8px}
@@ -792,11 +684,9 @@ h1{font-size:27px;margin-bottom:8px}
 <header>
 <div>
 <div class="brand">SAHAND TUNNEL</div>
-<div class="address">Panel address: <a href="{{PANEL_URL}}">{{PANEL_URL}}</a></div>
+<div class="address">Panel address: {{PANEL_URL}}</div>
 </div>
-<form method="post" action="/logout">
-<button type="submit">Sign out</button>
-</form>
+<form method="post" action="/logout"><button type="submit">Sign out</button></form>
 </header>
 <main>
 <h1>Dashboard</h1>
@@ -807,20 +697,19 @@ h1{font-size:27px;margin-bottom:8px}
 <div class="card"><div class="label">Application version</div><div class="value">{{VERSION}}</div></div>
 <div class="card"><div class="label">Node ID</div><div class="value">{{NODE_ID}}</div></div>
 </div>
-<div class="footer">Sahand Tunnel · Secure server management</div>
+<div class="footer">Sahand Tunnel · Server management</div>
 </main>
 </body>
-</html>` + "`" + `
+</html>`
 
 func runMenu() {
 	reader := bufio.NewReader(os.Stdin)
-
 	for {
 		fmt.Println()
 		fmt.Println("================================")
 		fmt.Println("       SAHAND TUNNEL")
 		fmt.Println("================================")
-		fmt.Println("1. Configure Installation")
+		fmt.Println("1. Configure Domain & SSL")
 		fmt.Println("2. Start Service")
 		fmt.Println("3. Restart Service")
 		fmt.Println("4. Stop Service")
@@ -835,53 +724,41 @@ func runMenu() {
 			fmt.Println("Input error:", err)
 			return
 		}
-
 		choice = strings.TrimSpace(choice)
 
 		switch choice {
 		case "1":
-			fmt.Println("Use the installer to configure or upgrade this installation.")
-
+			cmd := exec.Command("sahand-tunnel-domain")
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Println("Domain/SSL configuration failed:", err)
+			}
 		case "2":
 			runSystemctl("enable", "--now", "sahand-tunnel")
-
 		case "3":
 			runSystemctl("restart", "sahand-tunnel")
-
 		case "4":
 			runSystemctl("stop", "sahand-tunnel")
-
 		case "5":
 			runSystemctl("status", "sahand-tunnel", "--no-pager")
-
 		case "6":
-			runSystemctl("status", "sahand-tunnel", "--no-pager", "-l")
-			fmt.Println("\nRecent logs:")
-
-			runSystemctl("show", "-p", "ExecMainStatus", "sahand-tunnel")
-
-			cmd := exec.Command("journalctl", "-u", "sahand-tunnel", "-n", "40", "--no-pager")
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
+			cmd := exec.Command("journalctl", "-u", "sahand-tunnel", "-n", "50", "--no-pager")
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			_ = cmd.Run()
-
 		case "7":
 			cmd := exec.Command("sahand-tunnel-update")
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-
+			cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 			if err := cmd.Run(); err != nil {
 				fmt.Println("Update failed:", err)
 			}
-
 		case "0":
 			return
-
 		case "":
 			if errors.Is(err, io.EOF) {
 				return
 			}
-
 		default:
 			fmt.Println("Invalid option.")
 		}
@@ -889,7 +766,6 @@ func runMenu() {
 		if errors.Is(err, io.EOF) {
 			return
 		}
-
 		fmt.Print("\nPress Enter to continue...")
 		_, _ = reader.ReadString('\n')
 	}
@@ -897,9 +773,7 @@ func runMenu() {
 
 func runSystemctl(args ...string) {
 	cmd := exec.Command("systemctl", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		fmt.Println("Command failed:", err)
 	}
