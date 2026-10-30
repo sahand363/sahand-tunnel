@@ -223,7 +223,6 @@ install -m 0755 "${TMP}/${BIN_NAME}" "$BIN"
 log "Generating application configuration"
 
 if [ "$KEEP_PASSWORD_FLAG" = "yes" ]; then
-    # Keep existing password hashes and repair missing configuration fields.
     python3 - "$CONFIG" "$TMP/config.new.json" "$APP_PORT" "$ADMIN_USER" <<'PY'
 import json
 import os
@@ -264,13 +263,11 @@ else
         || fail "Application configuration failed."
 
     if [ "$EXISTING" -eq 1 ]; then
-        # Preserve the identity of an existing node while repairing its config.
         python3 - "$TMP/config.backup.json" "$NEW_CONFIG" "$TMP/config.merged.json" <<'PY'
 import json
 import os
 import sys
 
-# sys.argv[0] is the Python script name; actual arguments start at index 1.
 old_path, new_path, output_path = sys.argv[1:]
 
 with open(old_path) as f:
@@ -283,7 +280,6 @@ new["role"] = old["role"]
 new["node_id"] = old["node_id"]
 new["created_at"] = old.get("created_at", new.get("created_at"))
 
-# Preserve the previous public URL if one was configured.
 if old.get("panel_url"):
     new["panel_url"] = old["panel_url"]
 
@@ -374,6 +370,11 @@ command -v curl >/dev/null 2>&1 || {
     exit 1
 }
 
+command -v ip >/dev/null 2>&1 || {
+    echo "iproute2 is required."
+    exit 1
+}
+
 [ -f "$CONFIG" ] || {
     echo "Configuration file not found."
     exit 1
@@ -396,14 +397,23 @@ if [[ ! "$DOMAIN" =~ ^[a-z0-9.-]+$ ]] || [[ "$DOMAIN" != *.* ]]; then
     exit 1
 fi
 
-SERVER_IP="$(curl -4 -fsS --max-time 10 https://api.ipify.org)" || {
-    echo "Could not determine server public IPv4 address."
-    exit 1
-}
+# Detect the server's primary interface IP, not its NAT egress IP.
+SERVER_IP="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
 
-if ! getent ahostsv4 "$DOMAIN" | awk '{print $1}' | grep -Fxq "$SERVER_IP"; then
-    echo "The domain A record does not point to this server."
+if [ -z "$SERVER_IP" ]; then
+    echo "Could not detect server interface IP."
+    exit 1
+fi
+
+echo "Detected server interface IP: $SERVER_IP"
+
+DNS_IP="$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u || true)"
+
+if ! printf '%s\n' "$DNS_IP" | grep -Fxq "$SERVER_IP"; then
+    echo "The domain A record does not point to this server interface IP."
     echo "Expected IPv4: $SERVER_IP"
+    echo "Found:"
+    printf '%s\n' "$DNS_IP"
     exit 1
 fi
 
@@ -540,11 +550,30 @@ echo
 echo "Role: ${ROLE}"
 echo "Application port: ${APP_PORT}"
 echo
-echo "Panel address:"
-echo "  http://SERVER-IP:${APP_PORT}"
+
+PANEL_URL="$(python3 - "$CONFIG" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    cfg = json.load(f)
+
+print(cfg.get("panel_url") or "")
+PY
+)"
+
+if [ -n "$PANEL_URL" ]; then
+    echo "Panel address:"
+    echo "  ${PANEL_URL}"
+else
+    echo "Panel address:"
+    echo "  http://SERVER-IP:${APP_PORT}"
+    echo
+    echo "Domain and HTTPS are not configured."
+fi
+
 echo
-echo "Domain and HTTPS are optional."
-echo "To configure them later, run:"
+echo "To configure domain and HTTPS later, run:"
 echo "  sahand-tunnel menu"
 echo
 echo "Allow TCP port ${APP_PORT} in your firewall."
