@@ -18,6 +18,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"bufio"
+    "os/exec"
 )
 
 const AppName = "sahand-tunnel"
@@ -45,6 +47,8 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "menu":
+    	runMenu()
 	case "init":
 		runInit(os.Args[2:])
 	case "serve":
