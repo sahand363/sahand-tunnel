@@ -118,7 +118,7 @@ systemctl daemon-reload
 
 if [ -f "${CONFIG_DIR}/config.json" ]; then
     systemctl enable sahand-tunnel
-    systemctl restart sahand-tunnel || true
+    systemctl restart sahand-tunnel
 fi
 
 echo
