@@ -1,115 +1,269 @@
-
 import { useEffect, useState } from "react";
 import {
   Activity,
   ArrowDown,
   ArrowUp,
+  Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   Globe2,
+  Lock,
   Pause,
   Play,
   Plus,
+  RefreshCw,
   Server,
   Settings2,
   Shield,
   Trash2,
-  Wifi,
-  X,
 } from "lucide-react";
 
 type Tab = "servers" | "tunnels" | "analytics";
+type Role = "master" | "agent";
 
-type ServerItem = {
+type MethodResult = {
+  method_id: number;
+  success: boolean;
+  direction: string;
+  latency_ms: number;
+  error_reason?: string;
+  tested_at?: string;
+};
+
+type LifelineEvent = {
+  method_id: number;
+  method_name: string;
+  security: number;
+  latency_ms: number;
+  direction: string;
+  connected_at: string;
+};
+
+type TunnelConfig = {
   id: number;
+  name: string;
+  security: number;
+  traffic_type: string;
+  implemented: boolean;
+  enabled: boolean;
+  listen_port: number;
+  forward_ports: string;
+  sni?: string;
+  ws_path?: string;
+  cert_pin?: string;
+  heartbeat_sec?: number;
+  stream_limit?: number;
+  speed_limit_mbps?: string;
+  last_discovery: MethodResult;
+};
+
+type ServerPeer = {
+  id: string;
   name: string;
   ip: string;
+  token: string;
+  config_version: number;
+  sync_state: string;
+  status: string;
   running: boolean;
+  active_method_id: number;
+  active_method: string;
+  active_security: number;
+  active_latency_ms: number;
+  next_retry_at?: string;
+  recent_lifelines: LifelineEvent[];
+  tunnels: TunnelConfig[];
 };
 
-type TunnelItem = {
-  id: number;
-  name: string;
-  enabled: boolean;
-  port: string;
+type DailyUsage = {
+  date: string;
+  rx_bytes: number;
+  tx_bytes: number;
 };
 
-const initialTunnels: TunnelItem[] = Array.from(
-  { length: 30 },
-  (_, index) => ({
-    id: index + 1,
-    name: `Tunnel ${String(index + 1).padStart(2, "0")}`,
-    enabled: false,
-    port: "",
-  })
-);
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let idx = 0;
+  let val = bytes;
+  while (val >= 1024 && idx < units.length - 1) {
+    val /= 1024;
+    idx++;
+  }
+  return `${val.toFixed(val >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function securityTierClass(sec: number): string {
+  if (sec >= 85) return "sec-high";
+  if (sec >= 65) return "sec-mid";
+  return "sec-low";
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("servers");
-  const [servers, setServers] = useState<ServerItem[]>([]);
+  const [role, setRole] = useState<Role>("master");
+  const [appVersion, setAppVersion] = useState("0.4.0");
+  const [servers, setServers] = useState<ServerPeer[]>([]);
+  const [selectedServerID, setSelectedServerID] = useState<string>("");
+
+  // Master & Agent Form Inputs
   const [serverName, setServerName] = useState("");
   const [serverIP, setServerIP] = useState("");
+  const [agentToken, setAgentToken] = useState("");
+  const [formError, setFormError] = useState("");
+  const [copiedID, setCopiedID] = useState<string | null>(null);
+  const [expandedHistoryID, setExpandedHistoryID] = useState<string | null>(null);
+
+  // Tunnels Tab State
   const [expandedTunnel, setExpandedTunnel] = useState<number | null>(null);
-  const [tunnels, setTunnels] = useState(initialTunnels);
+
+  // Analytics Tab State
+  const [analyticsRange, setAnalyticsRange] = useState<7 | 30>(7);
+  const [daysUsage, setDaysUsage] = useState<DailyUsage[]>([]);
+
+  // Theme State
   const [darkMode, setDarkMode] = useState(true);
 
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
   }, [darkMode]);
 
-  function addServer(event: React.FormEvent<HTMLFormElement>) {
+  async function fetchState() {
+    try {
+      const res = await fetch("/api/v1/state");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.role === "master" || data.role === "agent") {
+        setRole(data.role);
+      }
+      if (data.app_version) {
+        setAppVersion(data.app_version);
+      }
+      const list: ServerPeer[] = Array.isArray(data.servers) ? data.servers : [];
+      setServers(list);
+      setSelectedServerID((prev) => {
+        if (prev && list.some((s) => s.id === prev)) return prev;
+        return list.length > 0 ? list[0].id : "";
+      });
+    } catch {
+      // Ignore transient local polling errors
+    }
+  }
+
+  async function fetchAnalytics() {
+    try {
+      const res = await fetch("/api/v1/analytics");
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.days)) {
+        setDaysUsage(data.days);
+      }
+    } catch {
+      // Ignore transient local polling errors
+    }
+  }
+
+  useEffect(() => {
+    fetchState();
+    fetchAnalytics();
+    const timer = setInterval(() => {
+      fetchState();
+    }, 4000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === "analytics") {
+      fetchAnalytics();
+    }
+  }, [activeTab]);
+
+  async function handleAddOrConnectServer(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    setFormError("");
 
-    const name = serverName.trim();
     const ip = serverIP.trim();
-
-    if (!name || !ip) return;
-
-    setServers((current) => [
-      ...current,
-      {
-        id: Date.now(),
-        name,
-        ip,
-        running: false,
-      },
-    ]);
-
-    setServerName("");
-    setServerIP("");
+    if (role === "master") {
+      const name = serverName.trim();
+      if (!name || !ip) return;
+      const res = await fetch("/api/v1/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, ip }),
+      });
+      if (!res.ok) {
+        setFormError(await res.text());
+        return;
+      }
+      setServerName("");
+      setServerIP("");
+      await fetchState();
+    } else {
+      const token = agentToken.trim();
+      if (!ip || !token) return;
+      const res = await fetch("/api/v1/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip, token }),
+      });
+      if (!res.ok) {
+        setFormError(await res.text());
+        return;
+      }
+      setServerIP("");
+      setAgentToken("");
+      await fetchState();
+    }
   }
 
-  function toggleServer(id: number) {
-    setServers((current) =>
-      current.map((server) =>
-        server.id === id
-          ? { ...server, running: !server.running }
-          : server
+  async function handleServerAction(serverID: string, action: "play" | "pause" | "delete" | "regen_token") {
+    await fetch("/api/v1/servers/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ server_id: serverID, action }),
+    });
+    await fetchState();
+  }
+
+  async function copyToken(id: string, token: string) {
+    try {
+      await navigator.clipboard.writeText(token);
+      setCopiedID(id);
+      setTimeout(() => setCopiedID(null), 1800);
+    } catch {
+      // Fallback ignored
+    }
+  }
+
+  async function saveTunnelConfig(serverID: string, updated: TunnelConfig) {
+    if (role !== "master") return;
+    setServers((prev) =>
+      prev.map((srv) =>
+        srv.id === serverID
+          ? {
+              ...srv,
+              tunnels: srv.tunnels.map((t) => (t.id === updated.id ? updated : t)),
+            }
+          : srv
       )
     );
+    await fetch("/api/v1/tunnels", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ server_id: serverID, tunnel: updated }),
+    });
+    await fetchState();
   }
 
-  function removeServer(id: number) {
-    setServers((current) => current.filter((server) => server.id !== id));
-  }
-
-  function toggleTunnel(id: number) {
-    setTunnels((current) =>
-      current.map((tunnel) =>
-        tunnel.id === id
-          ? { ...tunnel, enabled: !tunnel.enabled }
-          : tunnel
-      )
-    );
-  }
-
-  function updateTunnelPort(id: number, port: string) {
-    setTunnels((current) =>
-      current.map((tunnel) =>
-        tunnel.id === id ? { ...tunnel, port } : tunnel
-      )
-    );
-  }
+  const selectedServer = servers.find((s) => s.id === selectedServerID) || servers[0] || null;
+  const visibleAnalytics = daysUsage.slice(-analyticsRange);
+  const maxDayBytes = Math.max(
+    1,
+    ...visibleAnalytics.map((d) => Math.max(d.rx_bytes, d.tx_bytes))
+  );
+  const totalRx = visibleAnalytics.reduce((acc, d) => acc + d.rx_bytes, 0);
+  const totalTx = visibleAnalytics.reduce((acc, d) => acc + d.tx_bytes, 0);
 
   return (
     <div className="app-shell">
@@ -118,13 +272,15 @@ export default function App() {
           <div className="brand-mark">
             <Shield size={19} strokeWidth={2.2} />
           </div>
-          <span>Sahand<span className="brand-light">Tunnel</span></span>
+          <span>
+            Sahand<span className="brand-light">Tunnel</span>
+          </span>
         </div>
 
         <div className="topbar-right">
           <div className="system-status">
             <span className="status-dot" />
-            <span>LOCAL</span>
+            <span>{role.toUpperCase()}</span>
           </div>
 
           <button
@@ -167,39 +323,74 @@ export default function App() {
 
         {activeTab === "servers" && (
           <section className="page-section">
-            <form className="add-server-form" onSubmit={addServer}>
-              <div className="form-field name-field">
-                <label htmlFor="server-name">NAME</label>
-                <input
-                  id="server-name"
-                  value={serverName}
-                  onChange={(event) => setServerName(event.target.value)}
-                  placeholder="Server name"
-                  autoComplete="off"
-                />
-              </div>
+            <form className="add-server-form" onSubmit={handleAddOrConnectServer}>
+              {role === "master" ? (
+                <>
+                  <div className="form-field name-field">
+                    <label htmlFor="server-name">SERVER NAME</label>
+                    <input
+                      id="server-name"
+                      value={serverName}
+                      onChange={(event) => setServerName(event.target.value)}
+                      placeholder="Agent Frankfurt"
+                      autoComplete="off"
+                    />
+                  </div>
 
-              <div className="form-field ip-field">
-                <label htmlFor="server-ip">IP ADDRESS</label>
-                <input
-                  id="server-ip"
-                  value={serverIP}
-                  onChange={(event) => setServerIP(event.target.value)}
-                  placeholder="192.168.1.1"
-                  autoComplete="off"
-                />
-              </div>
+                  <div className="form-field ip-field">
+                    <label htmlFor="server-ip">AGENT IP ADDRESS</label>
+                    <input
+                      id="server-ip"
+                      value={serverIP}
+                      onChange={(event) => setServerIP(event.target.value)}
+                      placeholder="198.51.100.12"
+                      autoComplete="off"
+                    />
+                  </div>
 
-              <button className="add-button" type="submit">
-                <Plus size={17} />
-                <span>Add server</span>
-              </button>
+                  <button className="add-button" type="submit">
+                    <Plus size={17} />
+                    <span>Generate Token</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <div className="form-field ip-field">
+                    <label htmlFor="master-ip">MASTER IP ADDRESS</label>
+                    <input
+                      id="master-ip"
+                      value={serverIP}
+                      onChange={(event) => setServerIP(event.target.value)}
+                      placeholder="203.0.113.10"
+                      autoComplete="off"
+                    />
+                  </div>
+
+                  <div className="form-field name-field">
+                    <label htmlFor="master-token">MASTER CONNECTION TOKEN</label>
+                    <input
+                      id="master-token"
+                      value={agentToken}
+                      onChange={(event) => setAgentToken(event.target.value)}
+                      placeholder="st1.eyJ2IjoxLC..."
+                      autoComplete="off"
+                    />
+                  </div>
+
+                  <button className="add-button" type="submit">
+                    <Play size={16} />
+                    <span>Connect</span>
+                  </button>
+                </>
+              )}
             </form>
+
+            {formError && <div className="form-error-banner">{formError}</div>}
 
             <div className="section-divider" />
 
             <div className="list-heading">
-              <span>YOUR SERVERS</span>
+              <span>{role === "master" ? "REGISTERED AGENTS" : "MASTER CONNECTION"}</span>
               <span className="item-count">{servers.length}</span>
             </div>
 
@@ -208,51 +399,138 @@ export default function App() {
                 <div className="empty-icon">
                   <Server size={23} />
                 </div>
-                <p>No servers added</p>
+                <p>{role === "master" ? "No agents added" : "Not paired with a Master"}</p>
               </div>
             ) : (
               <div className="server-list">
-                {servers.map((server) => (
-                  <article className="server-row" key={server.id}>
-                    <div className="server-symbol">
-                      <Server size={19} />
-                    </div>
+                {servers.map((server) => {
+                  const historyOpen = expandedHistoryID === server.id;
 
-                    <div className="server-info">
-                      <div className="server-name">{server.name}</div>
-                      <div className="server-address">{server.ip}</div>
-                    </div>
+                  return (
+                    <article className="server-card-block" key={server.id}>
+                      <div className="server-row">
+                        <div className="server-symbol">
+                          <Server size={19} />
+                        </div>
 
-                    <div className="server-state">
-                      <span
-                        className={`state-dot ${server.running ? "online" : ""}`}
-                      />
-                      <span>{server.running ? "Active" : "Paused"}</span>
-                    </div>
+                        <div className="server-info">
+                          <div className="server-title-row">
+                            <span className="server-name">{server.name}</span>
+                            <span className="version-pill">v{server.config_version}</span>
+                          </div>
+                          <div className="server-address">
+                            {server.ip}
+                            {server.active_method ? (
+                              <span className="active-carrier-tag">
+                                • Method {String(server.active_method_id).padStart(2, "0")} ({server.active_method} {server.active_security}%) • {server.active_latency_ms}ms
+                              </span>
+                            ) : server.next_retry_at ? (
+                              <span className="retry-tag"> • Next retry at {server.next_retry_at}</span>
+                            ) : null}
+                          </div>
+                        </div>
 
-                    <button
-                      className={`server-action ${server.running ? "pause" : "play"}`}
-                      onClick={() => toggleServer(server.id)}
-                      title={server.running ? "Pause" : "Play"}
-                      aria-label={server.running ? "Pause server" : "Start server"}
-                    >
-                      {server.running ? (
-                        <Pause size={16} />
-                      ) : (
-                        <Play size={16} />
+                        <div className="server-state">
+                          <span
+                            className={`state-dot ${
+                              server.status === "CONNECTED"
+                                ? "online"
+                                : server.status === "TESTING"
+                                ? "testing"
+                                : ""
+                            }`}
+                          />
+                          <span>{server.status}</span>
+                        </div>
+
+                        {role === "master" && (
+                          <button
+                            className="icon-button"
+                            onClick={() => copyToken(server.id, server.token)}
+                            title="Copy connection token"
+                            aria-label="Copy connection token"
+                          >
+                            {copiedID === server.id ? <Check size={15} /> : <Copy size={15} />}
+                          </button>
+                        )}
+
+                        {role === "master" && (
+                          <button
+                            className="icon-button"
+                            onClick={() => handleServerAction(server.id, "regen_token")}
+                            title="Regenerate token with latest ports"
+                            aria-label="Regenerate token"
+                          >
+                            <RefreshCw size={15} />
+                          </button>
+                        )}
+
+                        <button
+                          className={`server-action ${server.running ? "pause" : "play"}`}
+                          onClick={() =>
+                            handleServerAction(server.id, server.running ? "pause" : "play")
+                          }
+                          title={server.running ? "Pause discovery" : "Start discovery"}
+                          aria-label={server.running ? "Pause discovery" : "Start discovery"}
+                        >
+                          {server.running ? <Pause size={16} /> : <Play size={16} />}
+                        </button>
+
+                        <button
+                          className="icon-button delete-button"
+                          onClick={() => handleServerAction(server.id, "delete")}
+                          title="Remove server"
+                          aria-label="Remove server"
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+
+                      <div className="server-subbar">
+                        <button
+                          className="history-toggle-btn"
+                          onClick={() =>
+                            setExpandedHistoryID(historyOpen ? null : server.id)
+                          }
+                        >
+                          <span>
+                            Recent Working Methods ({server.recent_lifelines?.length || 0}/5)
+                          </span>
+                          {historyOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                        </button>
+
+                        <span className="sync-badge">
+                          {server.sync_state === "synced" ? "Config Synced" : "Pending Sync"}
+                        </span>
+                      </div>
+
+                      {historyOpen && (
+                        <div className="lifeline-history-drawer">
+                          {!server.recent_lifelines || server.recent_lifelines.length === 0 ? (
+                            <div className="history-empty">
+                              No successful connection methods recorded yet.
+                            </div>
+                          ) : (
+                            server.recent_lifelines.map((item, idx) => (
+                              <div className="history-row" key={idx}>
+                                <span className="history-method">
+                                  #{String(item.method_id).padStart(2, "0")} {item.method_name}
+                                </span>
+                                <span className={`sec-badge ${securityTierClass(item.security)}`}>
+                                  {item.security}%
+                                </span>
+                                <span className="history-meta">
+                                  {item.latency_ms}ms • {item.direction}
+                                </span>
+                                <span className="history-time">{item.connected_at}</span>
+                              </div>
+                            ))
+                          )}
+                        </div>
                       )}
-                    </button>
-
-                    <button
-                      className="icon-button delete-button"
-                      onClick={() => removeServer(server.id)}
-                      title="Remove server"
-                      aria-label="Remove server"
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </article>
-                ))}
+                    </article>
+                  );
+                })}
               </div>
             )}
           </section>
@@ -260,128 +538,295 @@ export default function App() {
 
         {activeTab === "tunnels" && (
           <section className="page-section">
-            <div className="list-heading tunnel-heading">
-              <span>TUNNEL METHODS</span>
-              <span className="item-count">30</span>
+            <div className="tunnels-toolbar">
+              <div className="server-selector-group">
+                <label htmlFor="tunnel-server-select">TARGET SERVER</label>
+                <select
+                  id="tunnel-server-select"
+                  className="server-select"
+                  value={selectedServer?.id || ""}
+                  onChange={(e) => setSelectedServerID(e.target.value)}
+                  disabled={servers.length === 0}
+                >
+                  {servers.length === 0 ? (
+                    <option value="">No servers available</option>
+                  ) : (
+                    servers.map((srv) => (
+                      <option key={srv.id} value={srv.id}>
+                        {srv.name} ({srv.ip}) — {srv.status}
+                      </option>
+                    ))
+                  )}
+                </select>
+              </div>
+
+              {role === "agent" && (
+                <div className="readonly-banner">
+                  <Lock size={13} />
+                  <span>READ-ONLY (MANAGED BY MASTER)</span>
+                </div>
+              )}
             </div>
 
-            <div className="tunnel-list">
-              {tunnels.map((tunnel) => {
-                const expanded = expandedTunnel === tunnel.id;
+            {!selectedServer ? (
+              <div className="empty-state">
+                <div className="empty-icon">
+                  <Shield size={23} />
+                </div>
+                <p>Add or connect a server in the Servers tab to view its 30 tunnel methods</p>
+              </div>
+            ) : (
+              <>
+                <div className="list-heading tunnel-heading">
+                  <span>TUNNEL METHODS</span>
+                  <span className="item-count">{selectedServer.tunnels.length}</span>
+                </div>
 
-                return (
-                  <article
-                    className={`tunnel-card ${expanded ? "expanded" : ""}`}
-                    key={tunnel.id}
-                  >
-                    <div className="tunnel-row">
-                      <button
-                        className="tunnel-expand"
-                        onClick={() =>
-                          setExpandedTunnel(expanded ? null : tunnel.id)
-                        }
-                        aria-expanded={expanded}
+                <div className="tunnel-list">
+                  {selectedServer.tunnels.map((tunnel) => {
+                    const expanded = expandedTunnel === tunnel.id;
+                    const disc = tunnel.last_discovery;
+
+                    return (
+                      <article
+                        className={`tunnel-card ${expanded ? "expanded" : ""}`}
+                        key={tunnel.id}
                       >
-                        <span className="tunnel-number">
-                          {String(tunnel.id).padStart(2, "0")}
-                        </span>
-
-                        <span className="tunnel-title">{tunnel.name}</span>
-
-                        {expanded ? (
-                          <ChevronDown size={17} />
-                        ) : (
-                          <ChevronRight size={17} />
-                        )}
-                      </button>
-
-                      <button
-                        className={`switch ${tunnel.enabled ? "switch-on" : ""}`}
-                        onClick={() => toggleTunnel(tunnel.id)}
-                        role="switch"
-                        aria-checked={tunnel.enabled}
-                        aria-label={`Toggle ${tunnel.name}`}
-                      >
-                        <span />
-                      </button>
-                    </div>
-
-                    {expanded && (
-                      <div className="tunnel-settings">
-                        <div className="settings-title">
-                          <Settings2 size={15} />
-                          <span>Settings</span>
-                        </div>
-
-                        <div className="settings-grid">
-                          <div className="form-field">
-                            <label htmlFor={`port-${tunnel.id}`}>
-                              LISTEN PORT
-                            </label>
-                            <input
-                              id={`port-${tunnel.id}`}
-                              inputMode="numeric"
-                              placeholder="Default"
-                              value={tunnel.port}
-                              onChange={(event) =>
-                                updateTunnelPort(tunnel.id, event.target.value)
-                              }
-                            />
-                          </div>
-
-                          <div className="setting-status">
-                            <span className="setting-label">STATUS</span>
-                            <span
-                              className={`setting-value ${
-                                tunnel.enabled ? "enabled-text" : ""
-                              }`}
-                            >
-                              {tunnel.enabled ? "Enabled" : "Disabled"}
+                        <div className="tunnel-row">
+                          <button
+                            className="tunnel-expand"
+                            onClick={() =>
+                              setExpandedTunnel(expanded ? null : tunnel.id)
+                            }
+                            aria-expanded={expanded}
+                          >
+                            <span className="tunnel-number">
+                              {String(tunnel.id).padStart(2, "0")}
                             </span>
-                          </div>
+
+                            <span className="tunnel-title">{tunnel.name}</span>
+
+                            <span className={`sec-badge ${securityTierClass(tunnel.security)}`}>
+                              {tunnel.security}%
+                            </span>
+
+                            <span className="proto-badge">{tunnel.traffic_type.toUpperCase()}</span>
+
+                            {disc?.tested_at && (
+                              <span
+                                className={`disc-pill ${
+                                  disc.success ? "disc-ok" : "disc-fail"
+                                }`}
+                              >
+                                {disc.success
+                                  ? `OK ${disc.latency_ms}ms`
+                                  : disc.error_reason || "Failed"}
+                              </span>
+                            )}
+
+                            {expanded ? (
+                              <ChevronDown size={17} />
+                            ) : (
+                              <ChevronRight size={17} />
+                            )}
+                          </button>
+
+                          <button
+                            className={`switch ${tunnel.enabled ? "switch-on" : ""} ${
+                              role === "agent" ? "switch-disabled" : ""
+                            }`}
+                            onClick={() =>
+                              role === "master" &&
+                              saveTunnelConfig(selectedServer.id, {
+                                ...tunnel,
+                                enabled: !tunnel.enabled,
+                              })
+                            }
+                            disabled={role === "agent"}
+                            role="switch"
+                            aria-checked={tunnel.enabled}
+                            aria-label={`Toggle ${tunnel.name}`}
+                          >
+                            <span />
+                          </button>
                         </div>
-                      </div>
-                    )}
-                  </article>
-                );
-              })}
-            </div>
+
+                        {expanded && (
+                          <div className="tunnel-settings">
+                            <div className="settings-title">
+                              <Settings2 size={15} />
+                              <span>
+                                {tunnel.name} Configuration ({tunnel.traffic_type.toUpperCase()})
+                              </span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label htmlFor={`lport-${tunnel.id}`}>
+                                  TUNNEL LISTEN PORT
+                                </label>
+                                <input
+                                  id={`lport-${tunnel.id}`}
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={tunnel.listen_port}
+                                  onChange={(e) =>
+                                    saveTunnelConfig(selectedServer.id, {
+                                      ...tunnel,
+                                      listen_port: Number(e.target.value) || tunnel.listen_port,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label htmlFor={`fport-${tunnel.id}`}>
+                                  FORWARDING PORTS (CSV)
+                                </label>
+                                <input
+                                  id={`fport-${tunnel.id}`}
+                                  disabled={role === "agent"}
+                                  placeholder="2053, 2083"
+                                  value={tunnel.forward_ports}
+                                  onChange={(e) =>
+                                    saveTunnelConfig(selectedServer.id, {
+                                      ...tunnel,
+                                      forward_ports: e.target.value,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              {tunnel.sni !== undefined && (
+                                <div className="form-field">
+                                  <label htmlFor={`sni-${tunnel.id}`}>TLS SNI</label>
+                                  <input
+                                    id={`sni-${tunnel.id}`}
+                                    disabled={role === "agent"}
+                                    placeholder="www.speedtest.net"
+                                    value={tunnel.sni}
+                                    onChange={(e) =>
+                                      saveTunnelConfig(selectedServer.id, {
+                                        ...tunnel,
+                                        sni: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </div>
+                              )}
+
+                              {tunnel.ws_path !== undefined && (
+                                <div className="form-field">
+                                  <label htmlFor={`path-${tunnel.id}`}>HTTP / WS PATH</label>
+                                  <input
+                                    id={`path-${tunnel.id}`}
+                                    disabled={role === "agent"}
+                                    placeholder="/ws"
+                                    value={tunnel.ws_path}
+                                    onChange={(e) =>
+                                      saveTunnelConfig(selectedServer.id, {
+                                        ...tunnel,
+                                        ws_path: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </div>
+                              )}
+
+                              {tunnel.speed_limit_mbps !== undefined && (
+                                <div className="form-field">
+                                  <label htmlFor={`spd-${tunnel.id}`}>
+                                    SPEED LIMIT (MB/S, 0=UNLIMITED)
+                                  </label>
+                                  <input
+                                    id={`spd-${tunnel.id}`}
+                                    disabled={role === "agent"}
+                                    placeholder="0"
+                                    value={tunnel.speed_limit_mbps}
+                                    onChange={(e) =>
+                                      saveTunnelConfig(selectedServer.id, {
+                                        ...tunnel,
+                                        speed_limit_mbps: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </div>
+                              )}
+
+                              <div className="setting-status">
+                                <span className="setting-label">TRAFFIC TUNNEL</span>
+                                <span
+                                  className={`setting-value ${
+                                    tunnel.enabled ? "enabled-text" : ""
+                                  }`}
+                                >
+                                  {tunnel.enabled ? "Enabled" : "Disabled"}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              </>
+            )}
           </section>
         )}
 
         {activeTab === "analytics" && (
           <section className="page-section analytics-section">
-            <div className="traffic-grid">
-              <div className="traffic-card">
-                <div className="traffic-label">
-                  <ArrowDown size={16} />
-                  <span>DOWNLOAD</span>
-                </div>
-                <div className="traffic-value">—</div>
-                <div className="traffic-unit">Mbps</div>
+            <div className="analytics-header">
+              <div className="analytics-totals">
+                <span className="legend-item">
+                  <ArrowDown size={14} className="rx-icon" />
+                  <span>Download: {formatBytes(totalRx)}</span>
+                </span>
+                <span className="legend-item">
+                  <ArrowUp size={14} className="tx-icon" />
+                  <span>Upload: {formatBytes(totalTx)}</span>
+                </span>
               </div>
 
-              <div className="traffic-card">
-                <div className="traffic-label">
-                  <ArrowUp size={16} />
-                  <span>UPLOAD</span>
-                </div>
-                <div className="traffic-value">—</div>
-                <div className="traffic-unit">Mbps</div>
+              <div className="range-selector">
+                <button
+                  className={`range-btn ${analyticsRange === 7 ? "active" : ""}`}
+                  onClick={() => setAnalyticsRange(7)}
+                >
+                  7D
+                </button>
+                <button
+                  className={`range-btn ${analyticsRange === 30 ? "active" : ""}`}
+                  onClick={() => setAnalyticsRange(30)}
+                >
+                  30D
+                </button>
               </div>
             </div>
 
-            <div className="traffic-total">
-              <div>
-                <span className="total-label">TOTAL DATA</span>
-                <div className="total-value">—</div>
-              </div>
-              <Wifi size={21} />
-            </div>
+            <div className="chart-card">
+              <div className="bars-container">
+                {visibleAnalytics.map((day) => {
+                  const rxPct = Math.max(3, Math.round((day.rx_bytes / maxDayBytes) * 100));
+                  const txPct = Math.max(3, Math.round((day.tx_bytes / maxDayBytes) * 100));
+                  const shortDate = day.date.slice(5);
 
-            <div className="analytics-waiting">
-              <span className="status-dot" />
-              Traffic monitor not connected
+                  return (
+                    <div
+                      className="day-column"
+                      key={day.date}
+                      title={`${day.date} • ↓ ${formatBytes(day.rx_bytes)} | ↑ ${formatBytes(day.tx_bytes)}`}
+                    >
+                      <div className="day-bars">
+                        <div className="bar rx-bar" style={{ height: `${rxPct}%` }} />
+                        <div className="bar tx-bar" style={{ height: `${txPct}%` }} />
+                      </div>
+                      <span className="day-label">{shortDate}</span>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </section>
         )}
@@ -389,7 +834,7 @@ export default function App() {
 
       <footer className="app-footer">
         <span>SAHAND TUNNEL</span>
-        <span>0.3.0</span>
+        <span>{appVersion}</span>
       </footer>
     </div>
   );
