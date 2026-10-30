@@ -7,13 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"html"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -24,6 +25,10 @@ import (
 	"sync"
 	"time"
 )
+
+// The frontend is built by GitHub Actions before Go compilation.
+//go:embed web/dist
+var webAssets embed.FS
 
 const (
 	AppName        = "sahand-tunnel"
@@ -193,7 +198,7 @@ func loadExistingConfig(path string) (Config, bool, error) {
 		return cfg, false, err
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return cfg, false, fmt.Errorf("cannot read existing configuration: %w", err)
+		return cfg, true, fmt.Errorf("cannot read existing configuration: %w", err)
 	}
 	return cfg, true, nil
 }
@@ -347,6 +352,16 @@ func runServer() error {
 		return errors.New("administrator credentials are missing")
 	}
 
+	distFS, err := fs.Sub(webAssets, "web/dist")
+	if err != nil {
+		return fmt.Errorf("frontend assets are missing: %w", err)
+	}
+	assetFS, err := fs.Sub(distFS, "assets")
+	if err != nil {
+		return fmt.Errorf("frontend assets directory is missing: %w", err)
+	}
+	assetServer := http.FileServer(http.FS(assetFS))
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/health", handleHealth)
 	mux.HandleFunc("/login", handleLogin)
@@ -354,8 +369,15 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/node", requireAuth(func(w http.ResponseWriter, r *http.Request) {
 		handleNode(w, r, cfg)
 	}))
+	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		http.StripPrefix("/assets/", assetServer).ServeHTTP(w, r)
+	}))
 	mux.HandleFunc("/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
-		handleDashboard(w, r, cfg)
+		handleDashboard(w, r, distFS)
 	}))
 
 	server := &http.Server{
@@ -383,7 +405,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 		w.Header().Set("Content-Security-Policy",
-			"default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -392,7 +414,6 @@ func isHTTPS(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
-	// Caddy sets this header when proxying HTTPS requests.
 	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
@@ -600,7 +621,7 @@ func handleNode(w http.ResponseWriter, r *http.Request, cfg Config) {
 	_ = json.NewEncoder(w).Encode(info)
 }
 
-func handleDashboard(w http.ResponseWriter, r *http.Request, cfg Config) {
+func handleDashboard(w http.ResponseWriter, r *http.Request, dist fs.FS) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
@@ -609,17 +630,16 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, cfg Config) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	panelAddress := cfg.PanelURL
-	if panelAddress == "" {
-		panelAddress = "HTTP / port " + fmt.Sprint(cfg.PanelPort)
+	index, err := fs.ReadFile(dist, "index.html")
+	if err != nil {
+		http.Error(w, "dashboard frontend is unavailable", http.StatusInternalServerError)
+		return
 	}
-	page := strings.ReplaceAll(dashboardHTML, "{{PANEL_URL}}", html.EscapeString(panelAddress))
-	page = strings.ReplaceAll(page, "{{ROLE}}", html.EscapeString(strings.ToUpper(cfg.Role)))
-	page = strings.ReplaceAll(page, "{{NODE_ID}}", html.EscapeString(cfg.NodeID))
-	page = strings.ReplaceAll(page, "{{VERSION}}", html.EscapeString(AppVersion))
-	_, _ = io.WriteString(w, page)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(index)
 }
 
 const loginHTML = `<!DOCTYPE html>
@@ -653,52 +673,6 @@ button{width:100%;margin-top:24px;padding:13px;border:0;border-radius:9px;backgr
 </form>
 <div class="small">Server management</div>
 </div>
-</body>
-</html>`
-
-const dashboardHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sahand Tunnel</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#0b1020;color:#eef2ff;font-family:Arial,sans-serif}
-header{padding:22px 5%;background:#111a2e;border-bottom:1px solid #293653;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
-.brand{font-size:21px;font-weight:bold}
-.address{color:#8fa4c8;font-size:13px;margin-top:7px}
-button{background:#263653;color:#eaf0ff;border:1px solid #3b4d6c;border-radius:8px;padding:10px 15px;cursor:pointer}
-main{max-width:1100px;margin:35px auto;padding:0 22px}
-h1{font-size:27px;margin-bottom:8px}
-.subtitle{color:#91a1bd;margin-bottom:28px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:17px}
-.card{background:#151f35;border:1px solid #293956;border-radius:14px;padding:22px}
-.label{color:#91a1bd;font-size:13px;margin-bottom:12px}
-.value{font-size:20px;font-weight:bold;overflow-wrap:anywhere}
-.online{color:#55d69a}
-.footer{color:#657795;text-align:center;margin:40px 0;font-size:12px}
-</style>
-</head>
-<body>
-<header>
-<div>
-<div class="brand">SAHAND TUNNEL</div>
-<div class="address">Panel address: {{PANEL_URL}}</div>
-</div>
-<form method="post" action="/logout"><button type="submit">Sign out</button></form>
-</header>
-<main>
-<h1>Dashboard</h1>
-<div class="subtitle">Server overview and installation information</div>
-<div class="grid">
-<div class="card"><div class="label">Server status</div><div class="value online">● Online</div></div>
-<div class="card"><div class="label">Server role</div><div class="value">{{ROLE}}</div></div>
-<div class="card"><div class="label">Application version</div><div class="value">{{VERSION}}</div></div>
-<div class="card"><div class="label">Node ID</div><div class="value">{{NODE_ID}}</div></div>
-</div>
-<div class="footer">Sahand Tunnel · Server management</div>
-</main>
 </body>
 </html>`
 
