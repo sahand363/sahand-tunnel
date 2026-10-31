@@ -617,6 +617,140 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 	return true
 }
 
+func sortedTunnelIndices(tunnels []TunnelConfig) []int {
+	order := make([]int, len(tunnels))
+	for i := range tunnels {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		if tunnels[order[i]].Security != tunnels[order[j]].Security {
+			return tunnels[order[i]].Security > tunnels[order[j]].Security
+		}
+		return tunnels[order[i]].ID < tunnels[order[j]].ID
+	})
+	return order
+}
+
+// switchNextMethod tests candidate methods after the current active method in security order.
+// It never disconnects the current method unless a new working method responds and syncs with the Agent.
+func switchNextMethod(peerID string) (bool, string, error) {
+	stateMu.RLock()
+	var peerSnapshot *ServerPeer
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == peerID {
+			cp := appCfg.Servers[i]
+			peerSnapshot = &cp
+			break
+		}
+	}
+	stateMu.RUnlock()
+
+	if peerSnapshot == nil {
+		return false, "", errors.New("server not found")
+	}
+
+	tunnelsSnapshot := make([]TunnelConfig, len(peerSnapshot.Tunnels))
+	copy(tunnelsSnapshot, peerSnapshot.Tunnels)
+	order := sortedTunnelIndices(tunnelsSnapshot)
+
+	startPos := 0
+	if peerSnapshot.ActiveMethodID > 0 {
+		for pos, idx := range order {
+			if tunnelsSnapshot[idx].ID == peerSnapshot.ActiveMethodID {
+				startPos = (pos + 1) % len(order)
+				break
+			}
+		}
+	}
+
+	testedResults := make(map[int]MethodResult)
+	var chosenCandidate *TunnelConfig
+	var chosenResult MethodResult
+
+	for step := 0; step < len(order); step++ {
+		pos := (startPos + step) % len(order)
+		tc := tunnelsSnapshot[order[pos]]
+
+		// Do not re-select the already-active method unless no other method is active
+		if peerSnapshot.ActiveMethodID > 0 && tc.ID == peerSnapshot.ActiveMethodID {
+			continue
+		}
+		if !tc.Implemented {
+			continue
+		}
+
+		res := probeSingleMethod(*peerSnapshot, tc)
+		testedResults[tc.ID] = res
+
+		if res.Success {
+			if pushParitySyncOverMethod(*peerSnapshot, tc, res.LatencyMS) {
+				chosen := tc
+				chosenCandidate = &chosen
+				chosenResult = res
+				break
+			}
+		}
+		time.Sleep(time.Duration(70+randomIntN(90)) * time.Millisecond)
+	}
+
+	stateMu.Lock()
+	var updatedPeer *ServerPeer
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == peerID {
+			updatedPeer = &appCfg.Servers[i]
+			break
+		}
+	}
+	if updatedPeer == nil {
+		stateMu.Unlock()
+		return false, "", errors.New("server not found")
+	}
+
+	for i := range updatedPeer.Tunnels {
+		if r, ok := testedResults[updatedPeer.Tunnels[i].ID]; ok {
+			updatedPeer.Tunnels[i].LastDiscovery = r
+		}
+	}
+
+	if chosenCandidate != nil {
+		updatedPeer.Running = true
+		updatedPeer.Status = "CONNECTED"
+		updatedPeer.ActiveMethodID = chosenCandidate.ID
+		updatedPeer.ActiveMethod = chosenCandidate.Name
+		updatedPeer.ActivePort = chosenCandidate.ListenPort
+		updatedPeer.ActiveSecurity = chosenCandidate.Security
+		updatedPeer.ActiveLatencyMS = chosenResult.LatencyMS
+		updatedPeer.NextRetryAt = ""
+		updatedPeer.SyncState = "synced"
+		recordLifelineEvent(updatedPeer, chosenCandidate.ID, chosenCandidate.Name, chosenCandidate.ListenPort, chosenCandidate.Security, chosenResult.LatencyMS, "outbound")
+		_ = saveConfig(configPath(), appCfg)
+		stateMu.Unlock()
+
+		ensureLivenessMonitorRunning(peerID)
+		msg := fmt.Sprintf("Switched to Method %02d (%s %d%%) on port %d",
+			chosenCandidate.ID, chosenCandidate.Name, chosenCandidate.Security, chosenCandidate.ListenPort)
+		return true, msg, nil
+	}
+
+	_ = saveConfig(configPath(), appCfg)
+	curName := updatedPeer.ActiveMethod
+	stateMu.Unlock()
+
+	if curName != "" {
+		return false, fmt.Sprintf("No other method responded; stayed on %s", curName), nil
+	}
+	return false, "No working method responded", nil
+}
+
+func ensureLivenessMonitorRunning(peerID string) {
+	discoveryMu.Lock()
+	_, exists := discoveryCancel[peerID]
+	discoveryMu.Unlock()
+	if !exists {
+		startDiscoveryLoop(peerID)
+	}
+}
+
 func startDiscoveryLoop(peerID string) {
 	discoveryMu.Lock()
 	if ch, ok := discoveryCancel[peerID]; ok {
@@ -646,71 +780,85 @@ func startDiscoveryLoop(peerID string) {
 				stateMu.Unlock()
 				return
 			}
-			peer.Status = "TESTING"
-			peer.NextRetryAt = ""
+
+			alreadyConnected := peer.Status == "CONNECTED" && peer.ActiveMethodID > 0
+			if !alreadyConnected {
+				peer.Status = "TESTING"
+				peer.NextRetryAt = ""
+			}
 			peerSnapshot := *peer
 			tunnelsSnapshot := make([]TunnelConfig, len(peer.Tunnels))
 			copy(tunnelsSnapshot, peer.Tunnels)
 			stateMu.Unlock()
 
-			// Sort methods by highest Security % first
-			order := make([]int, len(tunnelsSnapshot))
-			for i := range tunnelsSnapshot {
-				order[i] = i
-			}
-			sort.SliceStable(order, func(i, j int) bool {
-				if tunnelsSnapshot[order[i]].Security != tunnelsSnapshot[order[j]].Security {
-					return tunnelsSnapshot[order[i]].Security > tunnelsSnapshot[order[j]].Security
+			if !alreadyConnected {
+				order := sortedTunnelIndices(tunnelsSnapshot)
+				results := make(map[int]MethodResult, 30)
+				var bestCandidate *TunnelConfig
+				var bestResult MethodResult
+
+				for _, idx := range order {
+					select {
+					case <-stopCh:
+						return
+					default:
+					}
+					tc := tunnelsSnapshot[idx]
+					res := probeSingleMethod(peerSnapshot, tc)
+					results[tc.ID] = res
+
+					if res.Success {
+						chosen := tc
+						bestCandidate = &chosen
+						bestResult = res
+						break
+					}
+					if tc.Implemented {
+						time.Sleep(time.Duration(90+randomIntN(140)) * time.Millisecond)
+					}
 				}
-				return tunnelsSnapshot[order[i]].ID < tunnelsSnapshot[order[j]].ID
-			})
 
-			results := make(map[int]MethodResult, 30)
-			var bestCandidate *TunnelConfig
-			var bestResult MethodResult
-
-			for _, idx := range order {
-				select {
-				case <-stopCh:
+				stateMu.Lock()
+				var updatedPeer *ServerPeer
+				for i := range appCfg.Servers {
+					if appCfg.Servers[i].ID == peerID {
+						updatedPeer = &appCfg.Servers[i]
+						break
+					}
+				}
+				if updatedPeer == nil || !updatedPeer.Running {
+					stateMu.Unlock()
 					return
-				default:
 				}
-				tc := tunnelsSnapshot[idx]
-				res := probeSingleMethod(peerSnapshot, tc)
-				results[tc.ID] = res
 
-				if res.Success {
-					chosen := tc
-					bestCandidate = &chosen
-					bestResult = res
-					// Stop trying remaining methods once the most secure working method connects
-					break
+				for i := range updatedPeer.Tunnels {
+					if r, ok := results[updatedPeer.Tunnels[i].ID]; ok {
+						updatedPeer.Tunnels[i].LastDiscovery = r
+					}
 				}
-				if tc.Implemented {
-					time.Sleep(time.Duration(90+randomIntN(140)) * time.Millisecond)
-				}
-			}
 
-			stateMu.Lock()
-			var updatedPeer *ServerPeer
-			for i := range appCfg.Servers {
-				if appCfg.Servers[i].ID == peerID {
-					updatedPeer = &appCfg.Servers[i]
-					break
-				}
-			}
-			if updatedPeer == nil || !updatedPeer.Running {
-				stateMu.Unlock()
-				return
-			}
+				if bestCandidate == nil {
+					retryMins := 10 + randomIntN(21)
+					retryDuration := time.Duration(retryMins) * time.Minute
+					nextRetry := time.Now().UTC().Add(retryDuration)
+					updatedPeer.Status = "RETRY SCHEDULED"
+					updatedPeer.ActiveMethodID = 0
+					updatedPeer.ActiveMethod = ""
+					updatedPeer.ActivePort = 0
+					updatedPeer.NextRetryAt = nextRetry.Format("15:04 UTC")
+					_ = saveConfig(configPath(), appCfg)
+					stateMu.Unlock()
 
-			for i := range updatedPeer.Tunnels {
-				if r, ok := results[updatedPeer.Tunnels[i].ID]; ok {
-					updatedPeer.Tunnels[i].LastDiscovery = r
+					timer := time.NewTimer(retryDuration)
+					select {
+					case <-stopCh:
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+					continue
 				}
-			}
 
-			if bestCandidate != nil {
 				updatedPeer.Status = "CONNECTED"
 				updatedPeer.ActiveMethodID = bestCandidate.ID
 				updatedPeer.ActiveMethod = bestCandidate.Name
@@ -725,69 +873,58 @@ func startDiscoveryLoop(peerID string) {
 
 				_ = pushParitySyncOverMethod(peerCopy, *bestCandidate, bestResult.LatencyMS)
 				go syncServerListeners(peerCopy)
-
-				// Silent jittered liveness monitor: only re-runs 30-method sweep if active connection drops
-				for {
-					jitterWait := time.Duration(90+randomIntN(90)) * time.Second
-					timer := time.NewTimer(jitterWait)
-					select {
-					case <-stopCh:
-						timer.Stop()
-						return
-					case <-timer.C:
-					}
-
-					stateMu.RLock()
-					var curPeer *ServerPeer
-					for i := range appCfg.Servers {
-						if appCfg.Servers[i].ID == peerID {
-							cp := appCfg.Servers[i]
-							curPeer = &cp
-							break
-						}
-					}
-					stateMu.RUnlock()
-
-					if curPeer == nil || !curPeer.Running {
-						return
-					}
-					var activeTun *TunnelConfig
-					for i := range curPeer.Tunnels {
-						if curPeer.Tunnels[i].ID == curPeer.ActiveMethodID {
-							t := curPeer.Tunnels[i]
-							activeTun = &t
-							break
-						}
-					}
-					if activeTun == nil {
-						break
-					}
-					chk := probeSingleMethod(*curPeer, *activeTun)
-					if !chk.Success {
-						break // Connection broke -> restart 30-method sweep
-					}
-				}
-				continue
 			}
 
-			// Random retry delay between 10 and 30 minutes per spec
-			retryMins := 10 + randomIntN(21)
-			retryDuration := time.Duration(retryMins) * time.Minute
-			nextRetry := time.Now().UTC().Add(retryDuration)
-			updatedPeer.Status = "RETRY SCHEDULED"
-			updatedPeer.ActiveMethodID = 0
-			updatedPeer.ActiveMethod = ""
-			updatedPeer.ActivePort = 0
-			updatedPeer.NextRetryAt = nextRetry.Format("15:04 UTC")
-			_ = saveConfig(configPath(), appCfg)
-			stateMu.Unlock()
+			// Silent jittered liveness monitor: watches the active method and only sweeps if it disconnects
+			for {
+				jitterWait := time.Duration(90+randomIntN(90)) * time.Second
+				timer := time.NewTimer(jitterWait)
+				select {
+				case <-stopCh:
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
 
-			timer := time.NewTimer(retryDuration)
-			select {
-			case <-stopCh:
-				timer.Stop()
-				return
-			case <-timer.C:
+				stateMu.RLock()
+				var curPeer *ServerPeer
+				for i := range appCfg.Servers {
+					if appCfg.Servers[i].ID == peerID {
+						cp := appCfg.Servers[i]
+						curPeer = &cp
+						break
+					}
+				}
+				stateMu.RUnlock()
+
+				if curPeer == nil || !curPeer.Running {
+					return
+				}
+				var activeTun *TunnelConfig
+				for i := range curPeer.Tunnels {
+					if curPeer.Tunnels[i].ID == curPeer.ActiveMethodID {
+						t := curPeer.Tunnels[i]
+						activeTun = &t
+						break
+					}
+				}
+				if activeTun == nil {
+					break
+				}
+				chk := probeSingleMethod(*curPeer, *activeTun)
+				if !chk.Success {
+					stateMu.Lock()
+					for i := range appCfg.Servers {
+						if appCfg.Servers[i].ID == peerID {
+							appCfg.Servers[i].Status = "TESTING"
+							appCfg.Servers[i].ActiveMethodID = 0
+							appCfg.Servers[i].ActiveMethod = ""
+							break
+						}
+					}
+					stateMu.Unlock()
+					break // Connection broke -> restart 30-method sweep
+				}
 			}
 		}
 	}()
