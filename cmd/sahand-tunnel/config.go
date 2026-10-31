@@ -58,12 +58,16 @@ type MethodCatalogueItem struct {
 }
 
 type MethodResult struct {
-	MethodID    int    `json:"method_id"`
-	Success     bool   `json:"success"`
-	Direction   string `json:"direction"`
-	LatencyMS   int64  `json:"latency_ms"`
-	ErrorReason string `json:"error_reason,omitempty"`
-	TestedAt    string `json:"tested_at,omitempty"`
+	MethodID      int    `json:"method_id"`
+	Success       bool   `json:"success"`
+	Direction     string `json:"direction"`
+	LatencyMS     int64  `json:"latency_ms"`
+	MinLatencyMS  int64  `json:"min_latency_ms,omitempty"`
+	MaxLatencyMS  int64  `json:"max_latency_ms,omitempty"`
+	JitterMS      int64  `json:"jitter_ms,omitempty"`
+	PacketLossPct int    `json:"packet_loss_pct,omitempty"`
+	ErrorReason   string `json:"error_reason,omitempty"`
+	TestedAt      string `json:"tested_at,omitempty"`
 }
 
 type LifelineEvent struct {
@@ -193,7 +197,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{5, "HTTPS Proxy", 82, "tcp", true, 11305, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
 	{6, "TCP Relay", 45, "tcp", true, 11306, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
 	{7, "TLS Stream", 88, "tcp", true, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin", "speed_limit_mbps"}},
-	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec", "speed_limit_mbps"}},
+	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "cert_pin", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{9, "HTTP/3", 92, "tcp+udp", false, 11309, []string{"listen_port", "forward_ports", "sni"}},
 	{10, "WebSocket TCP", 65, "tcp", false, 11310, []string{"listen_port", "forward_ports", "ws_path"}},
 	{11, "Reverse TCP", 50, "tcp", false, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
@@ -502,6 +506,12 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			if cur.WSPath == "" {
 				cur.WSPath = def.WSPath
 			}
+			if cur.HeartbeatSec <= 0 {
+				cur.HeartbeatSec = def.HeartbeatSec
+			}
+			if cur.StreamLimit <= 0 {
+				cur.StreamLimit = def.StreamLimit
+			}
 			if cur.SpeedLimitMBps == "" {
 				cur.SpeedLimitMBps = def.SpeedLimitMBps
 			}
@@ -628,7 +638,7 @@ func generatePeerToken(cfg Config, peer ServerPeer) (string, error) {
 	now := time.Now()
 	zName, zOff := now.Zone()
 	sharedKeyMac := hmac.New(sha256.New, []byte(cfg.TokenSecret))
-	_, _ = sharedKeyMac.Write([]byte(peer.ID + "|" + strconv.Itoa(peer.ConfigVersion)))
+	_, _ = sharedKeyMac.Write([]byte(peer.ID + "|sahand-peer-key-v1"))
 	derivedKey := hex.EncodeToString(sharedKeyMac.Sum(nil)[:16])
 
 	tp := TokenPayload{
@@ -671,4 +681,35 @@ func parseAndValidateToken(rawToken string) (TokenPayload, error) {
 		return tp, errors.New("token has expired")
 	}
 	return tp, nil
+}
+
+// derivePeerAuthKey extracts the shared 16-byte authentication key from the peer's existing
+// pairing token (on both Master and Agent) without introducing any new plaintext secret in config.json.
+func derivePeerAuthKey(cfg Config, peer ServerPeer) ([]byte, error) {
+	if peer.TokenRevoked {
+		return nil, errors.New("peer token has been revoked")
+	}
+	if strings.TrimSpace(peer.Token) != "" {
+		tp, err := parseAndValidateToken(peer.Token)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Role == "master" && cfg.TokenSecret != "" {
+			expectedSig := signTokenPayload(tp, cfg.TokenSecret)
+			if subtle.ConstantTimeCompare([]byte(tp.Sig), []byte(expectedSig)) != 1 {
+				return nil, errors.New("token signature verification failed")
+			}
+		}
+		keyBytes, err := hex.DecodeString(tp.Key)
+		if err != nil || len(keyBytes) == 0 {
+			return nil, errors.New("invalid derived key in token")
+		}
+		return keyBytes, nil
+	}
+	if cfg.Role == "master" && cfg.TokenSecret != "" && peer.ID != "" {
+		sharedKeyMac := hmac.New(sha256.New, []byte(cfg.TokenSecret))
+		_, _ = sharedKeyMac.Write([]byte(peer.ID + "|sahand-peer-key-v1"))
+		return sharedKeyMac.Sum(nil)[:16], nil
+	}
+	return nil, errors.New("peer authentication key unavailable")
 }
