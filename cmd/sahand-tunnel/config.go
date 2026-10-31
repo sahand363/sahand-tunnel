@@ -228,8 +228,6 @@ var (
 	appCfg    Config
 	localCert tls.Certificate
 
-	// Lock-free atomic mirrors for Master clock synchronization so masterNow()
-	// can be safely called even while stateMu.Lock() is held.
 	atomicIsAgent          atomic.Bool
 	atomicMasterTZOffset   atomic.Int64
 	atomicMasterClockDelta atomic.Int64
@@ -243,8 +241,6 @@ func syncMasterClockAtomics(cfg Config) {
 	atomicMasterTZName.Store(cfg.MasterTZName)
 }
 
-// masterNow returns the current time synchronized to the Master server's local clock and timezone.
-// It is completely lock-free so it can be called inside or outside stateMu critical sections.
 func masterNow() time.Time {
 	if !atomicIsAgent.Load() {
 		return time.Now()
@@ -697,33 +693,24 @@ func parseAndValidateToken(rawToken string) (TokenPayload, error) {
 	return tp, nil
 }
 
-// derivePeerAuthKey extracts the shared 16-byte authentication key from the peer's existing
-// pairing token (on both Master and Agent) without introducing any new plaintext secret in config.json.
-func derivePeerAuthKey(cfg Config, peer ServerPeer) ([]byte, error) {
+// derivePeerAuthKey validates the peer's st1. pairing token and derives a version-independent
+// 16-byte shared key from the paired AID/MID inside the token so Master (e.g. v13) and Agent (e.g. v1)
+// always compute the exact same HMAC key even after tunnel ports/settings are edited on the Master.
+func derivePeerAuthKey(_ Config, peer ServerPeer) ([]byte, error) {
 	if peer.TokenRevoked {
 		return nil, errors.New("peer token has been revoked")
 	}
-	if strings.TrimSpace(peer.Token) != "" {
-		tp, err := parseAndValidateToken(peer.Token)
-		if err != nil {
-			return nil, err
-		}
-		if cfg.Role == "master" && cfg.TokenSecret != "" {
-			expectedSig := signTokenPayload(tp, cfg.TokenSecret)
-			if subtle.ConstantTimeCompare([]byte(tp.Sig), []byte(expectedSig)) != 1 {
-				return nil, errors.New("token signature verification failed")
-			}
-		}
-		keyBytes, err := hex.DecodeString(tp.Key)
-		if err != nil || len(keyBytes) == 0 {
-			return nil, errors.New("invalid derived key in token")
-		}
-		return keyBytes, nil
+	if strings.TrimSpace(peer.Token) == "" {
+		return nil, errors.New("peer token is missing")
 	}
-	if cfg.Role == "master" && cfg.TokenSecret != "" && peer.ID != "" {
-		sharedKeyMac := hmac.New(sha256.New, []byte(cfg.TokenSecret))
-		_, _ = sharedKeyMac.Write([]byte(peer.ID + "|sahand-peer-key-v1"))
-		return sharedKeyMac.Sum(nil)[:16], nil
+	tp, err := parseAndValidateToken(peer.Token)
+	if err != nil {
+		return nil, err
 	}
-	return nil, errors.New("peer authentication key unavailable")
+	if peer.ID != "" && tp.AID != peer.ID {
+		return nil, errors.New("peer ID mismatch with token AID")
+	}
+	mac := hmac.New(sha256.New, []byte("sahand-quic-v1-pair-auth"))
+	_, _ = mac.Write([]byte(tp.AID + "|" + tp.MID))
+	return mac.Sum(nil)[:16], nil
 }
