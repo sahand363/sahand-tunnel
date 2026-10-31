@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -145,11 +144,11 @@ func (mc *wtManagedClient) close() {
 }
 
 var (
-	wtMu             sync.RWMutex
-	wtClientsByPeer  = make(map[string]*wtManagedClient)
-	wtExitUDPMuxes   = make(map[string]*wtUDPExitManager)
-	wtEntryUDPMuxes  = make(map[string]*wtUDPEntryManager)
-	wtUDPBlockedMap  = make(map[string]int64)
+	wtMu            sync.RWMutex
+	wtClientsByPeer = make(map[string]*wtManagedClient)
+	wtExitUDPMuxes  = make(map[string]*wtUDPExitManager)
+	wtEntryUDPMuxes = make(map[string]*wtUDPEntryManager)
+	wtUDPBlockedMap = make(map[string]int64)
 )
 
 func markWTUDPBlocked(endpoint string) {
