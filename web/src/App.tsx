@@ -119,7 +119,8 @@ function formatInitiatorFallback(role: Role, dir?: string, explicit?: string): s
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("servers");
   const [role, setRole] = useState<Role>("master");
-  const [appVersion, setAppVersion] = useState("0.4.3");
+  const [appVersion, setAppVersion] = useState("0.4.4");
+  const [masterTime, setMasterTime] = useState("");
   const [servers, setServers] = useState<ServerPeer[]>([]);
   const [selectedServerID, setSelectedServerID] = useState<string>("");
 
@@ -160,6 +161,9 @@ export default function App() {
       }
       if (data.app_version) {
         setAppVersion(data.app_version);
+      }
+      if (data.server_time) {
+        setMasterTime(data.server_time);
       }
       const list: ServerPeer[] = Array.isArray(data.servers) ? data.servers : [];
       setServers(list);
@@ -366,6 +370,8 @@ export default function App() {
         </div>
 
         <div className="topbar-right">
+          {masterTime && <span className="master-clock-pill">{masterTime}</span>}
+
           <div className="system-status">
             <span className="status-dot" />
             <span>{role.toUpperCase()}</span>
@@ -504,102 +510,117 @@ export default function App() {
                   return (
                     <article className="server-card-block" key={server.id}>
                       <div className="server-row">
-                        <div className="server-symbol">
-                          <Server size={19} />
-                        </div>
-
-                        <div className="server-info">
-                          <div className="server-title-row">
-                            <span className="server-name">{server.name}</span>
-                            <span className="version-pill">v{server.config_version}</span>
+                        <div className="server-main-col">
+                          <div className="server-symbol">
+                            <Server size={19} />
                           </div>
-                          <div className="server-address">
-                            {server.ip}
-                            {server.active_method ? (
-                              <span className="active-carrier-tag">
-                                {" "}
-                                • Method {String(server.active_method_id).padStart(2, "0")} (
-                                {server.active_method} {server.active_security}%) • Port{" "}
-                                {server.active_port || 11300 + server.active_method_id} •{" "}
-                                {server.active_latency_ms}ms
-                                {whoConnected ? ` • ${whoConnected}` : ""}
-                              </span>
-                            ) : server.next_retry_at ? (
-                              <span className="retry-tag">
-                                {" "}
-                                • Next retry at {server.next_retry_at}
-                              </span>
-                            ) : null}
+
+                          <div className="server-info">
+                            <div className="server-title-row">
+                              <span className="server-name">{server.name}</span>
+                              <span className="version-pill">v{server.config_version}</span>
+                            </div>
+                            <div className="server-address">
+                              <span className="ip-text">{server.ip}</span>
+                              {server.active_method ? (
+                                <span className="active-carrier-tag">
+                                  {" "}
+                                  • Method {String(server.active_method_id).padStart(2, "0")} (
+                                  {server.active_method} {server.active_security}%) • Port{" "}
+                                  {server.active_port || 11300 + server.active_method_id} •{" "}
+                                  {server.active_latency_ms}ms
+                                  {whoConnected ? ` • ${whoConnected}` : ""}
+                                </span>
+                              ) : server.next_retry_at ? (
+                                <span className="retry-tag">
+                                  {" "}
+                                  • Next retry at {server.next_retry_at}
+                                </span>
+                              ) : null}
+                            </div>
                           </div>
                         </div>
 
-                        <div className="server-state">
-                          <span
-                            className={`state-dot ${
-                              server.status === "CONNECTED"
-                                ? "online"
-                                : server.status === "TESTING"
-                                ? "testing"
-                                : ""
-                            }`}
-                          />
-                          <span>{server.status}</span>
+                        <div className="server-controls-col">
+                          <div className="server-state">
+                            <span
+                              className={`state-dot ${
+                                server.status === "CONNECTED"
+                                  ? "online"
+                                  : server.status === "TESTING"
+                                  ? "testing"
+                                  : ""
+                              }`}
+                            />
+                            <span>{server.status}</span>
+                          </div>
+
+                          <div className="server-buttons-group">
+                            {role === "master" && (
+                              <button
+                                className="next-method-btn"
+                                onClick={() => handleNextMethod(server.id)}
+                                disabled={isSwitching}
+                                title="Test and switch to the next working method without disconnecting"
+                                aria-label="Next working method"
+                              >
+                                <SkipForward size={13} />
+                                <span>{isSwitching ? "Checking..." : "Next"}</span>
+                              </button>
+                            )}
+
+                            {role === "master" && (
+                              <button
+                                className="icon-button"
+                                onClick={() => copyToken(server.id, server.token)}
+                                title="Copy connection token (includes current ports)"
+                                aria-label="Copy connection token"
+                              >
+                                {copiedID === server.id ? (
+                                  <Check size={15} />
+                                ) : (
+                                  <Copy size={15} />
+                                )}
+                              </button>
+                            )}
+
+                            {role === "master" && (
+                              <button
+                                className="icon-button"
+                                onClick={() => handleServerAction(server.id, "regen_token")}
+                                title="Regenerate token with latest ports"
+                                aria-label="Regenerate token"
+                              >
+                                <RefreshCw size={15} />
+                              </button>
+                            )}
+
+                            <button
+                              className={`server-action ${server.running ? "pause" : "play"}`}
+                              onClick={() =>
+                                handleServerAction(
+                                  server.id,
+                                  server.running ? "pause" : "play"
+                                )
+                              }
+                              title={server.running ? "Pause discovery" : "Start discovery"}
+                              aria-label={
+                                server.running ? "Pause discovery" : "Start discovery"
+                              }
+                            >
+                              {server.running ? <Pause size={16} /> : <Play size={16} />}
+                            </button>
+
+                            <button
+                              className="icon-button delete-button"
+                              onClick={() => handleServerAction(server.id, "delete")}
+                              title="Remove server"
+                              aria-label="Remove server"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
                         </div>
-
-                        {role === "master" && (
-                          <button
-                            className="next-method-btn"
-                            onClick={() => handleNextMethod(server.id)}
-                            disabled={isSwitching}
-                            title="Test and switch to the next working method without disconnecting"
-                            aria-label="Next working method"
-                          >
-                            <SkipForward size={13} />
-                            <span>{isSwitching ? "Checking..." : "Next"}</span>
-                          </button>
-                        )}
-
-                        {role === "master" && (
-                          <button
-                            className="icon-button"
-                            onClick={() => copyToken(server.id, server.token)}
-                            title="Copy connection token (includes current ports)"
-                            aria-label="Copy connection token"
-                          >
-                            {copiedID === server.id ? <Check size={15} /> : <Copy size={15} />}
-                          </button>
-                        )}
-
-                        {role === "master" && (
-                          <button
-                            className="icon-button"
-                            onClick={() => handleServerAction(server.id, "regen_token")}
-                            title="Regenerate token with latest ports"
-                            aria-label="Regenerate token"
-                          >
-                            <RefreshCw size={15} />
-                          </button>
-                        )}
-
-                        <button
-                          className={`server-action ${server.running ? "pause" : "play"}`}
-                          onClick={() =>
-                            handleServerAction(server.id, server.running ? "pause" : "play")
-                          }
-                          title={server.running ? "Pause discovery" : "Start discovery"}
-                          aria-label={server.running ? "Pause discovery" : "Start discovery"}
-                        >
-                          {server.running ? <Pause size={16} /> : <Play size={16} />}
-                        </button>
-
-                        <button
-                          className="icon-button delete-button"
-                          onClick={() => handleServerAction(server.id, "delete")}
-                          title="Remove server"
-                          aria-label="Remove server"
-                        >
-                          <Trash2 size={16} />
-                        </button>
                       </div>
 
                       <div className="server-subbar">
@@ -646,18 +667,25 @@ export default function App() {
                               );
                               return (
                                 <div className="history-row" key={idx}>
-                                  <span className="history-method">
-                                    #{String(item.method_id).padStart(2, "0")} {item.method_name}
-                                  </span>
-                                  <span
-                                    className={`sec-badge ${securityTierClass(item.security)}`}
-                                  >
-                                    {item.security}%
-                                  </span>
+                                  <div className="history-head">
+                                    <span className="history-method">
+                                      #{String(item.method_id).padStart(2, "0")}{" "}
+                                      {item.method_name}
+                                    </span>
+                                    <span
+                                      className={`sec-badge ${securityTierClass(
+                                        item.security
+                                      )}`}
+                                    >
+                                      {item.security}%
+                                    </span>
+                                  </div>
+
                                   <span className="history-meta">
-                                    Port {item.port || 11300 + item.method_id} • {item.latency_ms}
-                                    ms • {itemWho || item.direction}
+                                    Port {item.port || 11300 + item.method_id} •{" "}
+                                    {item.latency_ms}ms • {itemWho || item.direction}
                                   </span>
+
                                   <span className="history-time">{item.connected_at}</span>
                                 </div>
                               );
