@@ -70,6 +70,7 @@ type LifelineEvent struct {
 	Security    int    `json:"security"`
 	LatencyMS   int64  `json:"latency_ms"`
 	Direction   string `json:"direction"`
+	Initiator   string `json:"initiator,omitempty"`
 	ConnectedAt string `json:"connected_at"`
 }
 
@@ -106,6 +107,9 @@ type ServerPeer struct {
 	ActivePort      int             `json:"active_port"`
 	ActiveSecurity  int             `json:"active_security"`
 	ActiveLatencyMS int64           `json:"active_latency_ms"`
+	ActiveDirection string          `json:"active_direction,omitempty"`
+	ActiveInitiator string          `json:"active_initiator,omitempty"`
+	LastInboundAt   int64           `json:"last_inbound_at,omitempty"`
 	NextRetryAt     string          `json:"next_retry_at,omitempty"`
 	RemoteCertPin   string          `json:"remote_cert_pin,omitempty"`
 	RecentLifelines []LifelineEvent `json:"recent_lifelines"`
@@ -175,8 +179,8 @@ var methodCatalogue = []MethodCatalogueItem{
 	{2, "gRPC", 95, "tcp", true, 11302, []string{"listen_port", "forward_ports", "sni", "cert_pin", "stream_limit", "speed_limit_mbps"}},
 	{3, "HTTP/2", 90, "tcp", true, 11303, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec", "speed_limit_mbps"}},
 	{4, "HTTP CONNECT", 76, "tcp", true, 11304, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
-	{5, "HTTPS Proxy", 82, "tcp", false, 11305, []string{"listen_port", "forward_ports", "sni"}},
-	{6, "TCP Relay", 45, "tcp", false, 11306, []string{"listen_port", "forward_ports"}},
+	{5, "HTTPS Proxy", 82, "tcp", true, 11305, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
+	{6, "TCP Relay", 45, "tcp", true, 11306, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
 	{7, "TLS Stream", 88, "tcp", false, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
 	{8, "QUIC", 92, "tcp+udp", false, 11308, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec"}},
 	{9, "HTTP/3", 92, "tcp+udp", false, 11309, []string{"listen_port", "forward_ports", "sni"}},
