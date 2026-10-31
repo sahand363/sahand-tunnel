@@ -229,7 +229,7 @@ type quicManagedClientConn struct {
 	conn             *quic.Conn
 	maxDatagramBytes atomic.Int64
 	udpAuthed        atomic.Bool
-	entryUDPMux      *quicUDPEntrySessionManager
+	entryUDPMux      atomic.Pointer[quicUDPEntrySessionManager]
 }
 
 var (
@@ -633,13 +633,15 @@ func getOrDialQUICConnection(
 	mc, exists := quicClientPool[id]
 	if !exists {
 		mc = &quicManagedClientConn{
-			identity:    id,
-			entryUDPMux: entryUDPMux,
+			identity: id,
 		}
 		mc.maxDatagramBytes.Store(quicDefaultMaxDatagramPayload)
+		if entryUDPMux != nil {
+			mc.entryUDPMux.Store(entryUDPMux)
+		}
 		quicClientPool[id] = mc
 	} else if entryUDPMux != nil {
-		mc.entryUDPMux = entryUDPMux
+		mc.entryUDPMux.Store(entryUDPMux)
 	}
 	quicRegistryMu.Unlock()
 
@@ -704,8 +706,8 @@ func getOrDialQUICConnection(
 				if rErr != nil {
 					return
 				}
-				if clientWrapper.entryUDPMux != nil {
-					clientWrapper.entryUDPMux.handleInboundReplyDatagram(dgram)
+				if mux := clientWrapper.entryUDPMux.Load(); mux != nil {
+					mux.handleInboundReplyDatagram(dgram)
 				}
 			}
 		}(conn, mc)
@@ -1132,7 +1134,7 @@ func pipeQUICStreamAndTCP(stream *quic.Stream, tcpConn net.Conn, speedLimitMBps 
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		_, _ = io.CopyBuffer(toStream, tcpConn, buf)
-		_ = stream.Close() // Sends QUIC FIN on write direction
+		_ = stream.Close() // Sends QUIC FIN on write direction without discarding buffered frames
 	}()
 
 	// QUIC Stream -> TCP
@@ -1147,7 +1149,6 @@ func pipeQUICStreamAndTCP(stream *quic.Stream, tcpConn net.Conn, speedLimitMBps 
 
 	wg.Wait()
 	stream.CancelRead(0)
-	stream.CancelWrite(0)
 }
 
 // ============================================================================
