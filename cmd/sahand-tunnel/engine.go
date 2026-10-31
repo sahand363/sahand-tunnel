@@ -183,6 +183,7 @@ func stopAllServerListeners(peerID string) {
 	stopSSHTunnelPeerResources(peerID)
 	stopUDPRelayPeerResources(peerID)
 	stopDNSTransportPeerResources(peerID)
+	stopWebTransportPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -210,6 +211,70 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 19 (WebTransport): Genuine QUIC H3 Extended CONNECT + TLS 1.3 Fallback
+		if tc.ID == 19 {
+			uConn, tLn := startWebTransportServer(peer, tc)
+			if uConn != nil {
+				boundUDP = append(boundUDP, uConn)
+			}
+			if tLn != nil {
+				bound = append(bound, tLn)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startWebTransportUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 18 (HTTP Long Polling): Streaming HTTP/1.1 Event-Stream Carrier
+		if tc.ID == 18 {
+			if ln, err := startHTTPLongPollingServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 17 (TLS over TCP): Record-Layer Authenticated TLS over TCP
+		if tc.ID == 17 {
+			if ln, err := startTLSOverTCPServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
 			continue
 		}
 
@@ -630,6 +695,12 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardRawTCPTraffic(client, peer, tc, targetPort)
 	case 16:
 		forwardDNSTransportTraffic(client, peer, tc, targetPort)
+	case 17:
+		forwardTLSOverTCPTraffic(client, peer, tc, targetPort)
+	case 18:
+		forwardHTTPLongPollingTraffic(client, peer, tc, targetPort)
+	case 19:
+		forwardWebTransportTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -837,6 +908,12 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeUDPRelay(peer, tc, localNodeID)
 	case 16:
 		res = probeDNSTransport(peer, tc, localNodeID)
+	case 17:
+		res = probeTLSOverTCP(peer, tc, localNodeID)
+	case 18:
+		res = probeHTTPLongPolling(peer, tc, localNodeID)
+	case 19:
+		res = probeWebTransport(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -847,6 +924,12 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 19:
+		return pushWebTransportParitySync(peer, tc, latencyMS)
+	case 18:
+		return pushHTTPLongPollingParitySync(peer, tc, latencyMS)
+	case 17:
+		return pushTLSOverTCPParitySync(peer, tc, latencyMS)
 	case 16:
 		return pushDNSTransportParitySync(peer, tc, latencyMS)
 	case 15:
