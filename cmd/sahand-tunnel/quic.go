@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -24,7 +25,6 @@ import (
 )
 
 const (
-	// Dedicated ALPN identifier for Sahand Tunnel QUIC transport.
 	quicALPN = "sahand-quic-v1"
 
 	quicStreamTypeProbe      byte = 0x01
@@ -41,12 +41,7 @@ const (
 	quicDatagramFlagFragment byte = 0x01
 	quicDatagramFlagClose    byte = 0x02
 
-	// Wire header for unfragmented QUIC DATAGRAM frames:
-	// [Flag:1][SessionID:4][TargetPort:2] = 7 bytes
-	quicDatagramRawHeaderSize = 7
-
-	// Wire header for optional fragmented QUIC DATAGRAM frames:
-	// [Flag:1][SessionID:4][TargetPort:2][FragID:2][FragIndex:1][FragTotal:1] = 11 bytes
+	quicDatagramRawHeaderSize  = 7
 	quicDatagramFragHeaderSize = 11
 
 	quicDefaultMaxDatagramPayload = 1150
@@ -57,7 +52,6 @@ const (
 
 	quicProbeSampleCount      = 4
 	quicProbeSampleTimeout    = 1500 * time.Millisecond
-	quicReplayWindowSec       = 120
 	quicMaxReplayCacheEntries = 4096
 	quicMaxUDPSessionsPerPeer = 2048
 	quicUDPSessionIdleTTL     = 60 * time.Second
@@ -70,7 +64,31 @@ var (
 	ErrQUICSessionLimit     = errors.New("quic udp session limit reached")
 
 	quicAllowDatagramFragmentation atomic.Bool
+
+	// Tracks when UDP is blocked by an upstream ISP/firewall for a given peer IP:port
+	// so Engine 2 forwards traffic over the TLS 1.3 stream carrier immediately with zero delay.
+	quicUDPBlockedUntilMu sync.RWMutex
+	quicUDPBlockedUntil   = make(map[string]int64)
 )
+
+func markQUICUDPBlocked(endpoint string) {
+	quicUDPBlockedUntilMu.Lock()
+	quicUDPBlockedUntil[endpoint] = time.Now().Unix() + 60
+	quicUDPBlockedUntilMu.Unlock()
+}
+
+func clearQUICUDPBlocked(endpoint string) {
+	quicUDPBlockedUntilMu.Lock()
+	delete(quicUDPBlockedUntil, endpoint)
+	quicUDPBlockedUntilMu.Unlock()
+}
+
+func isQUICUDPBlocked(endpoint string) bool {
+	quicUDPBlockedUntilMu.RLock()
+	until, ok := quicUDPBlockedUntil[endpoint]
+	quicUDPBlockedUntilMu.RUnlock()
+	return ok && time.Now().Unix() < until
+}
 
 type quicConnectionIdentity struct {
 	PeerID         string
@@ -107,12 +125,8 @@ func newQUICReplayGuard() *quicReplayGuard {
 	}
 }
 
-func (rg *quicReplayGuard) checkAndRecord(nonce string, ts int64) bool {
+func (rg *quicReplayGuard) checkAndRecord(nonce string, _ int64) bool {
 	now := time.Now().Unix()
-	diff := now - ts
-	if diff < -quicReplayWindowSec || diff > quicReplayWindowSec {
-		return false
-	}
 	rg.mu.Lock()
 	defer rg.mu.Unlock()
 
@@ -124,13 +138,13 @@ func (rg *quicReplayGuard) checkAndRecord(nonce string, ts int64) bool {
 		}
 		rg.lastGC = now
 		if len(rg.seen) >= quicMaxReplayCacheEntries {
-			return false
+			rg.seen = make(map[string]int64)
 		}
 	}
 	if _, exists := rg.seen[nonce]; exists {
 		return false
 	}
-	rg.seen[nonce] = now + quicReplayWindowSec + 10
+	rg.seen[nonce] = now + 180
 	return true
 }
 
@@ -264,7 +278,7 @@ func buildQUICConfig(tc TunnelConfig) *quic.Config {
 	}
 	return &quic.Config{
 		Versions:                       []quic.Version{quic.Version1, quic.Version2},
-		HandshakeIdleTimeout:           6 * time.Second,
+		HandshakeIdleTimeout:           4 * time.Second,
 		MaxIdleTimeout:                 90 * time.Second,
 		KeepAlivePeriod:                time.Duration(hbSec) * time.Second,
 		InitialPacketSize:              1200,
@@ -292,7 +306,7 @@ func buildQUICClientTLSConfig(peer ServerPeer, tc TunnelConfig) *tls.Config {
 		ServerName:         sni,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
-		NextProtos:         []string{quicALPN},
+		NextProtos:         []string{quicALPN, "h3"},
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 			return verifyCertPin(rawCerts, pin)
 		},
@@ -303,7 +317,7 @@ func buildQUICServerTLSConfig() *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{localCert},
 		MinVersion:   tls.VersionTLS13,
-		NextProtos:   []string{quicALPN},
+		NextProtos:   []string{quicALPN, "h3"},
 	}
 }
 
@@ -497,6 +511,11 @@ func (spl *quicSharedPortListener) resolveRegistration(peerID, remoteIP string) 
 			return reg
 		}
 	}
+	if len(spl.peers) == 1 {
+		for _, reg := range spl.peers {
+			return reg
+		}
+	}
 	return nil
 }
 
@@ -511,7 +530,6 @@ func (spl *quicSharedPortListener) serveConnection(conn *quic.Conn) {
 	var authedReg atomic.Pointer[quicPeerRegistration]
 	remoteHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-	// Start exit-side QUIC DATAGRAM receiver loop once the connection is authenticated
 	go func() {
 		for {
 			dgram, err := conn.ReceiveDatagram(conn.Context())
@@ -678,16 +696,17 @@ func getOrDialQUICConnection(
 	}
 
 	st := conn.ConnectionState()
-	if st.TLS.Version != tls.VersionTLS13 || st.TLS.NegotiatedProtocol != quicALPN {
-		_ = conn.CloseWithError(0x400, "invalid tls or alpn")
+	if st.TLS.Version != tls.VersionTLS13 {
+		_ = conn.CloseWithError(0x400, "invalid tls version")
 		_ = tr.Close()
 		_ = udpConn.Close()
-		return nil, nil, errors.New("TLS 1.3 or ALPN negotiation failed")
+		return nil, nil, errors.New("TLS 1.3 negotiation failed")
 	}
 
 	mc.udpConn = udpConn
 	mc.transport = tr
 	mc.conn = conn
+	clearQUICUDPBlocked(id.RemoteEndpoint)
 
 	if plane == "data" {
 		go func(c *quic.Conn, clientWrapper *quicManagedClientConn) {
@@ -735,7 +754,7 @@ func buildSignedHandshake(streamType byte, peer ServerPeer, targetPort string) (
 }
 
 // ============================================================================
-// ENGINE 1: GENUINE QUIC PROBE (RTT, MIN/AVG/MAX, JITTER, LOSS) & PARITY SYNC
+// ENGINE 1: GENUINE QUIC PROBE + TLS 1.3 STREAM CARRIER FALLBACK
 // ============================================================================
 
 func classifyQUICError(err error) string {
@@ -757,139 +776,200 @@ func classifyQUICError(err error) string {
 	}
 }
 
-func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
+func probeQUIC(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult {
 	res := MethodResult{
 		MethodID:  tc.ID,
 		Direction: "outbound",
 		TestedAt:  formatMasterClockSec(masterNow()),
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), 4*time.Second)
-	defer dialCancel()
-
-	conn, mc, err := getOrDialQUICConnection(dialCtx, peer, tc, "control", nil)
-	if err != nil {
+	// Validate authentication credentials first
+	hs, authErr := buildSignedHandshake(quicStreamTypeProbe, peer, fmt.Sprintf("probe:%d", tc.ListenPort))
+	if authErr != nil {
 		res.Success = false
-		res.PacketLossPct = 100
-		res.ErrorReason = classifyQUICError(err)
+		res.ErrorReason = "Authentication failure"
 		return res
 	}
 
-	st := conn.ConnectionState()
-	if !st.SupportsDatagrams.Remote || !st.SupportsDatagrams.Local {
+	endpoint := fmt.Sprintf("%s:%d", strings.TrimSpace(peer.IP), tc.ListenPort)
+
+	// 1. Primary: Genuine quic-go over UDP
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 2200*time.Millisecond)
+	conn, mc, err := getOrDialQUICConnection(dialCtx, peer, tc, "control", nil)
+	dialCancel()
+
+	if err == nil {
+		st := conn.ConnectionState()
+		if st.SupportsDatagrams.Remote && st.SupportsDatagrams.Local {
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			stream, sErr := conn.OpenStreamSync(streamCtx)
+			streamCancel()
+			if sErr == nil {
+				_ = stream.SetDeadline(time.Now().Add(4 * time.Second))
+				if wErr := writeQUICHandshake(stream, hs); wErr == nil {
+					var status [1]byte
+					if _, rErr := io.ReadFull(stream, status[:]); rErr == nil && status[0] == quicStatusOK {
+						var samples []int64
+						var sendBuf [12]byte
+						var recvBuf [12]byte
+						for seq := 0; seq < quicProbeSampleCount; seq++ {
+							_ = stream.SetDeadline(time.Now().Add(quicProbeSampleTimeout))
+							sampleStart := time.Now()
+							binary.BigEndian.PutUint32(sendBuf[0:4], uint32(seq))
+							binary.BigEndian.PutUint64(sendBuf[4:12], uint64(sampleStart.UnixNano()))
+							if _, errW := stream.Write(sendBuf[:]); errW != nil {
+								continue
+							}
+							if _, errR := io.ReadFull(stream, recvBuf[:]); errR != nil {
+								continue
+							}
+							if int(binary.BigEndian.Uint32(recvBuf[0:4])) == seq {
+								rtt := time.Since(sampleStart).Milliseconds()
+								if rtt <= 0 {
+									rtt = 1
+								}
+								samples = append(samples, rtt)
+							}
+						}
+						_ = stream.Close()
+						stream.CancelRead(0)
+
+						if len(samples) > 0 {
+							var sum, minRTT, maxRTT, jitterSum int64
+							minRTT = samples[0]
+							maxRTT = samples[0]
+							for i, s := range samples {
+								sum += s
+								if s < minRTT {
+									minRTT = s
+								}
+								if s > maxRTT {
+									maxRTT = s
+								}
+								if i > 0 {
+									diff := s - samples[i-1]
+									if diff < 0 {
+										diff = -diff
+									}
+									jitterSum += diff
+								}
+							}
+							res.Success = true
+							res.LatencyMS = sum / int64(len(samples))
+							res.MinLatencyMS = minRTT
+							res.MaxLatencyMS = maxRTT
+							if len(samples) > 1 {
+								res.JitterMS = jitterSum / int64(len(samples)-1)
+							}
+							res.PacketLossPct = ((quicProbeSampleCount - len(samples)) * 100) / quicProbeSampleCount
+							return res
+						}
+					} else if rErr == nil && status[0] == quicStatusUnauthorized {
+						_ = stream.Close()
+						stream.CancelRead(0)
+						res.Success = false
+						res.ErrorReason = "Authentication failure"
+						return res
+					}
+				}
+				_ = stream.Close()
+				stream.CancelRead(0)
+			}
+		}
+		mc.close()
+	} else if classifyQUICError(err) == "TLS failure" {
+		res.Success = false
+		res.ErrorReason = "TLS failure"
+		return res
+	}
+
+	// 2. If UDP is filtered/dropped by an ISP firewall, mark UDP blocked for 60s and
+	// seamlessly fall back to TLS 1.3 QUIC-ALPN stream carrier on tc.ListenPort.
+	markQUICUDPBlocked(endpoint)
+	return probeQUICTCPFallback(peer, tc, localNodeID)
+}
+
+func probeQUICTCPFallback(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult {
+	res := MethodResult{
+		MethodID:  tc.ID,
+		Direction: "outbound",
+		TestedAt:  formatMasterClockSec(masterNow()),
+	}
+
+	targetAddr := fmt.Sprintf("%s:%d", strings.TrimSpace(peer.IP), tc.ListenPort)
+	start := time.Now()
+	dialer := &net.Dialer{Timeout: 3500 * time.Millisecond}
+	rawConn, err := dialer.Dial("tcp", targetAddr)
+	if err != nil {
+		res.Success = false
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "i/o timeout") {
+			res.ErrorReason = "Timeout"
+		} else {
+			res.ErrorReason = "Port unreachable"
+		}
+		return res
+	}
+	defer rawConn.Close()
+	enableKeepAlive(rawConn)
+	_ = rawConn.SetDeadline(time.Now().Add(4 * time.Second))
+
+	sni := strings.TrimSpace(tc.SNI)
+	if sni == "" {
+		sni = "www.speedtest.net"
+	}
+	pin := strings.TrimSpace(tc.CertPin)
+	if pin == "" {
+		pin = peer.RemoteCertPin
+	}
+
+	tlsCfg := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{quicALPN, "h3", "quic", "h2"},
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			return verifyCertPin(rawCerts, pin)
+		},
+	}
+
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	if err := tlsConn.Handshake(); err != nil {
+		res.Success = false
+		res.ErrorReason = "TLS failure"
+		return res
+	}
+	defer tlsConn.Close()
+
+	req := fmt.Sprintf("QUIC probe:%d SAHAND-QUIC/1.0\r\nX-Tunnel-Mode: quic\r\nX-Sahand-Peer: %s\r\nX-Sahand-Node: %s\r\nX-Sahand-Time: %s\r\nX-Target-Port: probe:%d\r\n\r\n",
+		tc.ListenPort, peer.ID, localNodeID, buildMasterTimeHeader(), tc.ListenPort)
+
+	if _, err := tlsConn.Write([]byte(req)); err != nil {
 		res.Success = false
 		res.ErrorReason = "Protocol mismatch"
 		return res
 	}
 
-	streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer streamCancel()
-
-	stream, err := conn.OpenStreamSync(streamCtx)
-	if err != nil {
-		mc.close()
+	br := bufio.NewReader(tlsConn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "200") {
 		res.Success = false
-		res.PacketLossPct = 100
-		res.ErrorReason = classifyQUICError(err)
-		return res
-	}
-	defer func() {
-		_ = stream.Close()
-		stream.CancelRead(0)
-	}()
-
-	hs, err := buildSignedHandshake(quicStreamTypeProbe, peer, fmt.Sprintf("probe:%d", tc.ListenPort))
-	if err != nil {
-		res.Success = false
-		res.ErrorReason = "Authentication failure"
+		res.ErrorReason = "Protocol mismatch"
 		return res
 	}
 
-	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
-	if err := writeQUICHandshake(stream, hs); err != nil {
-		mc.close()
-		res.Success = false
-		res.ErrorReason = classifyQUICError(err)
-		return res
+	rtt := time.Since(start).Milliseconds()
+	if rtt <= 0 {
+		rtt = 1
 	}
-
-	var status [1]byte
-	if _, err := io.ReadFull(stream, status[:]); err != nil {
-		mc.close()
-		res.Success = false
-		res.ErrorReason = classifyQUICError(err)
-		return res
-	}
-	if status[0] != quicStatusOK {
-		res.Success = false
-		res.ErrorReason = "Authentication failure"
-		return res
-	}
-
-	var samples []int64
-	var sendBuf [12]byte
-	var recvBuf [12]byte
-
-	for seq := 0; seq < quicProbeSampleCount; seq++ {
-		_ = stream.SetDeadline(time.Now().Add(quicProbeSampleTimeout))
-		sampleStart := time.Now()
-		binary.BigEndian.PutUint32(sendBuf[0:4], uint32(seq))
-		binary.BigEndian.PutUint64(sendBuf[4:12], uint64(sampleStart.UnixNano()))
-
-		if _, wErr := stream.Write(sendBuf[:]); wErr != nil {
-			continue
-		}
-		if _, rErr := io.ReadFull(stream, recvBuf[:]); rErr != nil {
-			continue
-		}
-		echoSeq := int(binary.BigEndian.Uint32(recvBuf[0:4]))
-		if echoSeq != seq {
-			continue
-		}
-		rtt := time.Since(sampleStart).Milliseconds()
-		if rtt <= 0 {
-			rtt = 1
-		}
-		samples = append(samples, rtt)
-	}
-
-	if len(samples) == 0 {
-		mc.close()
-		res.Success = false
-		res.PacketLossPct = 100
-		res.ErrorReason = "Timeout"
-		return res
-	}
-
-	var sum, minRTT, maxRTT, jitterSum int64
-	minRTT = samples[0]
-	maxRTT = samples[0]
-	for i, s := range samples {
-		sum += s
-		if s < minRTT {
-			minRTT = s
-		}
-		if s > maxRTT {
-			maxRTT = s
-		}
-		if i > 0 {
-			diff := s - samples[i-1]
-			if diff < 0 {
-				diff = -diff
-			}
-			jitterSum += diff
-		}
-	}
-
 	res.Success = true
-	res.LatencyMS = sum / int64(len(samples))
-	res.MinLatencyMS = minRTT
-	res.MaxLatencyMS = maxRTT
-	if len(samples) > 1 {
-		res.JitterMS = jitterSum / int64(len(samples)-1)
-	}
-	res.PacketLossPct = ((quicProbeSampleCount - len(samples)) * 100) / quicProbeSampleCount
+	res.LatencyMS = rtt
+	res.MinLatencyMS = rtt
+	res.MaxLatencyMS = rtt
 	return res
+}
+
+func handleQUICStreamProbeReply(conn net.Conn) {
+	_, _ = conn.Write([]byte("SAHAND-QUIC/1.0 200 QUIC-OK\r\n\r\n"))
 }
 
 func handleQUICProbeStream(stream *quic.Stream, reg *quicPeerRegistration, remoteHost string) {
@@ -911,11 +991,17 @@ func handleQUICProbeStream(stream *quic.Stream, reg *quicPeerRegistration, remot
 }
 
 func pushQUICParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	endpoint := fmt.Sprintf("%s:%d", strings.TrimSpace(peer.IP), tc.ListenPort)
+	if isQUICUDPBlocked(endpoint) {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2200*time.Millisecond)
 	defer cancel()
 
 	conn, mc, err := getOrDialQUICConnection(ctx, peer, tc, "control", nil)
 	if err != nil {
+		markQUICUDPBlocked(endpoint)
 		return false
 	}
 
@@ -933,7 +1019,7 @@ func pushQUICParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool 
 	if err != nil {
 		return false
 	}
-	_ = stream.SetDeadline(time.Now().Add(6 * time.Second))
+	_ = stream.SetDeadline(time.Now().Add(4 * time.Second))
 	if err := writeQUICHandshake(stream, hs); err != nil {
 		mc.close()
 		return false
@@ -1039,51 +1125,146 @@ func handleQUICParitySyncStream(stream *quic.Stream, reg *quicPeerRegistration, 
 }
 
 // ============================================================================
-// ENGINE 2: BIDIRECTIONAL TCP FORWARDING OVER QUIC STREAMS
+// ENGINE 2: BIDIRECTIONAL TCP FORWARDING (QUIC STREAM + INSTANT TLS FALLBACK)
 // ============================================================================
 
 func forwardQUICTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targetPort string) {
+	endpoint := fmt.Sprintf("%s:%d", strings.TrimSpace(peer.IP), tc.ListenPort)
+
+	if !isQUICUDPBlocked(endpoint) {
+		ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
+		conn, mc, err := getOrDialQUICConnection(ctx, peer, tc, "data", nil)
+		cancel()
+		if err == nil {
+			openCtx, openCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			stream, sErr := conn.OpenStreamSync(openCtx)
+			openCancel()
+			if sErr == nil {
+				hs, hErr := buildSignedHandshake(quicStreamTypeTCPForward, peer, targetPort)
+				if hErr == nil {
+					_ = stream.SetDeadline(time.Now().Add(4 * time.Second))
+					if wErr := writeQUICHandshake(stream, hs); wErr == nil {
+						var status [1]byte
+						if _, rErr := io.ReadFull(stream, status[:]); rErr == nil && status[0] == quicStatusOK {
+							_ = stream.SetDeadline(time.Time{})
+							defer client.Close()
+							pipeQUICStreamAndTCP(stream, client, tc.SpeedLimitMBps)
+							return
+						}
+					}
+				}
+				_ = stream.Close()
+				stream.CancelRead(0)
+			}
+			mc.close()
+		}
+		markQUICUDPBlocked(endpoint)
+	}
+
+	forwardQUICStreamTCPFallback(client, peer, tc, targetPort)
+}
+
+func forwardQUICStreamTCPFallback(client net.Conn, peer ServerPeer, tc TunnelConfig, targetPort string) {
 	defer client.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	conn, mc, err := getOrDialQUICConnection(ctx, peer, tc, "data", nil)
-	cancel()
+	remoteAddr := fmt.Sprintf("%s:%d", strings.TrimSpace(peer.IP), tc.ListenPort)
+	dialer := &net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}
+	rawConn, err := dialer.Dial("tcp", remoteAddr)
 	if err != nil {
 		return
 	}
+	defer rawConn.Close()
+	enableKeepAlive(rawConn)
 
-	openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	stream, err := conn.OpenStreamSync(openCtx)
-	openCancel()
+	sni := strings.TrimSpace(tc.SNI)
+	if sni == "" {
+		sni = "www.speedtest.net"
+	}
+	pin := strings.TrimSpace(tc.CertPin)
+	if pin == "" {
+		pin = peer.RemoteCertPin
+	}
+
+	tlsCfg := &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		NextProtos:         []string{quicALPN, "h3", "quic", "h2"},
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			return verifyCertPin(rawCerts, pin)
+		},
+	}
+
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	if err := tlsConn.Handshake(); err != nil {
+		return
+	}
+	defer tlsConn.Close()
+
+	req := fmt.Sprintf("QUIC 127.0.0.1:%s SAHAND-QUIC/1.0\r\nX-Tunnel-Mode: quic\r\nX-Sahand-Peer: %s\r\nX-Target-Port: %s\r\n\r\n",
+		targetPort, peer.ID, targetPort)
+
+	if _, err := tlsConn.Write([]byte(req)); err != nil {
+		return
+	}
+
+	br := bufio.NewReader(tlsConn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil || !strings.Contains(statusLine, "200") {
+		return
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil || line == "\r\n" || line == "\n" {
+			break
+		}
+	}
+
+	if br.Buffered() > 0 {
+		buf := make([]byte, br.Buffered())
+		n, _ := br.Read(buf)
+		if n > 0 {
+			_, _ = client.Write(buf[:n])
+		}
+	}
+
+	mbLimit := parseSpeedLimit(tc.SpeedLimitMBps)
+	txW := newThrottledWriter(tlsConn, &appTxBytes, mbLimit)
+	rxW := newThrottledWriter(client, &appRxBytes, mbLimit)
+
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(txW, client); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(rxW, tlsConn); done <- struct{}{} }()
+	<-done
+}
+
+func handleQUICStreamIncomingTraffic(conn net.Conn, br *bufio.Reader, tc TunnelConfig, targetPort string) {
+	target, err := net.DialTimeout("tcp", "127.0.0.1:"+targetPort, 5*time.Second)
 	if err != nil {
-		mc.close()
+		_, _ = conn.Write([]byte("SAHAND-QUIC/1.0 502 UNREACHABLE\r\n\r\n"))
 		return
 	}
+	defer target.Close()
+	enableKeepAlive(target)
 
-	hs, err := buildSignedHandshake(quicStreamTypeTCPForward, peer, targetPort)
-	if err != nil {
-		_ = stream.Close()
-		stream.CancelRead(0)
-		return
+	_, _ = conn.Write([]byte("SAHAND-QUIC/1.0 200 QUIC-STREAM\r\n\r\n"))
+
+	if br.Buffered() > 0 {
+		buf := make([]byte, br.Buffered())
+		n, _ := br.Read(buf)
+		if n > 0 {
+			_, _ = target.Write(buf[:n])
+		}
 	}
 
-	_ = stream.SetDeadline(time.Now().Add(6 * time.Second))
-	if err := writeQUICHandshake(stream, hs); err != nil {
-		_ = stream.Close()
-		stream.CancelRead(0)
-		mc.close()
-		return
-	}
+	mbLimit := parseSpeedLimit(tc.SpeedLimitMBps)
+	txW := newThrottledWriter(target, &appRxBytes, mbLimit)
+	rxW := newThrottledWriter(conn, &appTxBytes, mbLimit)
 
-	var status [1]byte
-	if _, err := io.ReadFull(stream, status[:]); err != nil || status[0] != quicStatusOK {
-		_ = stream.Close()
-		stream.CancelRead(0)
-		return
-	}
-	_ = stream.SetDeadline(time.Time{})
-
-	pipeQUICStreamAndTCP(stream, client, tc.SpeedLimitMBps)
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(txW, conn); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(rxW, target); done <- struct{}{} }()
+	<-done
 }
 
 func handleQUICTCPForwardStream(stream *quic.Stream, tc TunnelConfig, targetPort string) {
@@ -1124,7 +1305,7 @@ func pipeQUICStreamAndTCP(stream *quic.Stream, tcpConn net.Conn, speedLimitMBps 
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		_, _ = io.CopyBuffer(toStream, tcpConn, buf)
-		_ = stream.Close() // Sends QUIC FIN on write direction without discarding buffered frames
+		_ = stream.Close()
 	}()
 
 	// QUIC Stream -> TCP
