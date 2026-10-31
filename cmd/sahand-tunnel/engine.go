@@ -181,6 +181,8 @@ func stopAllServerListeners(peerID string) {
 	stopReverseTCPPeerResources(peerID)
 	stopSOCKS5PeerResources(peerID)
 	stopSSHTunnelPeerResources(peerID)
+	stopUDPRelayPeerResources(peerID)
+	stopDNSTransportPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -208,6 +210,77 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 16 (DNS Transport): Genuine RFC 1035 UDP DNS + TCP DNS (Section 4.2.2)
+		if tc.ID == 16 {
+			uConn, tLn := startDNSTransportServer(peer, tc)
+			if uConn != nil {
+				boundUDP = append(boundUDP, uConn)
+			}
+			if tLn != nil {
+				bound = append(bound, tLn)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startDNSTransportUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 15 (UDP Relay): Authenticated Binary UDP Datagram Relay + Companion Stream Carrier
+		if tc.ID == 15 {
+			uConn, tLn := startUDPRelayServer(peer, tc)
+			if uConn != nil {
+				boundUDP = append(boundUDP, uConn)
+			}
+			if tLn != nil {
+				bound = append(bound, tLn)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startUDPRelayEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 14 (Raw TCP): Zero-ASCII Binary Preamble + Unframed Raw TCP Splicing
+		if tc.ID == 14 {
+			if ln, err := startRawTCPServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
 			continue
 		}
 
@@ -553,6 +626,10 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardSOCKS5Traffic(client, peer, tc, targetPort)
 	case 13:
 		forwardSSHTunnelTraffic(client, peer, tc, targetPort)
+	case 14, 15:
+		forwardRawTCPTraffic(client, peer, tc, targetPort)
+	case 16:
+		forwardDNSTransportTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -754,6 +831,12 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeSOCKS5(peer, tc, localNodeID)
 	case 13:
 		res = probeSSHTunnel(peer, tc, localNodeID)
+	case 14:
+		res = probeRawTCP(peer, tc, localNodeID)
+	case 15:
+		res = probeUDPRelay(peer, tc, localNodeID)
+	case 16:
+		res = probeDNSTransport(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -764,6 +847,12 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 16:
+		return pushDNSTransportParitySync(peer, tc, latencyMS)
+	case 15:
+		return pushUDPRelayParitySync(peer, tc, latencyMS)
+	case 14:
+		return pushRawTCPParitySync(peer, tc, latencyMS)
 	case 13:
 		return pushSSHTunnelParitySync(peer, tc, latencyMS)
 	case 12:
