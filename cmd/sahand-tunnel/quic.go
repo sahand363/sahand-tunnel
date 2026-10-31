@@ -775,7 +775,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer dialCancel()
 
-	conn, _, err := getOrDialQUICConnection(dialCtx, peer, tc, "control", nil)
+	conn, mc, err := getOrDialQUICConnection(dialCtx, peer, tc, "control", nil)
 	if err != nil {
 		res.Success = false
 		res.PacketLossPct = 100
@@ -795,7 +795,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 
 	stream, err := conn.OpenStreamSync(streamCtx)
 	if err != nil {
-		_ = conn.CloseWithError(0, "stream open failed")
+		mc.close()
 		res.Success = false
 		res.PacketLossPct = 100
 		res.ErrorReason = classifyQUICError(err)
@@ -815,6 +815,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	if err := writeQUICHandshake(stream, hs); err != nil {
+		mc.close()
 		res.Success = false
 		res.ErrorReason = "Timeout"
 		return res
@@ -822,6 +823,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 
 	var status [1]byte
 	if _, err := io.ReadFull(stream, status[:]); err != nil {
+		mc.close()
 		res.Success = false
 		res.ErrorReason = "Timeout"
 		return res
@@ -860,6 +862,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	}
 
 	if len(samples) == 0 {
+		mc.close()
 		res.Success = false
 		res.PacketLossPct = 100
 		res.ErrorReason = "Timeout"
@@ -919,13 +922,14 @@ func pushQUICParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	conn, _, err := getOrDialQUICConnection(ctx, peer, tc, "control", nil)
+	conn, mc, err := getOrDialQUICConnection(ctx, peer, tc, "control", nil)
 	if err != nil {
 		return false
 	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
+		mc.close()
 		return false
 	}
 	defer func() {
@@ -939,6 +943,7 @@ func pushQUICParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool 
 	}
 	_ = stream.SetDeadline(time.Now().Add(6 * time.Second))
 	if err := writeQUICHandshake(stream, hs); err != nil {
+		mc.close()
 		return false
 	}
 
@@ -978,9 +983,11 @@ func pushQUICParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool 
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(rawPkt)))
 	if _, err := stream.Write(lenBuf[:]); err != nil {
+		mc.close()
 		return false
 	}
 	if _, err := stream.Write(rawPkt); err != nil {
+		mc.close()
 		return false
 	}
 
@@ -1047,7 +1054,7 @@ func forwardQUICTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targe
 	defer client.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	conn, _, err := getOrDialQUICConnection(ctx, peer, tc, "data", nil)
+	conn, mc, err := getOrDialQUICConnection(ctx, peer, tc, "data", nil)
 	cancel()
 	if err != nil {
 		return
@@ -1057,6 +1064,7 @@ func forwardQUICTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targe
 	stream, err := conn.OpenStreamSync(openCtx)
 	openCancel()
 	if err != nil {
+		mc.close()
 		return
 	}
 
@@ -1071,6 +1079,7 @@ func forwardQUICTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targe
 	if err := writeQUICHandshake(stream, hs); err != nil {
 		_ = stream.Close()
 		stream.CancelRead(0)
+		mc.close()
 		return
 	}
 
