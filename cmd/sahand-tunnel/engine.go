@@ -206,7 +206,7 @@ func syncServerListeners(peer ServerPeer) {
 			continue
 		}
 
-		// Method 08 (QUIC): Use genuine quic-go UDP listener ONLY (no fake TCP listener).
+		// Method 08 (QUIC): Use genuine quic-go UDP listener ONLY.
 		if tc.ID == 8 {
 			_ = registerQUICPeerListener(peer, tc)
 			if tc.Enabled && peer.IP != "" {
@@ -217,9 +217,11 @@ func syncServerListeners(peer ServerPeer) {
 					if err == nil {
 						bound = append(bound, entryLn)
 						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
-					}
-					if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
-						boundUDP = append(boundUDP, udpEntry)
+						// Only bind the UDP entry forwarder if the TCP port was free on this host
+						// (prevents hijacking UDP on the exit server where Xray/X-UI owns the port).
+						if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
 					}
 				}
 			}
