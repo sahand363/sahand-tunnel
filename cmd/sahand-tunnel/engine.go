@@ -178,6 +178,7 @@ func stopAllServerListeners(peerID string) {
 	stopQUICPeerResources(peerID)
 	stopRatholePeerResources(peerID)
 	stopNoiseStealthPeerResources(peerID)
+	stopReverseTCPPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -205,6 +206,26 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 11 (Reverse TCP): Warm Reverse Socket Pool + Control Channel
+		if tc.ID == 11 {
+			if ln, err := startReverseTCPServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				startReverseTCPClientWorker(peer, tc)
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
 			continue
 		}
 
@@ -483,6 +504,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardRatholeTraffic(client, peer, tc, targetPort)
 	case 10:
 		forwardNoiseStealthTraffic(client, peer, tc, targetPort)
+	case 11:
+		forwardReverseTCPTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -678,6 +701,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeRathole(peer, tc, localNodeID)
 	case 10:
 		res = probeNoiseStealth(peer, tc, localNodeID)
+	case 11:
+		res = probeReverseTCP(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -687,6 +712,9 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
+	if tc.ID == 11 {
+		return pushReverseTCPParitySync(peer, tc, latencyMS)
+	}
 	if tc.ID == 10 {
 		return pushNoiseStealthParitySync(peer, tc, latencyMS)
 	}
