@@ -206,26 +206,10 @@ func syncServerListeners(peer ServerPeer) {
 			continue
 		}
 
-		// Method 08 (QUIC): Use genuine quic-go UDP listener ONLY.
+		// Method 08 (QUIC): Bind genuine quic-go UDP listener AND TLS 1.3 TCP carrier
+		// so routes where ISP firewalls drop UDP still connect and forward without timeout.
 		if tc.ID == 8 {
 			_ = registerQUICPeerListener(peer, tc)
-			if tc.Enabled && peer.IP != "" {
-				forwardPorts := parsePortList(tc.ForwardPorts)
-				for _, fp := range forwardPorts {
-					targetPort := fp
-					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
-					if err == nil {
-						bound = append(bound, entryLn)
-						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
-						// Only bind the UDP entry forwarder if the TCP port was free on this host
-						// (prevents hijacking UDP on the exit server where Xray/X-UI owns the port).
-						if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
-							boundUDP = append(boundUDP, udpEntry)
-						}
-					}
-				}
-			}
-			continue
 		}
 
 		listenAddr := fmt.Sprintf("0.0.0.0:%d", tc.ListenPort)
@@ -237,6 +221,8 @@ func syncServerListeners(peer ServerPeer) {
 			nextProtos := []string{"http/1.1"}
 			if tc.ID == 2 || tc.ID == 3 || tc.ID == 7 {
 				nextProtos = []string{"h2", "http/1.1"}
+			} else if tc.ID == 8 {
+				nextProtos = []string{quicALPN, "h3", "quic", "h2"}
 			}
 			tlsCfg := &tls.Config{
 				Certificates: []tls.Certificate{localCert},
@@ -260,6 +246,11 @@ func syncServerListeners(peer ServerPeer) {
 				if err == nil {
 					bound = append(bound, entryLn)
 					go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					if tc.ID == 8 {
+						if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
 				}
 			}
 		}
@@ -330,7 +321,7 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		applyMasterTimeHeader(timeHeader)
 	}
 
-	if (parts[0] == "CONNECT" || parts[0] == "RELAY" || parts[0] == "STREAM") && targetPort == "" {
+	if (parts[0] == "CONNECT" || parts[0] == "RELAY" || parts[0] == "STREAM" || parts[0] == "QUIC") && targetPort == "" {
 		if strings.HasPrefix(parts[1], "probe:") {
 			targetPort = parts[1]
 		} else if idx := strings.LastIndex(parts[1], ":"); idx >= 0 {
@@ -374,6 +365,8 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			handleTCPRelayProbeReply(conn)
 		case tc.ID == 7 || parts[0] == "STREAM" || tunnelMode == "tls-stream":
 			handleTLSStreamProbeReply(conn)
+		case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
+			handleQUICStreamProbeReply(conn)
 		default:
 			handleWSSProbeReply(conn, wsKey)
 		}
@@ -407,6 +400,8 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		handleTCPRelayIncomingTraffic(conn, br, tc, targetPort)
 	case tc.ID == 7 || parts[0] == "STREAM" || tunnelMode == "tls-stream":
 		handleTLSStreamIncomingTraffic(conn, br, tc, targetPort)
+	case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
+		handleQUICStreamIncomingTraffic(conn, br, tc, targetPort)
 	default:
 		handleWSSIncomingTraffic(conn, br, tc, wsKey, targetPort)
 	}
@@ -640,7 +635,10 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	if tc.ID == 8 {
-		return pushQUICParitySync(peer, tc, latencyMS)
+		if pushQUICParitySync(peer, tc, latencyMS) {
+			return true
+		}
+		// If UDP is blocked by the ISP, fall through to TLS-over-TCP sync on port 11308
 	}
 
 	stateMu.RLock()
