@@ -393,6 +393,32 @@ func handleServerAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Action == "next_method" {
+		stateMu.RLock()
+		role := appCfg.Role
+		stateMu.RUnlock()
+		if role != "master" {
+			http.Error(w, "only master can switch methods", http.StatusForbidden)
+			return
+		}
+		switched, msg, err := switchNextMethod(req.ServerID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			OK       bool   `json:"ok"`
+			Switched bool   `json:"switched"`
+			Message  string `json:"message"`
+		}{
+			OK:       true,
+			Switched: switched,
+			Message:  msg,
+		})
+		return
+	}
+
 	stateMu.Lock()
 	idx := -1
 	for i := range appCfg.Servers {
@@ -411,6 +437,8 @@ func handleServerAction(w http.ResponseWriter, r *http.Request) {
 	case "play":
 		appCfg.Servers[idx].Running = true
 		appCfg.Servers[idx].Status = "TESTING"
+		appCfg.Servers[idx].ActiveMethodID = 0
+		appCfg.Servers[idx].ActiveMethod = ""
 		appCfg.Servers[idx].NextRetryAt = ""
 		peer := appCfg.Servers[idx]
 		_ = saveConfig(configPath(), appCfg)
