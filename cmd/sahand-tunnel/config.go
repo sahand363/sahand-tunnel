@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -226,20 +227,32 @@ var (
 	stateMu   sync.RWMutex
 	appCfg    Config
 	localCert tls.Certificate
+
+	// Lock-free atomic mirrors for Master clock synchronization so masterNow()
+	// can be safely called even while stateMu.Lock() is held.
+	atomicIsAgent          atomic.Bool
+	atomicMasterTZOffset   atomic.Int64
+	atomicMasterClockDelta atomic.Int64
+	atomicMasterTZName     atomic.Value // string
 )
 
-// masterNow returns the current time synchronized to the Master server's local clock and timezone.
-func masterNow() time.Time {
-	stateMu.RLock()
-	role := appCfg.Role
-	tzName := appCfg.MasterTZName
-	tzOff := appCfg.MasterTZOffsetSec
-	delta := appCfg.MasterClockDelta
-	stateMu.RUnlock()
+func syncMasterClockAtomics(cfg Config) {
+	atomicIsAgent.Store(cfg.Role == "agent")
+	atomicMasterTZOffset.Store(int64(cfg.MasterTZOffsetSec))
+	atomicMasterClockDelta.Store(cfg.MasterClockDelta)
+	atomicMasterTZName.Store(cfg.MasterTZName)
+}
 
-	if role == "master" {
+// masterNow returns the current time synchronized to the Master server's local clock and timezone.
+// It is completely lock-free so it can be called inside or outside stateMu critical sections.
+func masterNow() time.Time {
+	if !atomicIsAgent.Load() {
 		return time.Now()
 	}
+	delta := atomicMasterClockDelta.Load()
+	tzOff := int(atomicMasterTZOffset.Load())
+	tzName, _ := atomicMasterTZName.Load().(string)
+
 	now := time.Now().Add(time.Duration(delta) * time.Second)
 	if tzName != "" || tzOff != 0 {
 		if tzName == "" {
@@ -276,10 +289,7 @@ func formatMasterClockSec(t time.Time) string {
 }
 
 func buildMasterTimeHeader() string {
-	stateMu.RLock()
-	role := appCfg.Role
-	stateMu.RUnlock()
-	if role != "master" {
+	if atomicIsAgent.Load() {
 		return ""
 	}
 	now := time.Now()
@@ -308,6 +318,7 @@ func applyMasterTimeHeader(hdr string) {
 		if tzName != "" {
 			appCfg.MasterTZName = tzName
 		}
+		syncMasterClockAtomics(appCfg)
 	}
 	stateMu.Unlock()
 }
@@ -535,10 +546,12 @@ func loadExistingConfig(path string) (Config, bool, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, true, fmt.Errorf("cannot read existing configuration: %w", err)
 	}
+	syncMasterClockAtomics(cfg)
 	return cfg, true, nil
 }
 
 func saveConfig(path string, cfg Config) error {
+	syncMasterClockAtomics(cfg)
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -614,6 +627,7 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 			}
 		}
 	}
+	syncMasterClockAtomics(*cfg)
 	return changed, nil
 }
 
