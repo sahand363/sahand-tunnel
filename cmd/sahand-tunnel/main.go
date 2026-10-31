@@ -22,7 +22,7 @@ var webAssets embed.FS
 
 const (
 	AppName        = "sahand-tunnel"
-	AppVersion     = "0.4.1"
+	AppVersion     = "0.4.2"
 	defaultPort    = 18080
 	passwordRounds = 310000
 	sessionTTL     = 12 * time.Hour
@@ -188,6 +188,7 @@ func runMenu() {
 		fmt.Println("5. Service Status")
 		fmt.Println("6. View Logs")
 		fmt.Println("7. Update")
+		fmt.Println("8. Uninstall")
 		fmt.Println("0. Exit")
 		fmt.Print("\nSelect an option: ")
 
@@ -225,6 +226,10 @@ func runMenu() {
 			if err := cmd.Run(); err != nil {
 				fmt.Println("Update failed:", err)
 			}
+		case "8":
+			if runUninstall(reader) {
+				return
+			}
 		case "0":
 			return
 		case "":
@@ -241,6 +246,42 @@ func runMenu() {
 		fmt.Print("\nPress Enter to continue...")
 		_, _ = reader.ReadString('\n')
 	}
+}
+
+func runUninstall(reader *bufio.Reader) bool {
+	fmt.Println()
+	fmt.Print("Are you sure you want to completely uninstall Sahand Tunnel? [y/N]: ")
+	confirm, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Println("Input error:", err)
+		return false
+	}
+	confirm = strings.TrimSpace(strings.ToLower(confirm))
+	if confirm != "y" && confirm != "yes" {
+		fmt.Println("Uninstall cancelled.")
+		return false
+	}
+
+	fmt.Println("\nStopping and disabling Sahand Tunnel service...")
+	_ = exec.Command("systemctl", "stop", "sahand-tunnel").Run()
+	_ = exec.Command("systemctl", "disable", "sahand-tunnel").Run()
+
+	pathsToRemove := []string{
+		"/etc/systemd/system/sahand-tunnel.service",
+		"/usr/local/bin/sahand-tunnel-domain",
+		"/usr/local/bin/sahand-tunnel-update",
+		"/etc/sahand-tunnel",
+		"/var/lib/sahand-tunnel",
+		"/usr/local/bin/sahand-tunnel",
+	}
+
+	for _, p := range pathsToRemove {
+		_ = os.RemoveAll(p)
+	}
+
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+	fmt.Println("Sahand Tunnel has been completely uninstalled.")
+	return true
 }
 
 func runSystemctl(args ...string) {
