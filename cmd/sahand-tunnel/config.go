@@ -201,7 +201,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "cert_pin", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{9, "Rathole", 94, "tcp+udp", true, 11309, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
 	{10, "Noise TCP Stealth", 97, "tcp+udp", true, 11310, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
-	{11, "Reverse TCP", 50, "tcp", false, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
+	{11, "Reverse TCP", 50, "tcp", true, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
 	{12, "SOCKS5", 60, "tcp+udp", false, 11312, []string{"listen_port", "forward_ports"}},
 	{13, "SSH Tunnel", 86, "tcp", false, 11313, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
 	{14, "Raw TCP", 35, "tcp", false, 11314, []string{"listen_port", "forward_ports"}},
