@@ -199,7 +199,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{6, "TCP Relay", 45, "tcp", true, 11306, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
 	{7, "TLS Stream", 88, "tcp", true, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin", "speed_limit_mbps"}},
 	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "cert_pin", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
-	{9, "HTTP/3", 92, "tcp+udp", false, 11309, []string{"listen_port", "forward_ports", "sni"}},
+	{9, "Rathole", 94, "tcp+udp", true, 11309, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
 	{10, "WebSocket TCP", 65, "tcp", false, 11310, []string{"listen_port", "forward_ports", "ws_path"}},
 	{11, "Reverse TCP", 50, "tcp", false, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
 	{12, "SOCKS5", 60, "tcp+udp", false, 11312, []string{"listen_port", "forward_ports"}},
@@ -694,8 +694,8 @@ func parseAndValidateToken(rawToken string) (TokenPayload, error) {
 }
 
 // derivePeerAuthKey validates the peer's st1. pairing token and derives a version-independent
-// 16-byte shared key from the paired AID/MID inside the token so Master (e.g. v13) and Agent (e.g. v1)
-// always compute the exact same HMAC key even after tunnel ports/settings are edited on the Master.
+// 16-byte shared key from the paired AID/MID inside the token so Master and Agent always compute
+// the exact same HMAC / Noise static key even after tunnel ports/settings are edited on the Master.
 func derivePeerAuthKey(_ Config, peer ServerPeer) ([]byte, error) {
 	if peer.TokenRevoked {
 		return nil, errors.New("peer token has been revoked")
