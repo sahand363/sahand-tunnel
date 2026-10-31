@@ -179,6 +179,8 @@ func stopAllServerListeners(peerID string) {
 	stopRatholePeerResources(peerID)
 	stopNoiseStealthPeerResources(peerID)
 	stopReverseTCPPeerResources(peerID)
+	stopSOCKS5PeerResources(peerID)
+	stopSSHTunnelPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -206,6 +208,47 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 13 (SSH Tunnel): Genuine RFC 4251-4254 SSH-2 Server & direct-tcpip Channels
+		if tc.ID == 13 {
+			if ln, err := startSSHTunnelServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 12 (SOCKS5): Genuine RFC 1928 + RFC 1929 SOCKS5 Server (TCP CONNECT + UDP ASSOCIATE)
+		if tc.ID == 12 {
+			if ln, err := startSOCKS5ServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startSOCKS5UDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
 			continue
 		}
 
@@ -506,6 +549,10 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardNoiseStealthTraffic(client, peer, tc, targetPort)
 	case 11:
 		forwardReverseTCPTraffic(client, peer, tc, targetPort)
+	case 12:
+		forwardSOCKS5Traffic(client, peer, tc, targetPort)
+	case 13:
+		forwardSSHTunnelTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -703,6 +750,10 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeNoiseStealth(peer, tc, localNodeID)
 	case 11:
 		res = probeReverseTCP(peer, tc, localNodeID)
+	case 12:
+		res = probeSOCKS5(peer, tc, localNodeID)
+	case 13:
+		res = probeSSHTunnel(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -712,16 +763,18 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
-	if tc.ID == 11 {
+	switch tc.ID {
+	case 13:
+		return pushSSHTunnelParitySync(peer, tc, latencyMS)
+	case 12:
+		return pushSOCKS5ParitySync(peer, tc, latencyMS)
+	case 11:
 		return pushReverseTCPParitySync(peer, tc, latencyMS)
-	}
-	if tc.ID == 10 {
+	case 10:
 		return pushNoiseStealthParitySync(peer, tc, latencyMS)
-	}
-	if tc.ID == 9 {
+	case 9:
 		return pushRatholeParitySync(peer, tc, latencyMS)
-	}
-	if tc.ID == 8 {
+	case 8:
 		if pushQUICParitySync(peer, tc, latencyMS) {
 			return true
 		}
