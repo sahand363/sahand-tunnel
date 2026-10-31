@@ -22,12 +22,13 @@ var webAssets embed.FS
 
 const (
 	AppName        = "sahand-tunnel"
-	AppVersion     = "0.4.2"
 	defaultPort    = 18080
 	passwordRounds = 310000
 	sessionTTL     = 12 * time.Hour
 	wsGUID         = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
+
+var AppVersion = "0.4.5"
 
 func main() {
 	if len(os.Args) < 2 {
