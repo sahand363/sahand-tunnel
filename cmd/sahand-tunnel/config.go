@@ -28,20 +28,23 @@ import (
 )
 
 type Config struct {
-	Role          string       `json:"role"`
-	NodeID        string       `json:"node_id"`
-	ListenAddr    string       `json:"listen_addr"`
-	PanelURL      string       `json:"panel_url,omitempty"`
-	PanelPort     int          `json:"panel_port"`
-	AdminUsername string       `json:"admin_username"`
-	AdminSalt     string       `json:"admin_salt"`
-	AdminHash     string       `json:"admin_hash"`
-	TokenSecret   string       `json:"token_secret,omitempty"`
-	TLSCertPEM    string       `json:"tls_cert_pem,omitempty"`
-	TLSKeyPEM     string       `json:"tls_key_pem,omitempty"`
-	CertPin       string       `json:"cert_pin,omitempty"`
-	Servers       []ServerPeer `json:"servers,omitempty"`
-	CreatedAt     time.Time    `json:"created_at"`
+	Role              string       `json:"role"`
+	NodeID            string       `json:"node_id"`
+	ListenAddr        string       `json:"listen_addr"`
+	PanelURL          string       `json:"panel_url,omitempty"`
+	PanelPort         int          `json:"panel_port"`
+	AdminUsername     string       `json:"admin_username"`
+	AdminSalt         string       `json:"admin_salt"`
+	AdminHash         string       `json:"admin_hash"`
+	TokenSecret       string       `json:"token_secret,omitempty"`
+	TLSCertPEM        string       `json:"tls_cert_pem,omitempty"`
+	TLSKeyPEM         string       `json:"tls_key_pem,omitempty"`
+	CertPin           string       `json:"cert_pin,omitempty"`
+	MasterTZName      string       `json:"master_tz_name,omitempty"`
+	MasterTZOffsetSec int          `json:"master_tz_offset_sec,omitempty"`
+	MasterClockDelta  int64        `json:"master_clock_delta,omitempty"`
+	Servers           []ServerPeer `json:"servers,omitempty"`
+	CreatedAt         time.Time    `json:"created_at"`
 }
 
 type MethodCatalogueItem struct {
@@ -117,16 +120,18 @@ type ServerPeer struct {
 }
 
 type TokenPayload struct {
-	V     int    `json:"v"`
-	MID   string `json:"mid"`
-	AID   string `json:"aid"`
-	MIP   string `json:"mip,omitempty"`
-	Pin   string `json:"pin,omitempty"`
-	TS    int64  `json:"ts"`
-	Exp   int64  `json:"exp"`
-	Ports []int  `json:"ports"`
-	Key   string `json:"key"`
-	Sig   string `json:"sig"`
+	V      int    `json:"v"`
+	MID    string `json:"mid"`
+	AID    string `json:"aid"`
+	MIP    string `json:"mip,omitempty"`
+	Pin    string `json:"pin,omitempty"`
+	TS     int64  `json:"ts"`
+	Exp    int64  `json:"exp"`
+	TZName string `json:"tzn,omitempty"`
+	TZOff  int    `json:"tzo,omitempty"`
+	Ports  []int  `json:"ports"`
+	Key    string `json:"key"`
+	Sig    string `json:"sig"`
 }
 
 type SyncPacket struct {
@@ -137,6 +142,9 @@ type SyncPacket struct {
 	Port          int            `json:"port"`
 	LatencyMS     int64          `json:"latency_ms"`
 	ConfigVersion int            `json:"config_version"`
+	MasterUnix    int64          `json:"m_unix,omitempty"`
+	MasterTZName  string         `json:"m_tzn,omitempty"`
+	MasterTZOff   int            `json:"m_tzo,omitempty"`
 	Tunnels       []TunnelConfig `json:"tunnels,omitempty"`
 	CertPin       string         `json:"cert_pin,omitempty"`
 	Padding       string         `json:"pad,omitempty"`
@@ -146,6 +154,9 @@ type SyncResponse struct {
 	OK            bool           `json:"ok"`
 	NodeID        string         `json:"node_id"`
 	ConfigVersion int            `json:"config_version"`
+	MasterUnix    int64          `json:"m_unix,omitempty"`
+	MasterTZName  string         `json:"m_tzn,omitempty"`
+	MasterTZOff   int            `json:"m_tzo,omitempty"`
 	Tunnels       []TunnelConfig `json:"tunnels,omitempty"`
 	CertPin       string         `json:"cert_pin,omitempty"`
 }
@@ -181,8 +192,8 @@ var methodCatalogue = []MethodCatalogueItem{
 	{4, "HTTP CONNECT", 76, "tcp", true, 11304, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
 	{5, "HTTPS Proxy", 82, "tcp", true, 11305, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
 	{6, "TCP Relay", 45, "tcp", true, 11306, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
-	{7, "TLS Stream", 88, "tcp", false, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
-	{8, "QUIC", 92, "tcp+udp", false, 11308, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec"}},
+	{7, "TLS Stream", 88, "tcp", true, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin", "speed_limit_mbps"}},
+	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec", "speed_limit_mbps"}},
 	{9, "HTTP/3", 92, "tcp+udp", false, 11309, []string{"listen_port", "forward_ports", "sni"}},
 	{10, "WebSocket TCP", 65, "tcp", false, 11310, []string{"listen_port", "forward_ports", "ws_path"}},
 	{11, "Reverse TCP", 50, "tcp", false, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
@@ -212,6 +223,90 @@ var (
 	appCfg    Config
 	localCert tls.Certificate
 )
+
+// masterNow returns the current time synchronized to the Master server's local clock and timezone.
+func masterNow() time.Time {
+	stateMu.RLock()
+	role := appCfg.Role
+	tzName := appCfg.MasterTZName
+	tzOff := appCfg.MasterTZOffsetSec
+	delta := appCfg.MasterClockDelta
+	stateMu.RUnlock()
+
+	if role == "master" {
+		return time.Now()
+	}
+	now := time.Now().Add(time.Duration(delta) * time.Second)
+	if tzName != "" || tzOff != 0 {
+		if tzName == "" {
+			tzName = "MASTER"
+		}
+		loc := time.FixedZone(tzName, tzOff)
+		return now.In(loc)
+	}
+	return now
+}
+
+func formatMasterTimestamp(t time.Time) string {
+	zone, _ := t.Zone()
+	if zone == "" {
+		return t.Format("2006-01-02 15:04")
+	}
+	return fmt.Sprintf("%s %s", t.Format("2006-01-02 15:04"), zone)
+}
+
+func formatMasterClock(t time.Time) string {
+	zone, _ := t.Zone()
+	if zone == "" {
+		return t.Format("15:04")
+	}
+	return fmt.Sprintf("%s %s", t.Format("15:04"), zone)
+}
+
+func formatMasterClockSec(t time.Time) string {
+	zone, _ := t.Zone()
+	if zone == "" {
+		return t.Format("15:04:05")
+	}
+	return fmt.Sprintf("%s %s", t.Format("15:04:05"), zone)
+}
+
+func buildMasterTimeHeader() string {
+	stateMu.RLock()
+	role := appCfg.Role
+	stateMu.RUnlock()
+	if role != "master" {
+		return ""
+	}
+	now := time.Now()
+	zName, zOff := now.Zone()
+	return fmt.Sprintf("%d|%d|%s", now.Unix(), zOff, zName)
+}
+
+func applyMasterTimeHeader(hdr string) {
+	parts := strings.SplitN(strings.TrimSpace(hdr), "|", 3)
+	if len(parts) < 2 {
+		return
+	}
+	unixSec, err1 := strconv.ParseInt(parts[0], 10, 64)
+	tzOff, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || unixSec <= 0 {
+		return
+	}
+	var tzName string
+	if len(parts) == 3 {
+		tzName = parts[2]
+	}
+	stateMu.Lock()
+	if appCfg.Role == "agent" {
+		appCfg.MasterClockDelta = unixSec - time.Now().Unix()
+		appCfg.MasterTZOffsetSec = tzOff
+		if tzName != "" {
+			appCfg.MasterTZName = tzName
+		}
+	}
+	stateMu.Unlock()
+}
 
 func configPath() string {
 	if p := os.Getenv("SAHAND_CONFIG"); p != "" {
@@ -530,20 +625,23 @@ func generatePeerToken(cfg Config, peer ServerPeer) (string, error) {
 	for _, t := range tunnels {
 		ports = append(ports, t.ListenPort)
 	}
-	now := time.Now().UTC()
+	now := time.Now()
+	zName, zOff := now.Zone()
 	sharedKeyMac := hmac.New(sha256.New, []byte(cfg.TokenSecret))
 	_, _ = sharedKeyMac.Write([]byte(peer.ID + "|" + strconv.Itoa(peer.ConfigVersion)))
 	derivedKey := hex.EncodeToString(sharedKeyMac.Sum(nil)[:16])
 
 	tp := TokenPayload{
-		V:     peer.ConfigVersion,
-		MID:   cfg.NodeID,
-		AID:   peer.ID,
-		Pin:   cfg.CertPin,
-		TS:    now.Unix(),
-		Exp:   now.Add(365 * 24 * time.Hour).Unix(),
-		Ports: ports,
-		Key:   derivedKey,
+		V:      peer.ConfigVersion,
+		MID:    cfg.NodeID,
+		AID:    peer.ID,
+		Pin:    cfg.CertPin,
+		TS:     now.Unix(),
+		Exp:    now.Add(365 * 24 * time.Hour).Unix(),
+		TZName: zName,
+		TZOff:  zOff,
+		Ports:  ports,
+		Key:    derivedKey,
 	}
 	tp.Sig = signTokenPayload(tp, cfg.TokenSecret)
 	raw, err := json.Marshal(tp)
@@ -569,7 +667,7 @@ func parseAndValidateToken(rawToken string) (TokenPayload, error) {
 	if tp.MID == "" || tp.AID == "" || len(tp.Ports) != 30 || tp.Key == "" || tp.Sig == "" {
 		return tp, errors.New("incomplete token fields")
 	}
-	if time.Now().UTC().Unix() > tp.Exp {
+	if time.Now().Unix() > tp.Exp {
 		return tp, errors.New("token has expired")
 	}
 	return tp, nil
