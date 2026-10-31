@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,8 @@ import (
 
 func setupQUICTestEnvironment(t *testing.T, quicPort int, forwardPorts string, speedLimit string) (ServerPeer, TunnelConfig, func()) {
 	t.Helper()
+
+	t.Setenv("SAHAND_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 
 	certPEM, keyPEM, pin, err := generateSelfSignedCert()
 	if err != nil {
@@ -138,7 +141,7 @@ func TestQUICHandshakeTLS13ALPNAndProbe(t *testing.T) {
 	if st.TLS.NegotiatedProtocol != quicALPN {
 		t.Fatalf("expected ALPN %q, got %q", quicALPN, st.TLS.NegotiatedProtocol)
 	}
-	if !st.SupportsDatagrams {
+	if !st.SupportsDatagrams.Remote || !st.SupportsDatagrams.Local {
 		t.Fatalf("expected RFC 9221 QUIC DATAGRAM support to be negotiated")
 	}
 
@@ -300,9 +303,10 @@ func TestQUICTCPBidirectionalConcurrentAndSpeedLimit(t *testing.T) {
 func TestQUICUDPDatagramSessionsAndSizeHandling(t *testing.T) {
 	qPort := freeUDPPort(t)
 	udpTargetPort := freeUDPPort(t)
+	udpEntryPort := freeUDPPort(t)
 
-	// Start target UDP server that echoes back "<clientSourcePort>|<payload>"
-	// so we can prove that multiple packets from the same client use the exact same exit socket!
+	// Start target UDP server on 127.0.0.1:<udpTargetPort> that echoes "<clientSourcePort>|<payload>"
+	// so we can verify that multiple packets from the same client use the exact same exit socket.
 	targetUDPAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: udpTargetPort}
 	targetUDPConn, err := net.ListenUDP("udp", targetUDPAddr)
 	if err != nil {
@@ -325,7 +329,12 @@ func TestQUICUDPDatagramSessionsAndSizeHandling(t *testing.T) {
 	peer, quicTun, cleanup := setupQUICTestEnvironment(t, qPort, strconv.Itoa(udpTargetPort), "0")
 	defer cleanup()
 
-	entryPC := startQUICUDPEntryForwarder(peer, quicTun, strconv.Itoa(udpTargetPort))
+	entryPC := startQUICUDPEntryForwarderWithDest(
+		peer,
+		quicTun,
+		strconv.Itoa(udpEntryPort),
+		strconv.Itoa(udpTargetPort),
+	)
 	if entryPC == nil {
 		t.Fatalf("failed to start QUIC UDP entry forwarder")
 	}
@@ -339,7 +348,7 @@ func TestQUICUDPDatagramSessionsAndSizeHandling(t *testing.T) {
 		wg.Add(1)
 		go func(clientIdx int) {
 			defer wg.Done()
-			cli, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: udpTargetPort})
+			cli, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: udpEntryPort})
 			if err != nil {
 				errCh <- err
 				return
