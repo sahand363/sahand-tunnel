@@ -160,6 +160,19 @@ func parsePortList(raw string) []string {
 	return res
 }
 
+func formatConnectionInitiator(localRole, direction string) string {
+	if localRole == "master" {
+		if direction == "outbound" {
+			return "Master → Agent"
+		}
+		return "Agent → Master"
+	}
+	if direction == "outbound" {
+		return "Agent → Master"
+	}
+	return "Master → Agent"
+}
+
 func stopAllServerListeners(peerID string) {
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -183,16 +196,25 @@ func syncServerListeners(peer ServerPeer) {
 			continue
 		}
 		listenAddr := fmt.Sprintf("0.0.0.0:%d", tc.ListenPort)
-		nextProtos := []string{"http/1.1"}
-		if tc.ID == 2 || tc.ID == 3 {
-			nextProtos = []string{"h2", "http/1.1"}
+
+		var ln net.Listener
+		var err error
+		if tc.ID == 6 {
+			// Method 06 (TCP Relay) listens on raw TCP without TLS wrapper
+			ln, err = net.Listen("tcp", listenAddr)
+		} else {
+			nextProtos := []string{"http/1.1"}
+			if tc.ID == 2 || tc.ID == 3 {
+				nextProtos = []string{"h2", "http/1.1"}
+			}
+			tlsCfg := &tls.Config{
+				Certificates: []tls.Certificate{localCert},
+				MinVersion:   tls.VersionTLS12,
+				NextProtos:   nextProtos,
+			}
+			ln, err = tls.Listen("tcp", listenAddr, tlsCfg)
 		}
-		tlsCfg := &tls.Config{
-			Certificates: []tls.Certificate{localCert},
-			MinVersion:   tls.VersionTLS12,
-			NextProtos:   nextProtos,
-		}
-		ln, err := tls.Listen("tcp", listenAddr, tlsCfg)
+
 		if err == nil {
 			bound = append(bound, ln)
 			go acceptTunnelServerLoop(ln, peer.ID, tc)
@@ -251,7 +273,7 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		return
 	}
 
-	var wsKey, targetPort, syncPayloadB64, grpcMode, peerHeader string
+	var wsKey, targetPort, syncPayloadB64, tunnelMode, peerHeader string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil || line == "\r\n" || line == "\n" {
@@ -265,14 +287,13 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		} else if strings.HasPrefix(low, "x-sahand-sync:") {
 			syncPayloadB64 = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		} else if strings.HasPrefix(low, "x-tunnel-mode:") {
-			grpcMode = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+			tunnelMode = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		} else if strings.HasPrefix(low, "x-sahand-peer:") {
 			peerHeader = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		}
 	}
 
-	// Fallback target extraction from HTTP CONNECT authority (e.g. CONNECT 127.0.0.1:2053 HTTP/1.1)
-	if parts[0] == "CONNECT" && targetPort == "" {
+	if (parts[0] == "CONNECT" || parts[0] == "RELAY") && targetPort == "" {
 		if strings.HasPrefix(parts[1], "probe:") {
 			targetPort = parts[1]
 		} else if idx := strings.LastIndex(parts[1], ":"); idx >= 0 {
@@ -302,18 +323,21 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		return
 	}
 
-	// Engine 1: Discovery Probe (always responds regardless of Traffic Tunnel toggle, and marks peer CONNECTED)
+	// Engine 1: Discovery Probe (responds regardless of Traffic Tunnel toggle, and marks peer CONNECTED)
 	if strings.HasPrefix(targetPort, "probe:") {
 		markPeerConnectedInbound(effectivePeerID, remoteHost, tc.ID, tc.ListenPort, 1)
-		if tc.ID == 2 || grpcMode == "grpc" {
+		switch {
+		case tc.ID == 2 || tunnelMode == "grpc":
 			handleGRPCProbeReply(conn)
-			return
-		}
-		if tc.ID == 4 || parts[0] == "CONNECT" {
+		case tc.ID == 4 || parts[0] == "CONNECT":
 			handleHTTPConnectProbeReply(conn)
-			return
+		case tc.ID == 5 || tunnelMode == "https-proxy":
+			handleHTTPSProxyProbeReply(conn)
+		case tc.ID == 6 || parts[0] == "RELAY" || tunnelMode == "tcp-relay":
+			handleTCPRelayProbeReply(conn)
+		default:
+			handleWSSProbeReply(conn, wsKey)
 		}
-		handleWSSProbeReply(conn, wsKey)
 		return
 	}
 
@@ -333,11 +357,16 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		}
 	}
 
-	if tc.ID == 2 || grpcMode == "grpc" {
+	switch {
+	case tc.ID == 2 || tunnelMode == "grpc":
 		handleGRPCIncomingTraffic(conn, br, tc, targetPort)
-	} else if tc.ID == 4 || parts[0] == "CONNECT" {
+	case tc.ID == 4 || parts[0] == "CONNECT":
 		handleHTTPConnectIncomingTraffic(conn, br, tc, targetPort)
-	} else {
+	case tc.ID == 5 || tunnelMode == "https-proxy":
+		handleHTTPSProxyIncomingTraffic(conn, br, tc, targetPort)
+	case tc.ID == 6 || parts[0] == "RELAY" || tunnelMode == "tcp-relay":
+		handleTCPRelayIncomingTraffic(conn, br, tc, targetPort)
+	default:
 		handleWSSIncomingTraffic(conn, br, tc, wsKey, targetPort)
 	}
 }
@@ -361,19 +390,26 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardHTTP2Traffic(client, peer, tc, targetPort)
 	case 4:
 		forwardHTTPConnectTraffic(client, peer, tc, targetPort)
+	case 5:
+		forwardHTTPSProxyTraffic(client, peer, tc, targetPort)
+	case 6:
+		forwardTCPRelayTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
 }
 
-func recordLifelineEvent(peer *ServerPeer, mID int, mName string, port int, sec int, lat int64, dir string) {
+func recordLifelineEvent(peer *ServerPeer, mID int, mName string, port int, sec int, lat int64, dir, initiator string) {
 	nowStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
+	// If the most recent working method is already this exact method/port/direction, update it in place
+	// so periodic background liveness checks do not flood the 5-item history list.
 	if len(peer.RecentLifelines) > 0 {
 		top := &peer.RecentLifelines[0]
-		if top.MethodID == mID && top.Port == port && top.ConnectedAt == nowStr {
+		if top.MethodID == mID && top.Port == port && top.Direction == dir {
 			if lat > 1 {
 				top.LatencyMS = lat
 			}
+			top.Initiator = initiator
 			return
 		}
 	}
@@ -384,6 +420,7 @@ func recordLifelineEvent(peer *ServerPeer, mID int, mName string, port int, sec 
 		Security:    sec,
 		LatencyMS:   lat,
 		Direction:   dir,
+		Initiator:   initiator,
 		ConnectedAt: nowStr,
 	}
 	history := []LifelineEvent{ev}
@@ -400,12 +437,17 @@ func markPeerConnectedInbound(peerID, remoteIP string, methodID, port int, laten
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
+	initiator := formatConnectionInitiator(appCfg.Role, "inbound")
+
 	for i := range appCfg.Servers {
 		srv := &appCfg.Servers[i]
 		if srv.ID == peerID || srv.IP == remoteIP || len(appCfg.Servers) == 1 {
 			srv.Status = "CONNECTED"
 			srv.Running = true
 			srv.NextRetryAt = ""
+			srv.ActiveDirection = "inbound"
+			srv.ActiveInitiator = initiator
+			srv.LastInboundAt = time.Now().UTC().Unix()
 			for _, m := range methodCatalogue {
 				if m.ID == methodID {
 					srv.ActiveMethodID = m.ID
@@ -415,7 +457,7 @@ func markPeerConnectedInbound(peerID, remoteIP string, methodID, port int, laten
 					if latencyMS > 1 || srv.ActiveLatencyMS == 0 {
 						srv.ActiveLatencyMS = latencyMS
 					}
-					recordLifelineEvent(srv, m.ID, m.Name, port, m.Security, srv.ActiveLatencyMS, "inbound")
+					recordLifelineEvent(srv, m.ID, m.Name, port, m.Security, srv.ActiveLatencyMS, "inbound", initiator)
 					break
 				}
 			}
@@ -446,6 +488,8 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 	resp.NodeID = appCfg.NodeID
 	resp.CertPin = appCfg.CertPin
 
+	initiator := formatConnectionInitiator(appCfg.Role, "inbound")
+
 	for i := range appCfg.Servers {
 		srv := &appCfg.Servers[i]
 		if srv.ID == localPeerID || srv.ID == pkt.PeerID || srv.ID == pkt.SenderID || srv.IP == remoteIP || len(appCfg.Servers) == 1 {
@@ -459,6 +503,9 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 			srv.Running = true
 			srv.SyncState = "synced"
 			srv.NextRetryAt = ""
+			srv.ActiveDirection = "inbound"
+			srv.ActiveInitiator = initiator
+			srv.LastInboundAt = time.Now().UTC().Unix()
 			if pkt.LatencyMS > 0 {
 				srv.ActiveLatencyMS = pkt.LatencyMS
 			}
@@ -472,7 +519,7 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 						srv.ActivePort = m.DefaultPort
 					}
 					srv.ActiveSecurity = m.Security
-					recordLifelineEvent(srv, m.ID, m.Name, srv.ActivePort, m.Security, srv.ActiveLatencyMS, "inbound")
+					recordLifelineEvent(srv, m.ID, m.Name, srv.ActivePort, m.Security, srv.ActiveLatencyMS, "inbound", initiator)
 					break
 				}
 			}
@@ -516,6 +563,10 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		return probeHTTP2(peer, tc, localNodeID)
 	case 4:
 		return probeHTTPConnect(peer, tc, localNodeID)
+	case 5:
+		return probeHTTPSProxy(peer, tc, localNodeID)
+	case 6:
+		return probeTCPRelay(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -542,15 +593,20 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 	if sni == "" {
 		sni = "www.speedtest.net"
 	}
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
-	})
-	if err := tlsConn.Handshake(); err != nil {
-		return false
+
+	var conn net.Conn = rawConn
+	if tc.ID != 6 {
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return false
+		}
+		defer tlsConn.Close()
+		conn = tlsConn
 	}
-	defer tlsConn.Close()
 
 	padLen := 32 + randomIntN(128)
 	padHex, _ := randomHex(padLen)
@@ -573,11 +629,11 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 	b64 := base64.StdEncoding.EncodeToString(rawPkt)
 
 	req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nX-Sahand-Peer: %s\r\nX-Sahand-Sync: %s\r\n\r\n", sni, peer.ID, b64)
-	if _, err := tlsConn.Write([]byte(req)); err != nil {
+	if _, err := conn.Write([]byte(req)); err != nil {
 		return false
 	}
 
-	br := bufio.NewReader(tlsConn)
+	br := bufio.NewReader(conn)
 	status, err := br.ReadString('\n')
 	if err != nil || !strings.Contains(status, "200") {
 		return false
@@ -631,10 +687,9 @@ func sortedTunnelIndices(tunnels []TunnelConfig) []int {
 	return order
 }
 
-// switchNextMethod tests candidate methods after the current active method in security order.
-// It never disconnects the current method unless a new working method responds and syncs with the Agent.
 func switchNextMethod(peerID string) (bool, string, error) {
 	stateMu.RLock()
+	localRole := appCfg.Role
 	var peerSnapshot *ServerPeer
 	for i := range appCfg.Servers {
 		if appCfg.Servers[i].ID == peerID {
@@ -671,7 +726,6 @@ func switchNextMethod(peerID string) (bool, string, error) {
 		pos := (startPos + step) % len(order)
 		tc := tunnelsSnapshot[order[pos]]
 
-		// Do not re-select the already-active method unless no other method is active
 		if peerSnapshot.ActiveMethodID > 0 && tc.ID == peerSnapshot.ActiveMethodID {
 			continue
 		}
@@ -713,6 +767,7 @@ func switchNextMethod(peerID string) (bool, string, error) {
 	}
 
 	if chosenCandidate != nil {
+		initiator := formatConnectionInitiator(localRole, "outbound")
 		updatedPeer.Running = true
 		updatedPeer.Status = "CONNECTED"
 		updatedPeer.ActiveMethodID = chosenCandidate.ID
@@ -720,9 +775,11 @@ func switchNextMethod(peerID string) (bool, string, error) {
 		updatedPeer.ActivePort = chosenCandidate.ListenPort
 		updatedPeer.ActiveSecurity = chosenCandidate.Security
 		updatedPeer.ActiveLatencyMS = chosenResult.LatencyMS
+		updatedPeer.ActiveDirection = "outbound"
+		updatedPeer.ActiveInitiator = initiator
 		updatedPeer.NextRetryAt = ""
 		updatedPeer.SyncState = "synced"
-		recordLifelineEvent(updatedPeer, chosenCandidate.ID, chosenCandidate.Name, chosenCandidate.ListenPort, chosenCandidate.Security, chosenResult.LatencyMS, "outbound")
+		recordLifelineEvent(updatedPeer, chosenCandidate.ID, chosenCandidate.Name, chosenCandidate.ListenPort, chosenCandidate.Security, chosenResult.LatencyMS, "outbound", initiator)
 		_ = saveConfig(configPath(), appCfg)
 		stateMu.Unlock()
 
@@ -751,6 +808,17 @@ func ensureLivenessMonitorRunning(peerID string) {
 	}
 }
 
+func isPeerAlreadyConnected(peerID string) bool {
+	stateMu.RLock()
+	defer stateMu.RUnlock()
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == peerID {
+			return appCfg.Servers[i].Status == "CONNECTED" && appCfg.Servers[i].ActiveMethodID > 0
+		}
+	}
+	return false
+}
+
 func startDiscoveryLoop(peerID string) {
 	discoveryMu.Lock()
 	if ch, ok := discoveryCancel[peerID]; ok {
@@ -769,6 +837,7 @@ func startDiscoveryLoop(peerID string) {
 			}
 
 			stateMu.Lock()
+			localRole := appCfg.Role
 			var peer *ServerPeer
 			for i := range appCfg.Servers {
 				if appCfg.Servers[i].ID == peerID {
@@ -802,6 +871,10 @@ func startDiscoveryLoop(peerID string) {
 					case <-stopCh:
 						return
 					default:
+					}
+					// If the remote server connected to us while we were sweeping, stop sweeping immediately
+					if isPeerAlreadyConnected(peerID) {
+						break
 					}
 					tc := tunnelsSnapshot[idx]
 					res := probeSingleMethod(peerSnapshot, tc)
@@ -837,7 +910,11 @@ func startDiscoveryLoop(peerID string) {
 					}
 				}
 
-				if bestCandidate == nil {
+				// If an inbound connection arrived from the other side during the sweep, keep it!
+				if updatedPeer.Status == "CONNECTED" && updatedPeer.ActiveMethodID > 0 && bestCandidate == nil {
+					_ = saveConfig(configPath(), appCfg)
+					stateMu.Unlock()
+				} else if bestCandidate == nil {
 					retryMins := 10 + randomIntN(21)
 					retryDuration := time.Duration(retryMins) * time.Minute
 					nextRetry := time.Now().UTC().Add(retryDuration)
@@ -849,35 +926,46 @@ func startDiscoveryLoop(peerID string) {
 					_ = saveConfig(configPath(), appCfg)
 					stateMu.Unlock()
 
-					timer := time.NewTimer(retryDuration)
-					select {
-					case <-stopCh:
-						timer.Stop()
-						return
-					case <-timer.C:
+					// Wait for retry timer OR wake up early if the other side connects inbound
+					retryTicker := time.NewTicker(5 * time.Second)
+					deadline := time.Now().Add(retryDuration)
+					for time.Now().Before(deadline) {
+						select {
+						case <-stopCh:
+							retryTicker.Stop()
+							return
+						case <-retryTicker.C:
+							if isPeerAlreadyConnected(peerID) {
+								deadline = time.Now()
+							}
+						}
 					}
+					retryTicker.Stop()
 					continue
+				} else {
+					initiator := formatConnectionInitiator(localRole, "outbound")
+					updatedPeer.Status = "CONNECTED"
+					updatedPeer.ActiveMethodID = bestCandidate.ID
+					updatedPeer.ActiveMethod = bestCandidate.Name
+					updatedPeer.ActivePort = bestCandidate.ListenPort
+					updatedPeer.ActiveSecurity = bestCandidate.Security
+					updatedPeer.ActiveLatencyMS = bestResult.LatencyMS
+					updatedPeer.ActiveDirection = "outbound"
+					updatedPeer.ActiveInitiator = initiator
+					updatedPeer.NextRetryAt = ""
+					recordLifelineEvent(updatedPeer, bestCandidate.ID, bestCandidate.Name, bestCandidate.ListenPort, bestCandidate.Security, bestResult.LatencyMS, "outbound", initiator)
+					peerCopy := *updatedPeer
+					_ = saveConfig(configPath(), appCfg)
+					stateMu.Unlock()
+
+					_ = pushParitySyncOverMethod(peerCopy, *bestCandidate, bestResult.LatencyMS)
+					go syncServerListeners(peerCopy)
 				}
-
-				updatedPeer.Status = "CONNECTED"
-				updatedPeer.ActiveMethodID = bestCandidate.ID
-				updatedPeer.ActiveMethod = bestCandidate.Name
-				updatedPeer.ActivePort = bestCandidate.ListenPort
-				updatedPeer.ActiveSecurity = bestCandidate.Security
-				updatedPeer.ActiveLatencyMS = bestResult.LatencyMS
-				updatedPeer.NextRetryAt = ""
-				recordLifelineEvent(updatedPeer, bestCandidate.ID, bestCandidate.Name, bestCandidate.ListenPort, bestCandidate.Security, bestResult.LatencyMS, "outbound")
-				peerCopy := *updatedPeer
-				_ = saveConfig(configPath(), appCfg)
-				stateMu.Unlock()
-
-				_ = pushParitySyncOverMethod(peerCopy, *bestCandidate, bestResult.LatencyMS)
-				go syncServerListeners(peerCopy)
 			}
 
-			// Silent jittered liveness monitor: watches the active method and only sweeps if it disconnects
+			// Silent jittered liveness monitor: keeps the active method locked as long as it works
 			for {
-				jitterWait := time.Duration(90+randomIntN(90)) * time.Second
+				jitterWait := time.Duration(65+randomIntN(45)) * time.Second
 				timer := time.NewTimer(jitterWait)
 				select {
 				case <-stopCh:
@@ -900,6 +988,13 @@ func startDiscoveryLoop(peerID string) {
 				if curPeer == nil || !curPeer.Running {
 					return
 				}
+
+				// If the remote server is the initiator (inbound), and we've heard from it within 4 minutes,
+				// stay locked on CONNECTED without attempting an outbound sweep.
+				if curPeer.ActiveDirection == "inbound" && time.Now().UTC().Unix()-curPeer.LastInboundAt < 240 {
+					continue
+				}
+
 				var activeTun *TunnelConfig
 				for i := range curPeer.Tunnels {
 					if curPeer.Tunnels[i].ID == curPeer.ActiveMethodID {
@@ -912,18 +1007,36 @@ func startDiscoveryLoop(peerID string) {
 					break
 				}
 				chk := probeSingleMethod(*curPeer, *activeTun)
-				if !chk.Success {
+				if chk.Success {
 					stateMu.Lock()
 					for i := range appCfg.Servers {
 						if appCfg.Servers[i].ID == peerID {
-							appCfg.Servers[i].Status = "TESTING"
-							appCfg.Servers[i].ActiveMethodID = 0
-							appCfg.Servers[i].ActiveMethod = ""
+							appCfg.Servers[i].ActiveLatencyMS = chk.LatencyMS
 							break
 						}
 					}
 					stateMu.Unlock()
-					break // Connection broke -> restart 30-method sweep
+					continue
+				}
+
+				// Double-check if an inbound probe arrived before declaring connection broken
+				stateMu.Lock()
+				stillInboundAlive := false
+				for i := range appCfg.Servers {
+					if appCfg.Servers[i].ID == peerID {
+						if time.Now().UTC().Unix()-appCfg.Servers[i].LastInboundAt < 240 {
+							stillInboundAlive = true
+						} else {
+							appCfg.Servers[i].Status = "TESTING"
+							appCfg.Servers[i].ActiveMethodID = 0
+							appCfg.Servers[i].ActiveMethod = ""
+						}
+						break
+					}
+				}
+				stateMu.Unlock()
+				if !stillInboundAlive {
+					break
 				}
 			}
 		}
