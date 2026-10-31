@@ -177,6 +177,7 @@ func formatConnectionInitiator(localRole, direction string) string {
 func stopAllServerListeners(peerID string) {
 	stopQUICPeerResources(peerID)
 	stopRatholePeerResources(peerID)
+	stopNoiseStealthPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -204,6 +205,28 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 10 (Noise TCP Stealth): Noise_IK_25519_ChaChaPoly_BLAKE2s with obfuscated length headers
+		if tc.ID == 10 {
+			if ln, err := startNoiseStealthServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startNoiseStealthUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
 			continue
 		}
 
@@ -458,6 +481,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardQUICTraffic(client, peer, tc, targetPort)
 	case 9:
 		forwardRatholeTraffic(client, peer, tc, targetPort)
+	case 10:
+		forwardNoiseStealthTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -651,6 +676,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeQUIC(peer, tc, localNodeID)
 	case 9:
 		res = probeRathole(peer, tc, localNodeID)
+	case 10:
+		res = probeNoiseStealth(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -660,6 +687,9 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
+	if tc.ID == 10 {
+		return pushNoiseStealthParitySync(peer, tc, latencyMS)
+	}
 	if tc.ID == 9 {
 		return pushRatholeParitySync(peer, tc, latencyMS)
 	}
