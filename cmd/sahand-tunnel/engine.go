@@ -184,7 +184,7 @@ func syncServerListeners(peer ServerPeer) {
 		}
 		listenAddr := fmt.Sprintf("0.0.0.0:%d", tc.ListenPort)
 		nextProtos := []string{"http/1.1"}
-		if tc.ID == 2 {
+		if tc.ID == 2 || tc.ID == 3 {
 			nextProtos = []string{"h2", "http/1.1"}
 		}
 		tlsCfg := &tls.Config{
@@ -239,6 +239,13 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 	if err != nil {
 		return
 	}
+
+	// Method 03: Binary HTTP/2 connection preface
+	if strings.HasPrefix(firstLine, "PRI * HTTP/2.0") {
+		handleH2IncomingConn(conn, br, peerID, remoteHost, tc)
+		return
+	}
+
 	parts := strings.Fields(firstLine)
 	if len(parts) < 2 {
 		return
@@ -261,6 +268,15 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			grpcMode = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		} else if strings.HasPrefix(low, "x-sahand-peer:") {
 			peerHeader = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+		}
+	}
+
+	// Fallback target extraction from HTTP CONNECT authority (e.g. CONNECT 127.0.0.1:2053 HTTP/1.1)
+	if parts[0] == "CONNECT" && targetPort == "" {
+		if strings.HasPrefix(parts[1], "probe:") {
+			targetPort = parts[1]
+		} else if idx := strings.LastIndex(parts[1], ":"); idx >= 0 {
+			targetPort = parts[1][idx+1:]
 		}
 	}
 
@@ -293,6 +309,10 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			handleGRPCProbeReply(conn)
 			return
 		}
+		if tc.ID == 4 || parts[0] == "CONNECT" {
+			handleHTTPConnectProbeReply(conn)
+			return
+		}
 		handleWSSProbeReply(conn, wsKey)
 		return
 	}
@@ -315,6 +335,8 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 
 	if tc.ID == 2 || grpcMode == "grpc" {
 		handleGRPCIncomingTraffic(conn, br, tc, targetPort)
+	} else if tc.ID == 4 || parts[0] == "CONNECT" {
+		handleHTTPConnectIncomingTraffic(conn, br, tc, targetPort)
 	} else {
 		handleWSSIncomingTraffic(conn, br, tc, wsKey, targetPort)
 	}
@@ -332,9 +354,14 @@ func acceptTrafficEntryLoop(ln net.Listener, peer ServerPeer, tc TunnelConfig, t
 }
 
 func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig, targetPort string) {
-	if tc.ID == 2 {
+	switch tc.ID {
+	case 2:
 		forwardGRPCTraffic(client, peer, tc, targetPort)
-	} else {
+	case 3:
+		forwardHTTP2Traffic(client, peer, tc, targetPort)
+	case 4:
+		forwardHTTPConnectTraffic(client, peer, tc, targetPort)
+	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
 }
@@ -480,10 +507,20 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 	localNodeID := appCfg.NodeID
 	stateMu.RUnlock()
 
-	if tc.ID == 2 {
+	switch tc.ID {
+	case 1:
+		return probeWSS(peer, tc, localNodeID)
+	case 2:
 		return probeGRPC(peer, tc, localNodeID)
+	case 3:
+		return probeHTTP2(peer, tc, localNodeID)
+	case 4:
+		return probeHTTPConnect(peer, tc, localNodeID)
+	default:
+		res.Success = false
+		res.ErrorReason = "Driver not implemented"
+		return res
 	}
-	return probeWSS(peer, tc, localNodeID)
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
