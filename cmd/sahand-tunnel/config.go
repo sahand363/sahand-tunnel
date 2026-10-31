@@ -173,8 +173,8 @@ type Session struct {
 var methodCatalogue = []MethodCatalogueItem{
 	{1, "WSS", 95, "tcp", true, 11301, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
 	{2, "gRPC", 95, "tcp", true, 11302, []string{"listen_port", "forward_ports", "sni", "cert_pin", "stream_limit", "speed_limit_mbps"}},
-	{3, "HTTP/2", 90, "tcp", false, 11303, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec"}},
-	{4, "HTTP CONNECT", 76, "tcp", false, 11304, []string{"listen_port", "forward_ports", "sni"}},
+	{3, "HTTP/2", 90, "tcp", true, 11303, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec", "speed_limit_mbps"}},
+	{4, "HTTP CONNECT", 76, "tcp", true, 11304, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
 	{5, "HTTPS Proxy", 82, "tcp", false, 11305, []string{"listen_port", "forward_ports", "sni"}},
 	{6, "TCP Relay", 45, "tcp", false, 11306, []string{"listen_port", "forward_ports"}},
 	{7, "TLS Stream", 88, "tcp", false, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
@@ -391,7 +391,6 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			cur.Security = def.Security
 			cur.TrafficType = def.TrafficType
 			cur.Implemented = def.Implemented
-			// Migrate old 10201..10230 defaults or invalid ports to 11301..11330
 			if cur.ListenPort < 1024 || cur.ListenPort > 65535 || cur.ListenPort == 10200+def.ID {
 				cur.ListenPort = def.ListenPort
 			}
@@ -403,6 +402,9 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			}
 			if cur.WSPath == "" {
 				cur.WSPath = def.WSPath
+			}
+			if cur.SpeedLimitMBps == "" {
+				cur.SpeedLimitMBps = def.SpeedLimitMBps
 			}
 			out = append(out, cur)
 		} else {
