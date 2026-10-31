@@ -175,6 +175,8 @@ func formatConnectionInitiator(localRole, direction string) string {
 }
 
 func stopAllServerListeners(peerID string) {
+	stopQUICPeerResources(peerID)
+
 	engineMu.Lock()
 	defer engineMu.Unlock()
 	if list, ok := activeListeners[peerID]; ok {
@@ -203,15 +205,28 @@ func syncServerListeners(peer ServerPeer) {
 		if !tc.Implemented {
 			continue
 		}
-		listenAddr := fmt.Sprintf("0.0.0.0:%d", tc.ListenPort)
 
-		// Method 08 (QUIC): bind native UDP QUIC listener on the tunnel port
+		// Method 08 (QUIC): Use genuine quic-go UDP listener ONLY (no fake TCP listener).
 		if tc.ID == 8 {
-			if pc := startQUICUDPServer(peer.ID, tc); pc != nil {
-				boundUDP = append(boundUDP, pc)
+			_ = registerQUICPeerListener(peer, tc)
+			if tc.Enabled && peer.IP != "" {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+					if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+						boundUDP = append(boundUDP, udpEntry)
+					}
+				}
 			}
+			continue
 		}
 
+		listenAddr := fmt.Sprintf("0.0.0.0:%d", tc.ListenPort)
 		var ln net.Listener
 		var err error
 		if tc.ID == 6 {
@@ -220,8 +235,6 @@ func syncServerListeners(peer ServerPeer) {
 			nextProtos := []string{"http/1.1"}
 			if tc.ID == 2 || tc.ID == 3 || tc.ID == 7 {
 				nextProtos = []string{"h2", "http/1.1"}
-			} else if tc.ID == 8 {
-				nextProtos = []string{"h3", "quic", "h2"}
 			}
 			tlsCfg := &tls.Config{
 				Certificates: []tls.Certificate{localCert},
@@ -245,12 +258,6 @@ func syncServerListeners(peer ServerPeer) {
 				if err == nil {
 					bound = append(bound, entryLn)
 					go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
-				}
-				// For QUIC (tcp+udp), also bind UDP entry forwarder on the same port
-				if tc.ID == 8 {
-					if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
-						boundUDP = append(boundUDP, udpEntry)
-					}
 				}
 			}
 		}
@@ -321,7 +328,7 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		applyMasterTimeHeader(timeHeader)
 	}
 
-	if (parts[0] == "CONNECT" || parts[0] == "RELAY" || parts[0] == "STREAM" || parts[0] == "QUIC") && targetPort == "" {
+	if (parts[0] == "CONNECT" || parts[0] == "RELAY" || parts[0] == "STREAM") && targetPort == "" {
 		if strings.HasPrefix(parts[1], "probe:") {
 			targetPort = parts[1]
 		} else if idx := strings.LastIndex(parts[1], ":"); idx >= 0 {
@@ -365,8 +372,6 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			handleTCPRelayProbeReply(conn)
 		case tc.ID == 7 || parts[0] == "STREAM" || tunnelMode == "tls-stream":
 			handleTLSStreamProbeReply(conn)
-		case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
-			handleQUICStreamProbeReply(conn)
 		default:
 			handleWSSProbeReply(conn, wsKey)
 		}
@@ -400,8 +405,6 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		handleTCPRelayIncomingTraffic(conn, br, tc, targetPort)
 	case tc.ID == 7 || parts[0] == "STREAM" || tunnelMode == "tls-stream":
 		handleTLSStreamIncomingTraffic(conn, br, tc, targetPort)
-	case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
-		handleQUICStreamIncomingTraffic(conn, br, tc, targetPort)
 	default:
 		handleWSSIncomingTraffic(conn, br, tc, wsKey, targetPort)
 	}
@@ -634,6 +637,10 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
+	if tc.ID == 8 {
+		return pushQUICParitySync(peer, tc, latencyMS)
+	}
+
 	stateMu.RLock()
 	senderID := appCfg.NodeID
 	role := appCfg.Role
@@ -718,6 +725,11 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 		return false
 	}
 
+	applySyncResponseToPeer(peer.ID, resp)
+	return true
+}
+
+func applySyncResponseToPeer(peerID string, resp SyncResponse) {
 	stateMu.Lock()
 	if appCfg.Role == "agent" && resp.MasterUnix > 0 {
 		appCfg.MasterClockDelta = resp.MasterUnix - time.Now().Unix()
@@ -727,7 +739,7 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 		}
 	}
 	for i := range appCfg.Servers {
-		if appCfg.Servers[i].ID == peer.ID {
+		if appCfg.Servers[i].ID == peerID {
 			if appCfg.Role == "agent" && len(resp.Tunnels) == 30 && resp.ConfigVersion >= appCfg.Servers[i].ConfigVersion {
 				appCfg.Servers[i].Tunnels = normalizeTunnels(resp.Tunnels)
 				appCfg.Servers[i].ConfigVersion = resp.ConfigVersion
@@ -742,7 +754,6 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 		}
 	}
 	stateMu.Unlock()
-	return true
 }
 
 func sortedTunnelIndices(tunnels []TunnelConfig) []int {
