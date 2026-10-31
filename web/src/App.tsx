@@ -58,7 +58,7 @@ type TunnelConfig = {
   cert_pin?: string;
   heartbeat_sec?: number;
   stream_limit?: number;
-  speed_limit_mbps?: string;
+  speed_limit_mbps: string;
   last_discovery: MethodResult;
 };
 
@@ -117,14 +117,22 @@ function formatInitiatorFallback(role: Role, dir?: string, explicit?: string): s
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<Tab>("servers");
+  const [activeTab, setActiveTab] = useState<Tab>(() => {
+    const saved = localStorage.getItem("sahand_tab");
+    if (saved === "servers" || saved === "tunnels" || saved === "analytics") {
+      return saved as Tab;
+    }
+    return "servers";
+  });
+
   const [role, setRole] = useState<Role>("master");
-  const [appVersion, setAppVersion] = useState("0.4.4");
+  const [appVersion, setAppVersion] = useState("0.4.5");
   const [masterTime, setMasterTime] = useState("");
   const [servers, setServers] = useState<ServerPeer[]>([]);
-  const [selectedServerID, setSelectedServerID] = useState<string>("");
+  const [selectedServerID, setSelectedServerID] = useState<string>(() => {
+    return localStorage.getItem("sahand_server_id") || "";
+  });
 
-  // Master & Agent Form Inputs
   const [serverName, setServerName] = useState("");
   const [serverIP, setServerIP] = useState("");
   const [agentToken, setAgentToken] = useState("");
@@ -134,22 +142,28 @@ export default function App() {
   const [switchingServerID, setSwitchingServerID] = useState<string | null>(null);
   const [switchNotice, setSwitchNotice] = useState<Record<string, string>>({});
 
-  // Tunnels Tab State & Drafts
   const [expandedTunnel, setExpandedTunnel] = useState<number | null>(null);
   const [draftTunnels, setDraftTunnels] = useState<Record<string, TunnelConfig>>({});
   const [savingTunnelKey, setSavingTunnelKey] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<Record<string, string>>({});
 
-  // Analytics Tab State
   const [analyticsRange, setAnalyticsRange] = useState<7 | 30>(7);
   const [daysUsage, setDaysUsage] = useState<DailyUsage[]>([]);
-
-  // Theme State
   const [darkMode, setDarkMode] = useState(true);
 
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
   }, [darkMode]);
+
+  const switchTab = (tab: Tab) => {
+    setActiveTab(tab);
+    localStorage.setItem("sahand_tab", tab);
+  };
+
+  const handleSelectServer = (id: string) => {
+    setSelectedServerID(id);
+    localStorage.setItem("sahand_server_id", id);
+  };
 
   async function fetchState() {
     try {
@@ -169,6 +183,8 @@ export default function App() {
       setServers(list);
       setSelectedServerID((prev) => {
         if (prev && list.some((s) => s.id === prev)) return prev;
+        const saved = localStorage.getItem("sahand_server_id");
+        if (saved && list.some((s) => s.id === saved)) return saved;
         return list.length > 0 ? list[0].id : "";
       });
     } catch {
@@ -294,7 +310,11 @@ export default function App() {
 
   function getDraftTunnel(serverID: string, tunnel: TunnelConfig): TunnelConfig {
     const key = `${serverID}:${tunnel.id}`;
-    return draftTunnels[key] || tunnel;
+    const t = draftTunnels[key] || tunnel;
+    return {
+      ...t,
+      speed_limit_mbps: t.speed_limit_mbps ?? "0",
+    };
   }
 
   function updateDraftTunnel(serverID: string, updated: TunnelConfig) {
@@ -307,11 +327,21 @@ export default function App() {
     const key = `${serverID}:${updated.id}`;
     setSavingTunnelKey(key);
 
+    const safeSpeed =
+      updated.speed_limit_mbps && updated.speed_limit_mbps.trim() !== ""
+        ? updated.speed_limit_mbps.trim()
+        : "0";
+
+    const payload = {
+      ...updated,
+      speed_limit_mbps: safeSpeed,
+    };
+
     try {
       const res = await fetch("/api/v1/tunnels", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ server_id: serverID, tunnel: updated }),
+        body: JSON.stringify({ server_id: serverID, tunnel: payload }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -392,7 +422,7 @@ export default function App() {
         <nav className="tab-bar">
           <button
             className={`tab-button ${activeTab === "servers" ? "active" : ""}`}
-            onClick={() => setActiveTab("servers")}
+            onClick={() => switchTab("servers")}
           >
             <Server size={16} />
             <span>Servers</span>
@@ -400,7 +430,7 @@ export default function App() {
 
           <button
             className={`tab-button ${activeTab === "tunnels" ? "active" : ""}`}
-            onClick={() => setActiveTab("tunnels")}
+            onClick={() => switchTab("tunnels")}
           >
             <Shield size={16} />
             <span>Tunnels</span>
@@ -408,7 +438,7 @@ export default function App() {
 
           <button
             className={`tab-button ${activeTab === "analytics" ? "active" : ""}`}
-            onClick={() => setActiveTab("analytics")}
+            onClick={() => switchTab("analytics")}
           >
             <Activity size={16} />
             <span>Analytics</span>
@@ -710,7 +740,7 @@ export default function App() {
                   id="tunnel-server-select"
                   className="server-select"
                   value={selectedServer?.id || ""}
-                  onChange={(e) => setSelectedServerID(e.target.value)}
+                  onChange={(e) => handleSelectServer(e.target.value)}
                   disabled={servers.length === 0}
                 >
                   {servers.length === 0 ? (
@@ -910,25 +940,23 @@ export default function App() {
                                 </div>
                               )}
 
-                              {draft.speed_limit_mbps !== undefined && (
-                                <div className="form-field">
-                                  <label htmlFor={`spd-${tunnel.id}`}>
-                                    SPEED LIMIT (MB/S, 0=UNLIMITED)
-                                  </label>
-                                  <input
-                                    id={`spd-${tunnel.id}`}
-                                    disabled={role === "agent"}
-                                    placeholder="0"
-                                    value={draft.speed_limit_mbps}
-                                    onChange={(e) =>
-                                      updateDraftTunnel(selectedServer.id, {
-                                        ...draft,
-                                        speed_limit_mbps: e.target.value,
-                                      })
-                                    }
-                                  />
-                                </div>
-                              )}
+                              <div className="form-field">
+                                <label htmlFor={`spd-${tunnel.id}`}>
+                                  SPEED LIMIT (MB/S, 0=UNLIMITED)
+                                </label>
+                                <input
+                                  id={`spd-${tunnel.id}`}
+                                  disabled={role === "agent"}
+                                  placeholder="0"
+                                  value={draft.speed_limit_mbps ?? "0"}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      speed_limit_mbps: e.target.value,
+                                    })
+                                  }
+                                />
+                              </div>
 
                               <div className="setting-status">
                                 <span className="setting-label">TRAFFIC TUNNEL</span>
