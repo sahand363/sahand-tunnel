@@ -17,6 +17,7 @@ import {
   Server,
   Settings2,
   Shield,
+  SkipForward,
   Trash2,
 } from "lucide-react";
 
@@ -106,7 +107,7 @@ function securityTierClass(sec: number): string {
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("servers");
   const [role, setRole] = useState<Role>("master");
-  const [appVersion, setAppVersion] = useState("0.4.1");
+  const [appVersion, setAppVersion] = useState("0.4.2");
   const [servers, setServers] = useState<ServerPeer[]>([]);
   const [selectedServerID, setSelectedServerID] = useState<string>("");
 
@@ -117,6 +118,8 @@ export default function App() {
   const [formError, setFormError] = useState("");
   const [copiedID, setCopiedID] = useState<string | null>(null);
   const [expandedHistoryID, setExpandedHistoryID] = useState<string | null>(null);
+  const [switchingServerID, setSwitchingServerID] = useState<string | null>(null);
+  const [switchNotice, setSwitchNotice] = useState<Record<string, string>>({});
 
   // Tunnels Tab State & Drafts
   const [expandedTunnel, setExpandedTunnel] = useState<number | null>(null);
@@ -235,6 +238,33 @@ export default function App() {
     await fetchState();
   }
 
+  async function handleNextMethod(serverID: string) {
+    if (switchingServerID) return;
+    setSwitchingServerID(serverID);
+    try {
+      const res = await fetch("/api/v1/servers/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ server_id: serverID, action: "next_method" }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const msg = data.message || (data.switched ? "Switched method" : "No other method available");
+        setSwitchNotice((prev) => ({ ...prev, [serverID]: msg }));
+        setTimeout(() => {
+          setSwitchNotice((prev) => {
+            const next = { ...prev };
+            delete next[serverID];
+            return next;
+          });
+        }, 4000);
+        await fetchState();
+      }
+    } finally {
+      setSwitchingServerID(null);
+    }
+  }
+
   async function copyToken(id: string, token: string) {
     try {
       await navigator.clipboard.writeText(token);
@@ -299,7 +329,6 @@ export default function App() {
     0,
     ...visibleAnalytics.map((d) => Math.max(d.rx_bytes, d.tx_bytes))
   );
-  // Minimum scale of 1 GB (1073741824 B) when empty so Y-axis always has clean labels
   const chartScaleMax = rawMaxBytes > 0 ? rawMaxBytes : 1073741824;
   const yAxisTicks = [
     chartScaleMax,
@@ -451,6 +480,8 @@ export default function App() {
               <div className="server-list">
                 {servers.map((server) => {
                   const historyOpen = expandedHistoryID === server.id;
+                  const isSwitching = switchingServerID === server.id;
+                  const switchMsg = switchNotice[server.id];
 
                   return (
                     <article className="server-card-block" key={server.id}>
@@ -495,6 +526,19 @@ export default function App() {
                           />
                           <span>{server.status}</span>
                         </div>
+
+                        {role === "master" && (
+                          <button
+                            className="next-method-btn"
+                            onClick={() => handleNextMethod(server.id)}
+                            disabled={isSwitching}
+                            title="Test and switch to the next working method without disconnecting"
+                            aria-label="Next working method"
+                          >
+                            <SkipForward size={13} />
+                            <span>{isSwitching ? "Checking..." : "Next"}</span>
+                          </button>
+                        )}
 
                         {role === "master" && (
                           <button
@@ -557,7 +601,9 @@ export default function App() {
                         </button>
 
                         <span className="sync-badge">
-                          {copiedID === server.id
+                          {switchMsg
+                            ? switchMsg
+                            : copiedID === server.id
                             ? "✓ Token Copied"
                             : server.sync_state === "synced"
                             ? `Token Ready (v${server.config_version})`
