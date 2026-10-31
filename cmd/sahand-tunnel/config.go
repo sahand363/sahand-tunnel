@@ -96,7 +96,7 @@ type TunnelConfig struct {
 	CertPin        string       `json:"cert_pin,omitempty"`
 	HeartbeatSec   int          `json:"heartbeat_sec,omitempty"`
 	StreamLimit    int          `json:"stream_limit,omitempty"`
-	SpeedLimitMBps string       `json:"speed_limit_mbps,omitempty"`
+	SpeedLimitMBps string       `json:"speed_limit_mbps"`
 	LastDiscovery  MethodResult `json:"last_discovery"`
 }
 
@@ -200,7 +200,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{7, "TLS Stream", 88, "tcp", true, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin", "speed_limit_mbps"}},
 	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "cert_pin", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{9, "Rathole", 94, "tcp+udp", true, 11309, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
-	{10, "WebSocket TCP", 65, "tcp", false, 11310, []string{"listen_port", "forward_ports", "ws_path"}},
+	{10, "Noise TCP Stealth", 97, "tcp+udp", true, 11310, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
 	{11, "Reverse TCP", 50, "tcp", false, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
 	{12, "SOCKS5", 60, "tcp+udp", false, 11312, []string{"listen_port", "forward_ports"}},
 	{13, "SSH Tunnel", 86, "tcp", false, 11313, []string{"listen_port", "forward_ports", "heartbeat_sec"}},
@@ -231,7 +231,7 @@ var (
 	atomicIsAgent          atomic.Bool
 	atomicMasterTZOffset   atomic.Int64
 	atomicMasterClockDelta atomic.Int64
-	atomicMasterTZName     atomic.Value // string
+	atomicMasterTZName     atomic.Value
 )
 
 func syncMasterClockAtomics(cfg Config) {
@@ -457,14 +457,15 @@ func defaultTunnelsForServer() []TunnelConfig {
 	list := make([]TunnelConfig, 0, len(methodCatalogue))
 	for _, item := range methodCatalogue {
 		tc := TunnelConfig{
-			ID:           item.ID,
-			Name:         item.Name,
-			Security:     item.Security,
-			TrafficType:  item.SupportedTraffic,
-			Implemented:  item.Implemented,
-			Enabled:      item.ID == 1,
-			ListenPort:   item.DefaultPort,
-			ForwardPorts: "2053",
+			ID:             item.ID,
+			Name:           item.Name,
+			Security:       item.Security,
+			TrafficType:    item.SupportedTraffic,
+			Implemented:    item.Implemented,
+			Enabled:        item.ID == 1,
+			ListenPort:     item.DefaultPort,
+			ForwardPorts:   "2053",
+			SpeedLimitMBps: "0",
 			LastDiscovery: MethodResult{
 				MethodID: item.ID,
 			},
@@ -519,8 +520,8 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			if cur.StreamLimit <= 0 {
 				cur.StreamLimit = def.StreamLimit
 			}
-			if cur.SpeedLimitMBps == "" {
-				cur.SpeedLimitMBps = def.SpeedLimitMBps
+			if strings.TrimSpace(cur.SpeedLimitMBps) == "" {
+				cur.SpeedLimitMBps = "0"
 			}
 			out = append(out, cur)
 		} else {
@@ -693,9 +694,6 @@ func parseAndValidateToken(rawToken string) (TokenPayload, error) {
 	return tp, nil
 }
 
-// derivePeerAuthKey validates the peer's st1. pairing token and derives a version-independent
-// 16-byte shared key from the paired AID/MID inside the token so Master and Agent always compute
-// the exact same HMAC / Noise static key even after tunnel ports/settings are edited on the Master.
 func derivePeerAuthKey(_ Config, peer ServerPeer) ([]byte, error) {
 	if peer.TokenRevoked {
 		return nil, errors.New("peer token has been revoked")
