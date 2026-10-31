@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -34,10 +33,10 @@ const (
 	quicStreamTypeTCPForward byte = 0x03
 	quicStreamTypeUDPAuth    byte = 0x04
 
-	quicStatusOK          byte = 0x00
+	quicStatusOK           byte = 0x00
 	quicStatusUnauthorized byte = 0x01
-	quicStatusForbidden   byte = 0x02
-	quicStatusUnreachable byte = 0x03
+	quicStatusForbidden    byte = 0x02
+	quicStatusUnreachable  byte = 0x03
 
 	quicDatagramFlagRaw      byte = 0x00
 	quicDatagramFlagFragment byte = 0x01
@@ -57,13 +56,13 @@ const (
 	quicMaxReassemblyBytes        = 512 * 1024
 	quicReassemblyTTL             = 2 * time.Second
 
-	quicProbeSampleCount       = 4
-	quicProbeSampleTimeout     = 1500 * time.Millisecond
-	quicReplayWindowSec        = 120
-	quicMaxReplayCacheEntries  = 4096
-	quicMaxUDPSessionsPerPeer  = 2048
-	quicUDPSessionIdleTTL      = 60 * time.Second
-	quicSocketBufferBytes      = 4 * 1024 * 1024
+	quicProbeSampleCount      = 4
+	quicProbeSampleTimeout    = 1500 * time.Millisecond
+	quicReplayWindowSec       = 120
+	quicMaxReplayCacheEntries = 4096
+	quicMaxUDPSessionsPerPeer = 2048
+	quicUDPSessionIdleTTL     = 60 * time.Second
+	quicSocketBufferBytes     = 4 * 1024 * 1024
 )
 
 var (
@@ -102,9 +101,9 @@ type quicStreamHandshake struct {
 }
 
 type quicReplayGuard struct {
-	mu      sync.Mutex
-	seen    map[string]int64
-	lastGC  int64
+	mu     sync.Mutex
+	seen   map[string]int64
+	lastGC int64
 }
 
 func newQUICReplayGuard() *quicReplayGuard {
@@ -223,14 +222,14 @@ type quicSharedPortListener struct {
 }
 
 type quicManagedClientConn struct {
-	mu                sync.Mutex
-	identity          quicConnectionIdentity
-	udpConn           *net.UDPConn
-	transport         *quic.Transport
-	conn              *quic.Conn
-	maxDatagramBytes  atomic.Int64
-	udpAuthed         atomic.Bool
-	entryUDPMux       *quicUDPEntrySessionManager
+	mu               sync.Mutex
+	identity         quicConnectionIdentity
+	udpConn          *net.UDPConn
+	transport        *quic.Transport
+	conn             *quic.Conn
+	maxDatagramBytes atomic.Int64
+	udpAuthed        atomic.Bool
+	entryUDPMux      *quicUDPEntrySessionManager
 }
 
 var (
@@ -305,40 +304,11 @@ func buildQUICClientTLSConfig(peer ServerPeer, tc TunnelConfig) *tls.Config {
 	}
 }
 
-func buildQUICServerTLSConfig(port int) *tls.Config {
+func buildQUICServerTLSConfig() *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{localCert},
-		ClientAuth:   tls.RequestClientCert,
 		MinVersion:   tls.VersionTLS13,
 		NextProtos:   []string{quicALPN},
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			// If a peer has configured an explicit client certificate pin, verify it
-			quicRegistryMu.Lock()
-			spl := quicSharedListeners[port]
-			quicRegistryMu.Unlock()
-			if spl == nil || len(rawCerts) == 0 {
-				return nil
-			}
-			spl.mu.RLock()
-			defer spl.mu.RUnlock()
-			hasPinRequirement := false
-			for _, reg := range spl.peers {
-				pin := strings.TrimSpace(reg.Tunnel.CertPin)
-				if pin == "" {
-					pin = reg.Peer.RemoteCertPin
-				}
-				if pin != "" {
-					hasPinRequirement = true
-					if verifyCertPin(rawCerts, pin) == nil {
-						return nil
-					}
-				}
-			}
-			if hasPinRequirement {
-				return errors.New("client certificate pin mismatch")
-			}
-			return nil
-		},
 	}
 }
 
@@ -392,7 +362,7 @@ func registerQUICPeerListener(peer ServerPeer, tc TunnelConfig) error {
 		configureUDPSocketBuffers(udpConn)
 
 		tr := &quic.Transport{Conn: udpConn}
-		tlsCfg := buildQUICServerTLSConfig(tc.ListenPort)
+		tlsCfg := buildQUICServerTLSConfig()
 		quicCfg := buildQUICConfig(tc)
 
 		ln, err := tr.Listen(tlsCfg, quicCfg)
@@ -813,7 +783,8 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 		return res
 	}
 
-	if !conn.ConnectionState().SupportsDatagrams {
+	st := conn.ConnectionState()
+	if !st.SupportsDatagrams.Remote || !st.SupportsDatagrams.Local {
 		res.Success = false
 		res.ErrorReason = "Protocol mismatch"
 		return res
@@ -1236,7 +1207,6 @@ func (r *quicDatagramReassembler) insertFragment(
 	}
 
 	if ent.chunks[fragIndex] != nil {
-		// Duplicate fragment protection: ignore already received fragment index
 		return nil, false
 	}
 	if ent.byteSize+len(payload) > quicMaxOriginalDatagramSize || r.currentBytes+len(payload) > quicMaxReassemblyBytes {
@@ -1783,11 +1753,20 @@ func (m *quicUDPExitSessionManager) readLocalUDPRepliesLoop(sess *quicUDPExitSes
 }
 
 func startQUICUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetPort string) net.PacketConn {
-	portNum, err := strconv.Atoi(strings.TrimSpace(targetPort))
-	if err != nil || portNum < 1 || portNum > 65535 {
+	return startQUICUDPEntryForwarderWithDest(peer, tc, targetPort, targetPort)
+}
+
+func startQUICUDPEntryForwarderWithDest(peer ServerPeer, tc TunnelConfig, listenPortStr, destPortStr string) net.PacketConn {
+	listenPortNum, err := strconv.Atoi(strings.TrimSpace(listenPortStr))
+	if err != nil || listenPortNum < 1 || listenPortNum > 65535 {
 		return nil
 	}
-	udpAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+targetPort)
+	destPortNum, err := strconv.Atoi(strings.TrimSpace(destPortStr))
+	if err != nil || destPortNum < 1 || destPortNum > 65535 {
+		return nil
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+strconv.Itoa(listenPortNum))
 	if err != nil {
 		return nil
 	}
@@ -1797,7 +1776,7 @@ func startQUICUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetPort str
 	}
 	configureUDPSocketBuffers(entryConn)
 
-	muxKey := fmt.Sprintf("%s|%d", peer.ID, portNum)
+	muxKey := fmt.Sprintf("%s|%d", peer.ID, listenPortNum)
 	quicRegistryMu.Lock()
 	if oldMux, ok := quicEntryUDPMuxes[muxKey]; ok {
 		oldMux.closeAll()
@@ -1806,7 +1785,7 @@ func startQUICUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetPort str
 	quicEntryUDPMuxes[muxKey] = entryMux
 	quicRegistryMu.Unlock()
 
-	go func(uPort uint16, mgr *quicUDPEntrySessionManager) {
+	go func(uDestPort uint16, mgr *quicUDPEntrySessionManager) {
 		defer mgr.closeAll()
 		for {
 			bufPtr := quicBufPool.Get().(*[]byte)
@@ -1817,11 +1796,11 @@ func startQUICUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetPort str
 				return
 			}
 			if n > 0 {
-				_ = mgr.handleOutboundClientPacket(entryConn, clientAddr, uPort, buf[:n])
+				_ = mgr.handleOutboundClientPacket(entryConn, clientAddr, uDestPort, buf[:n])
 			}
 			quicBufPool.Put(bufPtr)
 		}
-	}(uint16(portNum), entryMux)
+	}(uint16(destPortNum), entryMux)
 
 	return entryConn
 }
