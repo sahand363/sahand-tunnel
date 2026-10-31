@@ -112,6 +112,34 @@ func readWebTransportConnectFrame(r io.Reader) (webTransportConnectHeader, error
 	return hdr, err
 }
 
+func handleWebTransportParitySyncStream(rw io.ReadWriter, effectivePeerID, remoteHost string) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(rw, lenBuf[:]); err != nil {
+		return
+	}
+	pktLen := binary.BigEndian.Uint32(lenBuf[:])
+	if pktLen == 0 || pktLen > 256*1024 {
+		return
+	}
+	rawPkt := make([]byte, pktLen)
+	if _, err := io.ReadFull(rw, rawPkt); err != nil {
+		return
+	}
+	var pkt SyncPacket
+	if json.Unmarshal(rawPkt, &pkt) != nil {
+		return
+	}
+
+	resp := processIncomingSync(effectivePeerID, remoteHost, pkt)
+	respBytes, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(respBytes)))
+	_, _ = rw.Write(lenBuf[:])
+	_, _ = rw.Write(respBytes)
+}
+
 // ============================================================================
 // WEBTRANSPORT QUIC/H3 CLIENT & SERVER MANAGERS (+ TLS/TCP FALLBACK)
 // ============================================================================
@@ -523,7 +551,7 @@ func handleWebTransportQUICStream(
 		if _, err := stream.Write([]byte{wtStatusOK}); err != nil {
 			return
 		}
-		handleRawTCPParitySyncServer(stream, effectivePeerID, remoteHost)
+		handleWebTransportParitySyncStream(stream, effectivePeerID, remoteHost)
 
 	case wtModeUDPAuth:
 		if !tc.Enabled {
@@ -607,7 +635,7 @@ func handleIncomingWebTransportTCPConn(conn net.Conn, peer ServerPeer, tc Tunnel
 		if _, err := conn.Write([]byte{wtStatusOK}); err != nil {
 			return
 		}
-		handleRawTCPParitySyncServer(conn, effectivePeerID, remoteHost)
+		handleWebTransportParitySyncStream(conn, effectivePeerID, remoteHost)
 
 	case wtModeTCPForward:
 		if !tc.Enabled {
