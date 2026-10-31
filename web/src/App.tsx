@@ -40,6 +40,7 @@ type LifelineEvent = {
   security: number;
   latency_ms: number;
   direction: string;
+  initiator?: string;
   connected_at: string;
 };
 
@@ -75,6 +76,8 @@ type ServerPeer = {
   active_port: number;
   active_security: number;
   active_latency_ms: number;
+  active_direction?: string;
+  active_initiator?: string;
   next_retry_at?: string;
   recent_lifelines: LifelineEvent[];
   tunnels: TunnelConfig[];
@@ -104,10 +107,19 @@ function securityTierClass(sec: number): string {
   return "sec-low";
 }
 
+function formatInitiatorFallback(role: Role, dir?: string, explicit?: string): string {
+  if (explicit) return explicit;
+  if (!dir) return "";
+  if (role === "master") {
+    return dir === "outbound" ? "Master → Agent" : "Agent → Master";
+  }
+  return dir === "outbound" ? "Agent → Master" : "Master → Agent";
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>("servers");
   const [role, setRole] = useState<Role>("master");
-  const [appVersion, setAppVersion] = useState("0.4.2");
+  const [appVersion, setAppVersion] = useState("0.4.3");
   const [servers, setServers] = useState<ServerPeer[]>([]);
   const [selectedServerID, setSelectedServerID] = useState<string>("");
 
@@ -249,7 +261,8 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        const msg = data.message || (data.switched ? "Switched method" : "No other method available");
+        const msg =
+          data.message || (data.switched ? "Switched method" : "No other method available");
         setSwitchNotice((prev) => ({ ...prev, [serverID]: msg }));
         setTimeout(() => {
           setSwitchNotice((prev) => {
@@ -482,6 +495,11 @@ export default function App() {
                   const historyOpen = expandedHistoryID === server.id;
                   const isSwitching = switchingServerID === server.id;
                   const switchMsg = switchNotice[server.id];
+                  const whoConnected = formatInitiatorFallback(
+                    role,
+                    server.active_direction,
+                    server.active_initiator
+                  );
 
                   return (
                     <article className="server-card-block" key={server.id}>
@@ -504,6 +522,7 @@ export default function App() {
                                 {server.active_method} {server.active_security}%) • Port{" "}
                                 {server.active_port || 11300 + server.active_method_id} •{" "}
                                 {server.active_latency_ms}ms
+                                {whoConnected ? ` • ${whoConnected}` : ""}
                               </span>
                             ) : server.next_retry_at ? (
                               <span className="retry-tag">
@@ -619,21 +638,30 @@ export default function App() {
                               No successful connection methods recorded yet.
                             </div>
                           ) : (
-                            server.recent_lifelines.map((item, idx) => (
-                              <div className="history-row" key={idx}>
-                                <span className="history-method">
-                                  #{String(item.method_id).padStart(2, "0")} {item.method_name}
-                                </span>
-                                <span className={`sec-badge ${securityTierClass(item.security)}`}>
-                                  {item.security}%
-                                </span>
-                                <span className="history-meta">
-                                  Port {item.port || 11300 + item.method_id} • {item.latency_ms}ms •{" "}
-                                  {item.direction}
-                                </span>
-                                <span className="history-time">{item.connected_at}</span>
-                              </div>
-                            ))
+                            server.recent_lifelines.map((item, idx) => {
+                              const itemWho = formatInitiatorFallback(
+                                role,
+                                item.direction,
+                                item.initiator
+                              );
+                              return (
+                                <div className="history-row" key={idx}>
+                                  <span className="history-method">
+                                    #{String(item.method_id).padStart(2, "0")} {item.method_name}
+                                  </span>
+                                  <span
+                                    className={`sec-badge ${securityTierClass(item.security)}`}
+                                  >
+                                    {item.security}%
+                                  </span>
+                                  <span className="history-meta">
+                                    Port {item.port || 11300 + item.method_id} • {item.latency_ms}
+                                    ms • {itemWho || item.direction}
+                                  </span>
+                                  <span className="history-time">{item.connected_at}</span>
+                                </div>
+                              );
+                            })
                           )}
                         </div>
                       )}
