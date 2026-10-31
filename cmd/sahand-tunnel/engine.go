@@ -125,7 +125,7 @@ func (t *throttledWriter) Write(p []byte) (int, error) {
 func enableKeepAlive(c net.Conn) {
 	if tcp, ok := c.(*net.TCPConn); ok {
 		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetKeepAlivePeriod(20 * time.Second)
 		_ = tcp.SetNoDelay(true)
 	}
 }
@@ -176,6 +176,7 @@ func formatConnectionInitiator(localRole, direction string) string {
 
 func stopAllServerListeners(peerID string) {
 	stopQUICPeerResources(peerID)
+	stopRatholePeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -206,8 +207,29 @@ func syncServerListeners(peer ServerPeer) {
 			continue
 		}
 
-		// Method 08 (QUIC): Bind genuine quic-go UDP listener AND TLS 1.3 TCP carrier
-		// so routes where ISP firewalls drop UDP still connect and forward without timeout.
+		// Method 09 (Rathole): Genuine Noise_NK_25519_ChaChaPoly_BLAKE2s listener + Reverse Control Channel
+		if tc.ID == 9 {
+			if ln, err := startRatholeServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" {
+				startRatholeReverseClient(peer, tc)
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startRatholeUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
+			continue
+		}
+
 		if tc.ID == 8 {
 			_ = registerQUICPeerListener(peer, tc)
 		}
@@ -434,6 +456,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardTLSStreamTraffic(client, peer, tc, targetPort)
 	case 8:
 		forwardQUICTraffic(client, peer, tc, targetPort)
+	case 9:
+		forwardRatholeTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -625,6 +649,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeTLSStream(peer, tc, localNodeID)
 	case 8:
 		res = probeQUIC(peer, tc, localNodeID)
+	case 9:
+		res = probeRathole(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -634,11 +660,13 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
+	if tc.ID == 9 {
+		return pushRatholeParitySync(peer, tc, latencyMS)
+	}
 	if tc.ID == 8 {
 		if pushQUICParitySync(peer, tc, latencyMS) {
 			return true
 		}
-		// If UDP is blocked by the ISP, fall through to TLS-over-TCP sync on port 11308
 	}
 
 	stateMu.RLock()
