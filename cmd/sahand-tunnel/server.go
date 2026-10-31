@@ -80,7 +80,7 @@ func loadAnalytics() {
 }
 
 func ensure30DaysLocked() {
-	now := time.Now().UTC()
+	now := masterNow()
 	byDate := make(map[string]DailyUsage, len(analyticsData.Days))
 	for _, d := range analyticsData.Days {
 		byDate[d.Date] = d
@@ -113,7 +113,7 @@ func sampleAnalyticsTick() {
 	analyticsData.LastRawRx = curRx
 	analyticsData.LastRawTx = curTx
 
-	today := time.Now().UTC().Format("2006-01-02")
+	today := masterNow().Format("2006-01-02")
 	for i := range analyticsData.Days {
 		if analyticsData.Days[i].Date == today {
 			analyticsData.Days[i].RxBytes += deltaRx
@@ -250,17 +250,20 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	mTime := formatMasterClock(masterNow())
 	stateMu.RLock()
 	payload := struct {
 		AppVersion string                `json:"app_version"`
 		Role       string                `json:"role"`
 		NodeID     string                `json:"node_id"`
+		ServerTime string                `json:"server_time"`
 		Servers    []ServerPeer          `json:"servers"`
 		Catalogue  []MethodCatalogueItem `json:"catalogue"`
 	}{
 		AppVersion: AppVersion,
 		Role:       appCfg.Role,
 		NodeID:     appCfg.NodeID,
+		ServerTime: mTime,
 		Servers:    appCfg.Servers,
 		Catalogue:  methodCatalogue,
 	}
@@ -339,6 +342,12 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		stateMu.Unlock()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+
+	// Adopt the Master server's timezone from the token immediately
+	if tp.TZName != "" || tp.TZOff != 0 {
+		appCfg.MasterTZName = tp.TZName
+		appCfg.MasterTZOffsetSec = tp.TZOff
 	}
 
 	tunnels := defaultTunnelsForServer()
