@@ -36,8 +36,9 @@ var (
 	discoveryMu     sync.Mutex
 	discoveryCancel = make(map[string]chan struct{})
 
-	engineMu        sync.Mutex
-	activeListeners = make(map[string][]net.Listener)
+	engineMu          sync.Mutex
+	activeListeners   = make(map[string][]net.Listener)
+	activePacketConns = make(map[string][]net.PacketConn)
 
 	sharedBuckets   = make(map[int64]*sharedThrottleBucket)
 	sharedBucketsMu sync.Mutex
@@ -182,12 +183,19 @@ func stopAllServerListeners(peerID string) {
 		}
 		delete(activeListeners, peerID)
 	}
+	if pList, ok := activePacketConns[peerID]; ok {
+		for _, pc := range pList {
+			_ = pc.Close()
+		}
+		delete(activePacketConns, peerID)
+	}
 }
 
 func syncServerListeners(peer ServerPeer) {
 	stopAllServerListeners(peer.ID)
 
 	var bound []net.Listener
+	var boundUDP []net.PacketConn
 	tunnels := normalizeTunnels(peer.Tunnels)
 
 	for _, tun := range tunnels {
@@ -197,15 +205,23 @@ func syncServerListeners(peer ServerPeer) {
 		}
 		listenAddr := fmt.Sprintf("0.0.0.0:%d", tc.ListenPort)
 
+		// Method 08 (QUIC): bind native UDP QUIC listener on the tunnel port
+		if tc.ID == 8 {
+			if pc := startQUICUDPServer(peer.ID, tc); pc != nil {
+				boundUDP = append(boundUDP, pc)
+			}
+		}
+
 		var ln net.Listener
 		var err error
 		if tc.ID == 6 {
-			// Method 06 (TCP Relay) listens on raw TCP without TLS wrapper
 			ln, err = net.Listen("tcp", listenAddr)
 		} else {
 			nextProtos := []string{"http/1.1"}
-			if tc.ID == 2 || tc.ID == 3 {
+			if tc.ID == 2 || tc.ID == 3 || tc.ID == 7 {
 				nextProtos = []string{"h2", "http/1.1"}
+			} else if tc.ID == 8 {
+				nextProtos = []string{"h3", "quic", "h2"}
 			}
 			tlsCfg := &tls.Config{
 				Certificates: []tls.Certificate{localCert},
@@ -226,17 +242,23 @@ func syncServerListeners(peer ServerPeer) {
 			for _, fp := range forwardPorts {
 				targetPort := fp
 				entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
-				if err != nil {
-					continue
+				if err == nil {
+					bound = append(bound, entryLn)
+					go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
 				}
-				bound = append(bound, entryLn)
-				go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+				// For QUIC (tcp+udp), also bind UDP entry forwarder on the same port
+				if tc.ID == 8 {
+					if udpEntry := startQUICUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+						boundUDP = append(boundUDP, udpEntry)
+					}
+				}
 			}
 		}
 	}
 
 	engineMu.Lock()
 	activeListeners[peer.ID] = bound
+	activePacketConns[peer.ID] = boundUDP
 	engineMu.Unlock()
 }
 
@@ -273,7 +295,7 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		return
 	}
 
-	var wsKey, targetPort, syncPayloadB64, tunnelMode, peerHeader string
+	var wsKey, targetPort, syncPayloadB64, tunnelMode, peerHeader, timeHeader string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil || line == "\r\n" || line == "\n" {
@@ -290,10 +312,16 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			tunnelMode = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		} else if strings.HasPrefix(low, "x-sahand-peer:") {
 			peerHeader = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
+		} else if strings.HasPrefix(low, "x-sahand-time:") {
+			timeHeader = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		}
 	}
 
-	if (parts[0] == "CONNECT" || parts[0] == "RELAY") && targetPort == "" {
+	if timeHeader != "" {
+		applyMasterTimeHeader(timeHeader)
+	}
+
+	if (parts[0] == "CONNECT" || parts[0] == "RELAY" || parts[0] == "STREAM" || parts[0] == "QUIC") && targetPort == "" {
 		if strings.HasPrefix(parts[1], "probe:") {
 			targetPort = parts[1]
 		} else if idx := strings.LastIndex(parts[1], ":"); idx >= 0 {
@@ -335,6 +363,10 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			handleHTTPSProxyProbeReply(conn)
 		case tc.ID == 6 || parts[0] == "RELAY" || tunnelMode == "tcp-relay":
 			handleTCPRelayProbeReply(conn)
+		case tc.ID == 7 || parts[0] == "STREAM" || tunnelMode == "tls-stream":
+			handleTLSStreamProbeReply(conn)
+		case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
+			handleQUICStreamProbeReply(conn)
 		default:
 			handleWSSProbeReply(conn, wsKey)
 		}
@@ -366,6 +398,10 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		handleHTTPSProxyIncomingTraffic(conn, br, tc, targetPort)
 	case tc.ID == 6 || parts[0] == "RELAY" || tunnelMode == "tcp-relay":
 		handleTCPRelayIncomingTraffic(conn, br, tc, targetPort)
+	case tc.ID == 7 || parts[0] == "STREAM" || tunnelMode == "tls-stream":
+		handleTLSStreamIncomingTraffic(conn, br, tc, targetPort)
+	case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
+		handleQUICStreamIncomingTraffic(conn, br, tc, targetPort)
 	default:
 		handleWSSIncomingTraffic(conn, br, tc, wsKey, targetPort)
 	}
@@ -394,15 +430,17 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardHTTPSProxyTraffic(client, peer, tc, targetPort)
 	case 6:
 		forwardTCPRelayTraffic(client, peer, tc, targetPort)
+	case 7:
+		forwardTLSStreamTraffic(client, peer, tc, targetPort)
+	case 8:
+		forwardQUICTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
 }
 
 func recordLifelineEvent(peer *ServerPeer, mID int, mName string, port int, sec int, lat int64, dir, initiator string) {
-	nowStr := time.Now().UTC().Format("2006-01-02 15:04 UTC")
-	// If the most recent working method is already this exact method/port/direction, update it in place
-	// so periodic background liveness checks do not flood the 5-item history list.
+	nowStr := formatMasterTimestamp(masterNow())
 	if len(peer.RecentLifelines) > 0 {
 		top := &peer.RecentLifelines[0]
 		if top.MethodID == mID && top.Port == port && top.Direction == dir {
@@ -438,6 +476,7 @@ func markPeerConnectedInbound(peerID, remoteIP string, methodID, port int, laten
 	defer stateMu.Unlock()
 
 	initiator := formatConnectionInitiator(appCfg.Role, "inbound")
+	testedStr := formatMasterClockSec(masterNow())
 
 	for i := range appCfg.Servers {
 		srv := &appCfg.Servers[i]
@@ -447,7 +486,7 @@ func markPeerConnectedInbound(peerID, remoteIP string, methodID, port int, laten
 			srv.NextRetryAt = ""
 			srv.ActiveDirection = "inbound"
 			srv.ActiveInitiator = initiator
-			srv.LastInboundAt = time.Now().UTC().Unix()
+			srv.LastInboundAt = time.Now().Unix()
 			for _, m := range methodCatalogue {
 				if m.ID == methodID {
 					srv.ActiveMethodID = m.ID
@@ -468,7 +507,7 @@ func markPeerConnectedInbound(peerID, remoteIP string, methodID, port int, laten
 						Success:   true,
 						Direction: "inbound",
 						LatencyMS: srv.ActiveLatencyMS,
-						TestedAt:  time.Now().UTC().Format("15:04:05 UTC"),
+						TestedAt:  testedStr,
 					}
 					break
 				}
@@ -483,10 +522,25 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 	stateMu.Lock()
 	defer stateMu.Unlock()
 
+	if appCfg.Role == "agent" && pkt.MasterUnix > 0 {
+		appCfg.MasterClockDelta = pkt.MasterUnix - time.Now().Unix()
+		appCfg.MasterTZOffsetSec = pkt.MasterTZOff
+		if pkt.MasterTZName != "" {
+			appCfg.MasterTZName = pkt.MasterTZName
+		}
+	}
+
 	var resp SyncResponse
 	resp.OK = true
 	resp.NodeID = appCfg.NodeID
 	resp.CertPin = appCfg.CertPin
+	if appCfg.Role == "master" {
+		now := time.Now()
+		zName, zOff := now.Zone()
+		resp.MasterUnix = now.Unix()
+		resp.MasterTZName = zName
+		resp.MasterTZOff = zOff
+	}
 
 	initiator := formatConnectionInitiator(appCfg.Role, "inbound")
 
@@ -505,7 +559,7 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 			srv.NextRetryAt = ""
 			srv.ActiveDirection = "inbound"
 			srv.ActiveInitiator = initiator
-			srv.LastInboundAt = time.Now().UTC().Unix()
+			srv.LastInboundAt = time.Now().Unix()
 			if pkt.LatencyMS > 0 {
 				srv.ActiveLatencyMS = pkt.LatencyMS
 			}
@@ -536,7 +590,7 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 	res := MethodResult{
 		MethodID:  tc.ID,
 		Direction: "outbound",
-		TestedAt:  time.Now().UTC().Format("15:04:05 UTC"),
+		TestedAt:  formatMasterClockSec(masterNow()),
 	}
 
 	if !tc.Implemented {
@@ -556,22 +610,27 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 	switch tc.ID {
 	case 1:
-		return probeWSS(peer, tc, localNodeID)
+		res = probeWSS(peer, tc, localNodeID)
 	case 2:
-		return probeGRPC(peer, tc, localNodeID)
+		res = probeGRPC(peer, tc, localNodeID)
 	case 3:
-		return probeHTTP2(peer, tc, localNodeID)
+		res = probeHTTP2(peer, tc, localNodeID)
 	case 4:
-		return probeHTTPConnect(peer, tc, localNodeID)
+		res = probeHTTPConnect(peer, tc, localNodeID)
 	case 5:
-		return probeHTTPSProxy(peer, tc, localNodeID)
+		res = probeHTTPSProxy(peer, tc, localNodeID)
 	case 6:
-		return probeTCPRelay(peer, tc, localNodeID)
+		res = probeTCPRelay(peer, tc, localNodeID)
+	case 7:
+		res = probeTLSStream(peer, tc, localNodeID)
+	case 8:
+		res = probeQUIC(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
-		return res
 	}
+	res.TestedAt = formatMasterClockSec(masterNow())
+	return res
 }
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
@@ -623,12 +682,18 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 		Padding:       padHex,
 	}
 	if role == "master" {
+		now := time.Now()
+		zName, zOff := now.Zone()
+		pkt.MasterUnix = now.Unix()
+		pkt.MasterTZName = zName
+		pkt.MasterTZOff = zOff
 		pkt.Tunnels = peer.Tunnels
 	}
 	rawPkt, _ := json.Marshal(pkt)
 	b64 := base64.StdEncoding.EncodeToString(rawPkt)
 
-	req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nX-Sahand-Peer: %s\r\nX-Sahand-Sync: %s\r\n\r\n", sni, peer.ID, b64)
+	req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nX-Sahand-Peer: %s\r\nX-Sahand-Time: %s\r\nX-Sahand-Sync: %s\r\n\r\n",
+		sni, peer.ID, buildMasterTimeHeader(), b64)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return false
 	}
@@ -654,6 +719,13 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 	}
 
 	stateMu.Lock()
+	if appCfg.Role == "agent" && resp.MasterUnix > 0 {
+		appCfg.MasterClockDelta = resp.MasterUnix - time.Now().Unix()
+		appCfg.MasterTZOffsetSec = resp.MasterTZOff
+		if resp.MasterTZName != "" {
+			appCfg.MasterTZName = resp.MasterTZName
+		}
+	}
 	for i := range appCfg.Servers {
 		if appCfg.Servers[i].ID == peer.ID {
 			if appCfg.Role == "agent" && len(resp.Tunnels) == 30 && resp.ConfigVersion >= appCfg.Servers[i].ConfigVersion {
@@ -872,7 +944,6 @@ func startDiscoveryLoop(peerID string) {
 						return
 					default:
 					}
-					// If the remote server connected to us while we were sweeping, stop sweeping immediately
 					if isPeerAlreadyConnected(peerID) {
 						break
 					}
@@ -910,23 +981,21 @@ func startDiscoveryLoop(peerID string) {
 					}
 				}
 
-				// If an inbound connection arrived from the other side during the sweep, keep it!
 				if updatedPeer.Status == "CONNECTED" && updatedPeer.ActiveMethodID > 0 && bestCandidate == nil {
 					_ = saveConfig(configPath(), appCfg)
 					stateMu.Unlock()
 				} else if bestCandidate == nil {
 					retryMins := 10 + randomIntN(21)
 					retryDuration := time.Duration(retryMins) * time.Minute
-					nextRetry := time.Now().UTC().Add(retryDuration)
+					nextRetry := masterNow().Add(retryDuration)
 					updatedPeer.Status = "RETRY SCHEDULED"
 					updatedPeer.ActiveMethodID = 0
 					updatedPeer.ActiveMethod = ""
 					updatedPeer.ActivePort = 0
-					updatedPeer.NextRetryAt = nextRetry.Format("15:04 UTC")
+					updatedPeer.NextRetryAt = formatMasterClock(nextRetry)
 					_ = saveConfig(configPath(), appCfg)
 					stateMu.Unlock()
 
-					// Wait for retry timer OR wake up early if the other side connects inbound
 					retryTicker := time.NewTicker(5 * time.Second)
 					deadline := time.Now().Add(retryDuration)
 					for time.Now().Before(deadline) {
@@ -989,9 +1058,7 @@ func startDiscoveryLoop(peerID string) {
 					return
 				}
 
-				// If the remote server is the initiator (inbound), and we've heard from it within 4 minutes,
-				// stay locked on CONNECTED without attempting an outbound sweep.
-				if curPeer.ActiveDirection == "inbound" && time.Now().UTC().Unix()-curPeer.LastInboundAt < 240 {
+				if curPeer.ActiveDirection == "inbound" && time.Now().Unix()-curPeer.LastInboundAt < 240 {
 					continue
 				}
 
@@ -1019,12 +1086,11 @@ func startDiscoveryLoop(peerID string) {
 					continue
 				}
 
-				// Double-check if an inbound probe arrived before declaring connection broken
 				stateMu.Lock()
 				stillInboundAlive := false
 				for i := range appCfg.Servers {
 					if appCfg.Servers[i].ID == peerID {
-						if time.Now().UTC().Unix()-appCfg.Servers[i].LastInboundAt < 240 {
+						if time.Now().Unix()-appCfg.Servers[i].LastInboundAt < 240 {
 							stillInboundAlive = true
 						} else {
 							appCfg.Servers[i].Status = "TESTING"
