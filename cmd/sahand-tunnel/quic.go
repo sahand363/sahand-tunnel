@@ -25,7 +25,6 @@ import (
 
 const (
 	// Dedicated ALPN identifier for Sahand Tunnel QUIC transport.
-	// Never advertises "h3" because this transport is native multiplexed QUIC, not HTTP/3.
 	quicALPN = "sahand-quic-v1"
 
 	quicStreamTypeProbe      byte = 0x01
@@ -50,7 +49,7 @@ const (
 	// [Flag:1][SessionID:4][TargetPort:2][FragID:2][FragIndex:1][FragTotal:1] = 11 bytes
 	quicDatagramFragHeaderSize = 11
 
-	quicDefaultMaxDatagramPayload = 1180
+	quicDefaultMaxDatagramPayload = 1150
 	quicMaxOriginalDatagramSize   = 8192
 	quicMaxFragmentsPerDatagram   = 8
 	quicMaxReassemblyBytes        = 512 * 1024
@@ -70,13 +69,9 @@ var (
 	ErrQUICUnauthorizedPeer = errors.New("quic peer authentication failed")
 	ErrQUICSessionLimit     = errors.New("quic udp session limit reached")
 
-	// Optional datagram fragmentation toggle (disabled by default to preserve strict datagram boundaries;
-	// can be enabled explicitly when oversized UDP payloads must be carried).
 	quicAllowDatagramFragmentation atomic.Bool
 )
 
-// quicConnectionIdentity uniquely identifies a pooled QUIC connection so Engine 1 (control)
-// and Engine 2 (data), multiple peers, and configuration changes never collide.
 type quicConnectionIdentity struct {
 	PeerID         string
 	LocalNodeID    string
@@ -272,6 +267,7 @@ func buildQUICConfig(tc TunnelConfig) *quic.Config {
 		HandshakeIdleTimeout:           6 * time.Second,
 		MaxIdleTimeout:                 90 * time.Second,
 		KeepAlivePeriod:                time.Duration(hbSec) * time.Second,
+		InitialPacketSize:              1200,
 		MaxIncomingStreams:             int64(streamLimit),
 		MaxIncomingUniStreams:          16,
 		InitialStreamReceiveWindow:     2 * 1024 * 1024,
@@ -293,7 +289,6 @@ func buildQUICClientTLSConfig(peer ServerPeer, tc TunnelConfig) *tls.Config {
 		pin = peer.RemoteCertPin
 	}
 	return &tls.Config{
-		Certificates:       []tls.Certificate{localCert},
 		ServerName:         sni,
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS13,
@@ -499,11 +494,6 @@ func (spl *quicSharedPortListener) resolveRegistration(peerID, remoteIP string) 
 	}
 	for _, reg := range spl.peers {
 		if reg.Peer.IP == remoteIP {
-			return reg
-		}
-	}
-	if len(spl.peers) == 1 {
-		for _, reg := range spl.peers {
 			return reg
 		}
 	}
@@ -819,7 +809,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	if err := writeQUICHandshake(stream, hs); err != nil {
 		mc.close()
 		res.Success = false
-		res.ErrorReason = "Timeout"
+		res.ErrorReason = classifyQUICError(err)
 		return res
 	}
 
@@ -827,7 +817,7 @@ func probeQUIC(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	if _, err := io.ReadFull(stream, status[:]); err != nil {
 		mc.close()
 		res.Success = false
-		res.ErrorReason = "Timeout"
+		res.ErrorReason = classifyQUICError(err)
 		return res
 	}
 	if status[0] != quicStatusOK {
