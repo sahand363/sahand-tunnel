@@ -197,6 +197,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/servers/action", requireAuth(handleServerAction))
 	mux.HandleFunc("/api/v1/tunnels", requireAuth(handleTunnelsUpdate))
 	mux.HandleFunc("/api/v1/tunnels/ports", requireAuth(handleBatchPortsUpdate))
+	mux.HandleFunc("/api/v1/tunnels/ping", requireAuth(handleTunnelPing))
 	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
 
 	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -497,6 +498,74 @@ func handleServerAction(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+func handleTunnelPing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string `json:"server_id"`
+		MethodID int    `json:"method_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.RLock()
+	var peerSnapshot *ServerPeer
+	var tcSnapshot *TunnelConfig
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			cp := appCfg.Servers[i]
+			peerSnapshot = &cp
+			for j := range cp.Tunnels {
+				if cp.Tunnels[j].ID == req.MethodID {
+					tc := cp.Tunnels[j]
+					tcSnapshot = &tc
+					break
+				}
+			}
+			break
+		}
+	}
+	stateMu.RUnlock()
+
+	if peerSnapshot == nil || tcSnapshot == nil {
+		http.Error(w, "server or tunnel method not found", http.StatusNotFound)
+		return
+	}
+
+	res := probeSingleMethod(*peerSnapshot, *tcSnapshot)
+
+	stateMu.Lock()
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			for j := range appCfg.Servers[i].Tunnels {
+				if appCfg.Servers[i].Tunnels[j].ID == req.MethodID {
+					appCfg.Servers[i].Tunnels[j].LastDiscovery = res
+					break
+				}
+			}
+			if res.Success && appCfg.Servers[i].ActiveMethodID == req.MethodID {
+				appCfg.Servers[i].ActiveLatencyMS = res.LatencyMS
+			}
+			_ = saveConfig(configPath(), appCfg)
+			break
+		}
+	}
+	stateMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK     bool         `json:"ok"`
+		Result MethodResult `json:"result"`
+	}{
+		OK:     true,
+		Result: res,
+	})
 }
 
 func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
