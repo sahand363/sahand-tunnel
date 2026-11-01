@@ -500,8 +500,132 @@ export default function App() {
   const totalRx = visibleAnalytics.reduce((acc, d) => acc + d.rx_bytes, 0);
   const totalTx = visibleAnalytics.reduce((acc, d) => acc + d.tx_bytes, 0);
 
+  // Explicit theme-aware palette for the Settings Modal
+  const modalTheme = darkMode
+    ? {
+        backdrop: "rgba(5, 9, 20, 0.78)",
+        cardBg: "#12192b",
+        cardBorder: "#26334d",
+        textMain: "#f1f5f9",
+        textMuted: "#94a3b8",
+        itemBg: "#0c1324",
+        itemBorder: "#23304a",
+        inputBg: "#080d1a",
+        inputBorder: "#2e3d5c",
+        inputText: "#f8fafc",
+      }
+    : {
+        backdrop: "rgba(15, 23, 42, 0.45)",
+        cardBg: "#ffffff",
+        cardBorder: "#cbd5e1",
+        textMain: "#0f172a",
+        textMuted: "#475569",
+        itemBg: "#f8fafc",
+        itemBorder: "#e2e8f0",
+        inputBg: "#ffffff",
+        inputBorder: "#cbd5e1",
+        inputText: "#0f172a",
+      };
+
   return (
     <div className="app-shell">
+      <style>{`
+        .sahand-chart-card {
+          padding: 16px 14px 14px 10px !important;
+        }
+        .sahand-chart-layout {
+          display: flex !important;
+          align-items: stretch !important;
+          gap: 8px !important;
+          width: 100% !important;
+        }
+        .sahand-y-axis {
+          display: flex !important;
+          flex-direction: column !important;
+          justify-content: space-between !important;
+          width: 46px !important;
+          min-width: 46px !important;
+          padding-bottom: 22px !important;
+          text-align: right !important;
+          font-size: 11px !important;
+          opacity: 0.75 !important;
+          user-select: none !important;
+        }
+        .sahand-plot-area {
+          position: relative !important;
+          flex: 1 1 0% !important;
+          min-width: 0 !important;
+          height: 230px !important;
+          display: flex !important;
+          flex-direction: column !important;
+        }
+        .sahand-grid-lines {
+          position: absolute !important;
+          inset: 0 0 22px 0 !important;
+          display: flex !important;
+          flex-direction: column !important;
+          justify-content: space-between !important;
+          pointer-events: none !important;
+        }
+        .sahand-bars-grid {
+          position: relative !important;
+          z-index: 1 !important;
+          flex: 1 1 0% !important;
+          display: grid !important;
+          align-items: end !important;
+          width: 100% !important;
+          height: 100% !important;
+          padding: 0 !important;
+          margin: 0 !important;
+        }
+        .sahand-bars-grid.range-7 {
+          grid-template-columns: repeat(7, minmax(0, 1fr)) !important;
+          gap: 8px !important;
+        }
+        .sahand-bars-grid.range-30 {
+          grid-template-columns: repeat(30, minmax(0, 1fr)) !important;
+          gap: 2px !important;
+        }
+        .sahand-day-col {
+          display: flex !important;
+          flex-direction: column !important;
+          align-items: center !important;
+          justify-content: flex-end !important;
+          height: 100% !important;
+          min-width: 0 !important;
+          width: 100% !important;
+        }
+        .sahand-day-bars {
+          flex: 1 1 0% !important;
+          width: 100% !important;
+          display: flex !important;
+          align-items: flex-end !important;
+          justify-content: center !important;
+          gap: 2px !important;
+          padding-bottom: 4px !important;
+        }
+        .sahand-bars-grid.range-30 .sahand-day-bars {
+          gap: 1px !important;
+        }
+        .sahand-bar {
+          flex: 1 1 0% !important;
+          max-width: 14px !important;
+          min-width: 2px !important;
+          border-radius: 3px 3px 0 0 !important;
+          transition: height 0.25s ease !important;
+        }
+        .sahand-date-cell {
+          height: 18px !important;
+          display: flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          font-size: 10px !important;
+          opacity: 0.78 !important;
+          white-space: nowrap !important;
+          overflow: visible !important;
+        }
+      `}</style>
+
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">
@@ -561,7 +685,7 @@ export default function App() {
           style={{
             position: "fixed",
             inset: 0,
-            backgroundColor: "rgba(5, 9, 20, 0.78)",
+            backgroundColor: modalTheme.backdrop,
             backdropFilter: "blur(6px)",
             zIndex: 9999,
             display: "flex",
@@ -575,20 +699,21 @@ export default function App() {
             style={{
               width: "min(860px, 100%)",
               maxHeight: "90vh",
-              backgroundColor: "var(--card-bg, #12192b)",
-              border: "1px solid var(--border-color, #26334d)",
+              backgroundColor: modalTheme.cardBg,
+              color: modalTheme.textMain,
+              border: `1px solid ${modalTheme.cardBorder}`,
               borderRadius: "16px",
               display: "flex",
               flexDirection: "column",
               overflow: "hidden",
-              boxShadow: "0 24px 60px rgba(0,0,0,0.55)",
+              boxShadow: "0 24px 60px rgba(0,0,0,0.45)",
             }}
             onClick={(e) => e.stopPropagation()}
           >
             <div
               style={{
                 padding: "16px 20px",
-                borderBottom: "1px solid var(--border-color, #26334d)",
+                borderBottom: `1px solid ${modalTheme.cardBorder}`,
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
@@ -599,10 +724,16 @@ export default function App() {
               <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                 <Settings2 size={18} />
                 <div>
-                  <div style={{ fontWeight: 700, fontSize: "15px" }}>
+                  <div
+                    style={{
+                      fontWeight: 700,
+                      fontSize: "15px",
+                      color: modalTheme.textMain,
+                    }}
+                  >
                     Application & Port Settings
                   </div>
-                  <div style={{ fontSize: "12px", opacity: 0.7 }}>
+                  <div style={{ fontSize: "12px", color: modalTheme.textMuted }}>
                     Customize appearance and Engine 1 / Engine 2 port mappings
                   </div>
                 </div>
@@ -624,6 +755,7 @@ export default function App() {
                   className="icon-button"
                   onClick={() => setShowPortSettings(false)}
                   title="Close settings"
+                  style={{ color: modalTheme.textMain }}
                 >
                   ✕
                 </button>
@@ -631,7 +763,13 @@ export default function App() {
             </div>
 
             {!selectedServer ? (
-              <div style={{ padding: "36px", textAlign: "center", opacity: 0.75 }}>
+              <div
+                style={{
+                  padding: "36px",
+                  textAlign: "center",
+                  color: modalTheme.textMuted,
+                }}
+              >
                 Add or select a server first to configure its 30 method ports.
               </div>
             ) : (
@@ -639,7 +777,7 @@ export default function App() {
                 <div
                   style={{
                     padding: "14px 20px",
-                    borderBottom: "1px solid var(--border-color, #26334d)",
+                    borderBottom: `1px solid ${modalTheme.cardBorder}`,
                     display: "flex",
                     flexWrap: "wrap",
                     alignItems: "center",
@@ -648,12 +786,23 @@ export default function App() {
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: 600, opacity: 0.8 }}>
+                    <span
+                      style={{
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        color: modalTheme.textMuted,
+                      }}
+                    >
                       TARGET:
                     </span>
                     <select
                       className="server-select"
                       value={selectedServer.id}
+                      style={{
+                        backgroundColor: modalTheme.inputBg,
+                        color: modalTheme.inputText,
+                        borderColor: modalTheme.inputBorder,
+                      }}
                       onChange={(e) => {
                         const newID = e.target.value;
                         handleSelectServer(newID);
@@ -688,7 +837,9 @@ export default function App() {
                       }}
                     >
                       <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                        <span style={{ fontSize: "12px", opacity: 0.8 }}>
+                        <span
+                          style={{ fontSize: "12px", color: modalTheme.textMuted }}
+                        >
                           Engine 1 Start:
                         </span>
                         <input
@@ -701,9 +852,9 @@ export default function App() {
                             width: "82px",
                             padding: "6px 8px",
                             borderRadius: "8px",
-                            border: "1px solid var(--border-color, #2c3a57)",
-                            background: "var(--input-bg, #0b1120)",
-                            color: "inherit",
+                            border: `1px solid ${modalTheme.inputBorder}`,
+                            backgroundColor: modalTheme.inputBg,
+                            color: modalTheme.inputText,
                             fontSize: "13px",
                           }}
                         />
@@ -717,7 +868,9 @@ export default function App() {
                       </div>
 
                       <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                        <span style={{ fontSize: "12px", opacity: 0.8 }}>
+                        <span
+                          style={{ fontSize: "12px", color: modalTheme.textMuted }}
+                        >
                           Engine 2 Start:
                         </span>
                         <input
@@ -730,9 +883,9 @@ export default function App() {
                             width: "82px",
                             padding: "6px 8px",
                             borderRadius: "8px",
-                            border: "1px solid var(--border-color, #2c3a57)",
-                            background: "var(--input-bg, #0b1120)",
-                            color: "inherit",
+                            border: `1px solid ${modalTheme.inputBorder}`,
+                            backgroundColor: modalTheme.inputBg,
+                            color: modalTheme.inputText,
                             fontSize: "13px",
                           }}
                         />
@@ -768,8 +921,8 @@ export default function App() {
                         style={{
                           padding: "10px 12px",
                           borderRadius: "10px",
-                          border: "1px solid var(--border-color, #26334d)",
-                          background: "rgba(15, 23, 42, 0.45)",
+                          border: `1px solid ${modalTheme.itemBorder}`,
+                          backgroundColor: modalTheme.itemBg,
                           display: "flex",
                           flexDirection: "column",
                           gap: "8px",
@@ -782,6 +935,7 @@ export default function App() {
                             justifyContent: "space-between",
                             fontSize: "13px",
                             fontWeight: 600,
+                            color: modalTheme.textMain,
                           }}
                         >
                           <span>
@@ -804,7 +958,8 @@ export default function App() {
                               style={{
                                 display: "block",
                                 fontSize: "10px",
-                                opacity: 0.7,
+                                fontWeight: 600,
+                                color: modalTheme.textMuted,
                                 marginBottom: "3px",
                               }}
                             >
@@ -827,9 +982,9 @@ export default function App() {
                                 width: "100%",
                                 padding: "6px 8px",
                                 borderRadius: "7px",
-                                border: "1px solid var(--border-color, #2c3a57)",
-                                background: "var(--input-bg, #0b1120)",
-                                color: "inherit",
+                                border: `1px solid ${modalTheme.inputBorder}`,
+                                backgroundColor: modalTheme.inputBg,
+                                color: modalTheme.inputText,
                                 fontSize: "13px",
                               }}
                             />
@@ -840,7 +995,8 @@ export default function App() {
                               style={{
                                 display: "block",
                                 fontSize: "10px",
-                                opacity: 0.7,
+                                fontWeight: 600,
+                                color: modalTheme.textMuted,
                                 marginBottom: "3px",
                               }}
                             >
@@ -863,9 +1019,9 @@ export default function App() {
                                 width: "100%",
                                 padding: "6px 8px",
                                 borderRadius: "7px",
-                                border: "1px solid var(--border-color, #2c3a57)",
-                                background: "var(--input-bg, #0b1120)",
-                                color: "inherit",
+                                border: `1px solid ${modalTheme.inputBorder}`,
+                                backgroundColor: modalTheme.inputBg,
+                                color: modalTheme.inputText,
                                 fontSize: "13px",
                               }}
                             />
@@ -879,7 +1035,7 @@ export default function App() {
                 <div
                   style={{
                     padding: "14px 20px",
-                    borderTop: "1px solid var(--border-color, #26334d)",
+                    borderTop: `1px solid ${modalTheme.cardBorder}`,
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
@@ -887,7 +1043,7 @@ export default function App() {
                     flexWrap: "wrap",
                   }}
                 >
-                  <div style={{ fontSize: "13px", color: "#34d399", fontWeight: 600 }}>
+                  <div style={{ fontSize: "13px", color: "#10b981", fontWeight: 600 }}>
                     {batchPortNotice && `✓ ${batchPortNotice}`}
                   </div>
 
@@ -1306,6 +1462,7 @@ export default function App() {
                         className={`tunnel-card ${expanded ? "expanded" : ""}`}
                         key={tunnel.id}
                       >
+                        {/* Top Ribbon: Method ID, Name, Protocol Badge (TCP / TCP+UDP), and Toggle */}
                         <div className="tunnel-row">
                           <button
                             className="tunnel-expand"
@@ -1319,6 +1476,10 @@ export default function App() {
                             </span>
 
                             <span className="tunnel-title">{tunnel.name}</span>
+
+                            <span className="proto-badge">
+                              {tunnel.traffic_type.toUpperCase()}
+                            </span>
 
                             {noticeText && !expanded && (
                               <span className="save-feedback-inline">✓ {noticeText}</span>
@@ -1351,7 +1512,7 @@ export default function App() {
                           </button>
                         </div>
 
-                        {/* Lower narrow footer bar for mobile-friendly metadata & live Ping button */}
+                        {/* Lower Narrow Footer: Port, Security %, Ping Result, and Ping Button */}
                         <div
                           className="server-subbar"
                           style={{
@@ -1375,10 +1536,6 @@ export default function App() {
 
                             <span className={`sec-badge ${securityTierClass(tunnel.security)}`}>
                               {tunnel.security}%
-                            </span>
-
-                            <span className="proto-badge">
-                              {tunnel.traffic_type.toUpperCase()}
                             </span>
 
                             {disc?.tested_at && (
@@ -1581,23 +1738,27 @@ export default function App() {
               </div>
             </div>
 
-            <div className="chart-card">
-              <div className="chart-layout">
-                <div className="y-axis-labels">
+            <div className="chart-card sahand-chart-card">
+              <div className="sahand-chart-layout">
+                <div className="sahand-y-axis">
                   {yAxisTicks.map((val, i) => (
                     <span key={i}>{formatBytes(val)}</span>
                   ))}
                 </div>
 
-                <div className="chart-plot-area">
-                  <div className="y-grid-lines">
+                <div className="sahand-plot-area">
+                  <div className="sahand-grid-lines">
                     {yAxisTicks.map((_, i) => (
                       <div className="y-grid-line" key={i} />
                     ))}
                   </div>
 
-                  <div className="bars-container">
-                    {visibleAnalytics.map((day) => {
+                  <div
+                    className={`sahand-bars-grid ${
+                      analyticsRange === 30 ? "range-30" : "range-7"
+                    }`}
+                  >
+                    {visibleAnalytics.map((day, idx) => {
                       const rxPct =
                         day.rx_bytes > 0
                           ? Math.max(4, Math.round((day.rx_bytes / chartScaleMax) * 100))
@@ -1607,20 +1768,33 @@ export default function App() {
                           ? Math.max(4, Math.round((day.tx_bytes / chartScaleMax) * 100))
                           : 2;
                       const shortDate = day.date.slice(5);
+                      const showLabel =
+                        analyticsRange === 7 ||
+                        idx === 0 ||
+                        idx === visibleAnalytics.length - 1 ||
+                        idx % 5 === 0;
 
                       return (
                         <div
-                          className="day-column"
+                          className="sahand-day-col"
                           key={day.date}
                           title={`${day.date} • ↓ ${formatBytes(day.rx_bytes)} | ↑ ${formatBytes(
                             day.tx_bytes
                           )}`}
                         >
-                          <div className="day-bars">
-                            <div className="bar rx-bar" style={{ height: `${rxPct}%` }} />
-                            <div className="bar tx-bar" style={{ height: `${txPct}%` }} />
+                          <div className="sahand-day-bars">
+                            <div
+                              className="bar rx-bar sahand-bar"
+                              style={{ height: `${rxPct}%` }}
+                            />
+                            <div
+                              className="bar tx-bar sahand-bar"
+                              style={{ height: `${txPct}%` }}
+                            />
                           </div>
-                          <span className="day-label">{shortDate}</span>
+                          <div className="sahand-date-cell">
+                            {showLabel ? shortDate : ""}
+                          </div>
                         </div>
                       );
                     })}
