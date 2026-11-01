@@ -95,6 +95,7 @@ type TunnelConfig struct {
 	SNI            string       `json:"sni,omitempty"`
 	WSPath         string       `json:"ws_path,omitempty"`
 	CertPin        string       `json:"cert_pin,omitempty"`
+	RawTransport   string       `json:"raw_transport,omitempty"`
 	HeartbeatSec   int          `json:"heartbeat_sec,omitempty"`
 	StreamLimit    int          `json:"stream_limit,omitempty"`
 	SpeedLimitMBps string       `json:"speed_limit_mbps"`
@@ -215,7 +216,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{21, "TCP Multiplex", 68, "tcp", true, 28021, []string{"listen_port", "forward_ports", "stream_limit", "speed_limit_mbps"}},
 	{22, "WebSocket Multiplex", 89, "tcp", true, 28022, []string{"listen_port", "forward_ports", "sni", "ws_path", "stream_limit", "speed_limit_mbps"}},
 	{23, "HTTP Upgrade", 74, "tcp", true, 28023, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
-	{24, "SAHAND-RAW", 96, "tcp+udp", true, 28024, []string{"listen_port", "forward_ports", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
+	{24, "SAHAND-RAW", 96, "tcp+udp", true, 28024, []string{"listen_port", "forward_ports", "raw_transport", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{25, "Secure Relay", 85, "tcp", false, 28025, []string{"listen_port", "forward_ports", "sni"}},
 	{26, "Stream Bridge", 80, "tcp+udp", false, 28026, []string{"listen_port", "forward_ports", "stream_limit"}},
 	{27, "Fallback TCP", 42, "tcp", false, 28027, []string{"listen_port", "forward_ports"}},
@@ -479,6 +480,8 @@ func defaultTunnelsForServer() []TunnelConfig {
 				tc.SNI = "www.speedtest.net"
 			case "ws_path":
 				tc.WSPath = "/ws"
+			case "raw_transport":
+				tc.RawTransport = "auto"
 			case "heartbeat_sec":
 				tc.HeartbeatSec = 30
 			case "stream_limit":
@@ -521,6 +524,14 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			}
 			if cur.WSPath == "" {
 				cur.WSPath = def.WSPath
+			}
+			if def.RawTransport != "" {
+				rt := strings.ToLower(strings.TrimSpace(cur.RawTransport))
+				if rt != "raw_ip" && rt != "udp" && rt != "auto" {
+					cur.RawTransport = def.RawTransport
+				} else {
+					cur.RawTransport = rt
+				}
 			}
 			if cur.HeartbeatSec <= 0 {
 				cur.HeartbeatSec = def.HeartbeatSec
