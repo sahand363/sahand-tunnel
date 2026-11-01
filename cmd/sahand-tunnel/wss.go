@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -33,10 +34,12 @@ const (
 	wssStreamChunkSize     = 32 * 1024
 	wssMaxIncomingMsgBytes = 512 * 1024
 
-	wssHandshakeTimeout    = 6 * time.Second
-	wssWriteTimeout        = 15 * time.Second
-	wssDefaultPingInterval = 25 * time.Second
-	wssCloseGraceTimeout   = 3 * time.Second
+	wssHandshakeTimeout      = 6 * time.Second
+	wssWriteTimeout          = 15 * time.Second
+	wssDefaultPingInterval   = 25 * time.Second
+	wssCloseGraceTimeout     = 3 * time.Second
+	wssCloseHandshakeTimeout = 5 * time.Second
+	wssAuthSkewWindowSec     = 300
 )
 
 var (
@@ -103,6 +106,113 @@ func resolveWSSPingTiming(tc TunnelConfig) (pingInterval time.Duration, pongTime
 	return pingInterval, pongTimeout
 }
 
+// ============================================================================
+// PEER AUTHENTICATION & TARGET-PORT AUTHORIZATION
+// ============================================================================
+
+func computeWSSRequestMAC(authKey []byte, peerID, purpose, tsStr, nonce string) string {
+	mac := hmac.New(sha256.New, authKey)
+	_, _ = mac.Write([]byte("sahand-rfc6455-wss-auth-v1:"))
+	_, _ = mac.Write([]byte(peerID + "|" + purpose + "|" + tsStr + "|" + nonce))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func attachWSSAuthHeaders(hdr http.Header, peer ServerPeer, purpose string) error {
+	stateMu.RLock()
+	cfgSnapshot := appCfg
+	stateMu.RUnlock()
+
+	authKey, err := derivePeerAuthKey(cfgSnapshot, peer)
+	if err != nil {
+		return err
+	}
+	nonce, err := randomHex(8)
+	if err != nil {
+		return err
+	}
+	tsStr := strconv.FormatInt(time.Now().Unix(), 10)
+	sig := computeWSSRequestMAC(authKey, peer.ID, purpose, tsStr, nonce)
+
+	hdr.Set("X-Sahand-Peer", peer.ID)
+	hdr.Set("X-Sahand-TS", tsStr)
+	hdr.Set("X-Sahand-Nonce", nonce)
+	hdr.Set("X-Sahand-Auth", sig)
+	return nil
+}
+
+func verifyWSSPeerRequest(r *http.Request, expectedPeer ServerPeer, purpose string) error {
+	peerHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Peer"))
+	if peerHdr == "" || expectedPeer.ID == "" {
+		return errors.New("missing peer identity")
+	}
+	if subtle.ConstantTimeCompare([]byte(peerHdr), []byte(expectedPeer.ID)) != 1 {
+		return errors.New("peer identity mismatch")
+	}
+
+	stateMu.RLock()
+	cfgSnapshot := appCfg
+	stateMu.RUnlock()
+
+	authKey, err := derivePeerAuthKey(cfgSnapshot, expectedPeer)
+	if err != nil {
+		return err
+	}
+
+	tsStr := strings.TrimSpace(r.Header.Get("X-Sahand-TS"))
+	nonce := strings.TrimSpace(r.Header.Get("X-Sahand-Nonce"))
+	authSig := strings.TrimSpace(r.Header.Get("X-Sahand-Auth"))
+	if tsStr == "" || nonce == "" || authSig == "" {
+		return errors.New("missing authentication headers")
+	}
+
+	tsSec, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return errors.New("invalid authentication timestamp")
+	}
+	diff := time.Now().Unix() - tsSec
+	if diff < -wssAuthSkewWindowSec || diff > wssAuthSkewWindowSec {
+		return errors.New("authentication timestamp out of window")
+	}
+
+	expectedSig := computeWSSRequestMAC(authKey, expectedPeer.ID, purpose, tsStr, nonce)
+	if subtle.ConstantTimeCompare([]byte(authSig), []byte(expectedSig)) != 1 {
+		return errors.New("invalid request signature")
+	}
+	return nil
+}
+
+// Validates that the requested targetPort is explicitly listed in tc.ForwardPorts.
+// If requestedPort is empty, selects the first configured port in tc.ForwardPorts.
+// Rejects any port not present in tc.ForwardPorts before dialing localhost.
+func authorizeWSSTargetPort(tc TunnelConfig, requestedPort string) (string, error) {
+	allowedPorts := parsePortList(tc.ForwardPorts)
+	if len(allowedPorts) == 0 {
+		return "", errors.New("no forwarding ports configured for this tunnel")
+	}
+
+	candidate := strings.TrimSpace(requestedPort)
+	if candidate == "" {
+		candidate = allowedPorts[0]
+	}
+
+	portNum, err := strconv.Atoi(candidate)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return "", errors.New("invalid target port")
+	}
+	normalizedCandidate := strconv.Itoa(portNum)
+
+	for _, allowed := range allowedPorts {
+		if subtle.ConstantTimeCompare([]byte(normalizedCandidate), []byte(allowed)) == 1 {
+			return allowed, nil
+		}
+	}
+	return "", fmt.Errorf("target port %s is not authorized for this tunnel", normalizedCandidate)
+}
+
+// ============================================================================
+// TLS VERIFICATION & CERTIFICATE PINNING
+// ============================================================================
+
 func parseExpectedPinBytes(rawPin string) ([]byte, error) {
 	clean := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(rawPin, ":", "")))
 	if clean == "" {
@@ -115,6 +225,12 @@ func parseExpectedPinBytes(rawPin string) ([]byte, error) {
 	return decoded, nil
 }
 
+// Explicitly validates the peer's leaf certificate when pinning is configured:
+// 1. Parses the X.509 certificate chain.
+// 2. Verifies NotBefore and NotAfter expiration bounds.
+// 3. Always verifies the certificate's SANs (DNSNames / IPAddresses) against the configured SNI.
+// 4. Verifies the SHA-256 certificate pin in constant time.
+// 5. If self-issued, verifies the cryptographic self-signature.
 func verifyWSSPinnedCertificate(rawCerts [][]byte, expectedPinBytes []byte, sni string) error {
 	if len(rawCerts) == 0 {
 		return errors.New("no peer certificate presented")
@@ -123,21 +239,32 @@ func verifyWSSPinnedCertificate(rawCerts [][]byte, expectedPinBytes []byte, sni 
 	if err != nil {
 		return fmt.Errorf("invalid peer leaf certificate: %w", err)
 	}
+
 	now := time.Now()
-	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
-		return errors.New("peer certificate is expired or not yet valid")
+	if now.Before(leaf.NotBefore) {
+		return errors.New("peer certificate is not yet valid")
 	}
+	if now.After(leaf.NotAfter) {
+		return errors.New("peer certificate has expired")
+	}
+
+	if sni != "" {
+		if err := leaf.VerifyHostname(sni); err != nil {
+			return fmt.Errorf("certificate hostname mismatch: %w", err)
+		}
+	}
+
 	if len(expectedPinBytes) != sha256.Size {
 		return errors.New("certificate pin is not configured")
 	}
-	actualSum := sha256.Sum256(rawCerts[0])
+	actualSum := sha256.Sum256(leaf.Raw)
 	if subtle.ConstantTimeCompare(actualSum[:], expectedPinBytes) != 1 {
 		return errors.New("certificate pin mismatch")
 	}
-	// If the certificate does not use the default self-signed placeholder CN, enforce hostname match when SNI is set.
-	if sni != "" && len(leaf.DNSNames) > 0 && leaf.Subject.CommonName != "www.speedtest.net" {
-		if err := leaf.VerifyHostname(sni); err != nil {
-			return fmt.Errorf("certificate hostname mismatch: %w", err)
+
+	if bytes.Equal(leaf.RawIssuer, leaf.RawSubject) {
+		if err := leaf.CheckSignatureFrom(leaf); err != nil {
+			return fmt.Errorf("invalid self-signed certificate signature: %w", err)
 		}
 	}
 	return nil
@@ -150,24 +277,18 @@ func buildWSSRootCAPool() *x509.CertPool {
 	}
 	stateMu.RLock()
 	certPEM := appCfg.TLSCertPEM
-	localRaw := localCert.Certificate
 	stateMu.RUnlock()
 
 	if certPEM != "" {
 		_ = pool.AppendCertsFromPEM([]byte(certPEM))
 	}
-	for _, der := range localRaw {
-		if cert, err := x509.ParseCertificate(der); err == nil {
-			pool.AddCert(cert)
-		}
-	}
 	return pool
 }
 
-// Builds the TLS client configuration for RFC 6455 WSS over HTTP/1.1.
-// - Forces ALPN NextProtos to ["http/1.1"] so HTTP/2 is never negotiated.
-// - When no pin is configured, uses standard X.509 chain and hostname verification (InsecureSkipVerify: false).
-// - When a pin is configured (tc.CertPin or peer.RemoteCertPin), validates the SHA-256 pin in constant time.
+// Builds the TLS client configuration for RFC 6455 WSS over HTTP/1.1:
+// - Restricts ALPN NextProtos to ["http/1.1"] so HTTP/2 is never negotiated.
+// - Unpinned mode: Uses standard X.509 certificate-chain, expiration, and hostname verification (InsecureSkipVerify: false).
+// - Pinned mode: Uses verifyWSSPinnedCertificate to enforce expiration, hostname/SAN verification, and SHA-256 pinning.
 func buildWSSClientTLSConfig(peer ServerPeer, tc TunnelConfig) (*tls.Config, error) {
 	sni := normalizeWSSSNI(tc.SNI)
 	rawPin := strings.TrimSpace(tc.CertPin)
@@ -189,13 +310,19 @@ func buildWSSClientTLSConfig(peer ServerPeer, tc TunnelConfig) (*tls.Config, err
 			InsecureSkipVerify: false,
 			MinVersion:         tls.VersionTLS12,
 			NextProtos:         []string{"http/1.1"},
+			VerifyConnection: func(cs tls.ConnectionState) error {
+				if cs.NegotiatedProtocol != "" && cs.NegotiatedProtocol != "http/1.1" {
+					return fmt.Errorf("unexpected ALPN protocol %q for RFC 6455 websocket", cs.NegotiatedProtocol)
+				}
+				return nil
+			},
 		}, nil
 	}
 
 	return &tls.Config{
 		ServerName:         sni,
 		RootCAs:            rootPool,
-		InsecureSkipVerify: true, // Custom VerifyConnection enforces cryptographic SHA-256 certificate pinning
+		InsecureSkipVerify: true, // Custom VerifyPeerCertificate & VerifyConnection enforce pin + hostname + expiration
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"http/1.1"},
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -264,6 +391,7 @@ type wssSafeConn struct {
 	conn      *websocket.Conn
 	writeMu   sync.Mutex
 	closeOnce sync.Once
+	closeSent atomic.Bool
 	closed    atomic.Bool
 }
 
@@ -272,13 +400,13 @@ func newWSSSafeConn(conn *websocket.Conn) *wssSafeConn {
 }
 
 func (w *wssSafeConn) writeBinary(payload []byte, timeout time.Duration) error {
-	if w.closed.Load() {
+	if w.closed.Load() || w.closeSent.Load() {
 		return net.ErrClosed
 	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	if w.closed.Load() {
+	if w.closed.Load() || w.closeSent.Load() {
 		return net.ErrClosed
 	}
 	_ = w.conn.SetWriteDeadline(time.Now().Add(timeout))
@@ -288,13 +416,13 @@ func (w *wssSafeConn) writeBinary(payload []byte, timeout time.Duration) error {
 }
 
 func (w *wssSafeConn) writePing(payload []byte, timeout time.Duration) error {
-	if w.closed.Load() {
+	if w.closed.Load() || w.closeSent.Load() {
 		return net.ErrClosed
 	}
 	w.writeMu.Lock()
 	defer w.writeMu.Unlock()
 
-	if w.closed.Load() {
+	if w.closed.Load() || w.closeSent.Load() {
 		return net.ErrClosed
 	}
 	return w.conn.WriteControl(websocket.PingMessage, payload, time.Now().Add(timeout))
@@ -315,8 +443,12 @@ func (w *wssSafeConn) writePong(payload []byte, timeout time.Duration) error {
 
 func (w *wssSafeConn) writeCloseFrame(closeCode int, text string) {
 	w.closeOnce.Do(func() {
+		w.closeSent.Store(true)
 		w.writeMu.Lock()
 		defer w.writeMu.Unlock()
+		if w.closed.Load() {
+			return
+		}
 		msg := websocket.FormatCloseMessage(closeCode, text)
 		_ = w.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(wssCloseGraceTimeout))
 	})
@@ -327,37 +459,78 @@ func (w *wssSafeConn) closeRaw() {
 	_ = w.conn.Close()
 }
 
-// Bridges a continuous bidirectional TCP byte stream (`tcpConn`) and an RFC 6455
-// WebSocket connection (`wsConn`) using binary frames, periodic Ping/Pong control
-// frames, read/write deadlines, speed throttling, and clean shutdown semantics.
+func closeWriteTCP(c net.Conn) {
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+}
+
+type wssBridgeOptions struct {
+	pingInterval          time.Duration
+	pongTimeout           time.Duration
+	writeTimeout          time.Duration
+	closeHandshakeTimeout time.Duration
+	onHealthyPing         func()
+}
+
+func defaultWSSBridgeOptions(tc TunnelConfig, onHealthyPing func()) wssBridgeOptions {
+	pingInterval, pongTimeout := resolveWSSPingTiming(tc)
+	return wssBridgeOptions{
+		pingInterval:          pingInterval,
+		pongTimeout:           pongTimeout,
+		writeTimeout:          wssWriteTimeout,
+		closeHandshakeTimeout: wssCloseHandshakeTimeout,
+		onHealthyPing:         onHealthyPing,
+	}
+}
+
+// Bridges a bidirectional TCP stream (`tcpConn`) and an RFC 6455 WebSocket (`wsConn`).
+//
+// Half-Close & Closing Handshake Semantics:
+//   - RFC 6455 Section 5.5.1 / Section 7.1.2 does not provide a separate application half-close frame;
+//     once an endpoint sends a Close control frame, it MUST NOT send any more data frames, though it
+//     MAY continue to receive data frames until the peer responds with its own Close frame.
+//   - When `tcpConn` reaches EOF first (local TCP half-close), `tcpToWS` sends a WebSocket Close frame
+//     and waits up to `closeHandshakeTimeout` for `wsToTCP` to finish forwarding any remaining inbound
+//     WebSocket BinaryMessages to `tcpConn` and receive the peer's Close response.
+//   - When `wsConn` receives a Close frame from the peer first, `SetCloseHandler` / `wsToTCP` performs
+//     a TCP half-close (`closeWriteTCP(tcpConn)`) so the local TCP endpoint sees EOF, while `tcpToWS`
+//     is given up to `closeHandshakeTimeout` to drain remaining outbound TCP bytes before sending the
+//     reply WebSocket Close frame.
 func bridgeWSSAndTCP(
 	wsConn *websocket.Conn,
 	tcpConn net.Conn,
 	tc TunnelConfig,
 	onHealthyPing func(),
 ) {
+	bridgeWSSAndTCPWithOptions(wsConn, tcpConn, tc, defaultWSSBridgeOptions(tc, onHealthyPing))
+}
+
+func bridgeWSSAndTCPWithOptions(
+	wsConn *websocket.Conn,
+	tcpConn net.Conn,
+	tc TunnelConfig,
+	opts wssBridgeOptions,
+) {
+	if opts.pingInterval <= 0 {
+		opts.pingInterval = wssDefaultPingInterval
+	}
+	if opts.pongTimeout <= 0 {
+		opts.pongTimeout = opts.pingInterval*2 + 10*time.Second
+	}
+	if opts.writeTimeout <= 0 {
+		opts.writeTimeout = wssWriteTimeout
+	}
+	if opts.closeHandshakeTimeout <= 0 {
+		opts.closeHandshakeTimeout = wssCloseHandshakeTimeout
+	}
+
 	safeWS := newWSSSafeConn(wsConn)
-	pingInterval, pongTimeout := resolveWSSPingTiming(tc)
 
-	wsConn.SetReadLimit(wssMaxIncomingMsgBytes)
-	_ = wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
-
-	wsConn.SetPongHandler(func(_ string) error {
-		if onHealthyPing != nil {
-			onHealthyPing()
-		}
-		return wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
-	})
-
-	wsConn.SetPingHandler(func(appData string) error {
-		if onHealthyPing != nil {
-			onHealthyPing()
-		}
-		_ = wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
-		return safeWS.writePong([]byte(appData), wssWriteTimeout)
-	})
-
+	var peerCloseSeen atomic.Bool
+	wsToTCPDone := make(chan struct{})
 	doneCh := make(chan struct{})
+
 	var shutdownOnce sync.Once
 	shutdownBridge := func() {
 		shutdownOnce.Do(func() {
@@ -367,6 +540,30 @@ func bridgeWSSAndTCP(
 		})
 	}
 	defer shutdownBridge()
+
+	wsConn.SetReadLimit(wssMaxIncomingMsgBytes)
+	_ = wsConn.SetReadDeadline(time.Now().Add(opts.pongTimeout))
+
+	wsConn.SetPongHandler(func(_ string) error {
+		if opts.onHealthyPing != nil {
+			opts.onHealthyPing()
+		}
+		return wsConn.SetReadDeadline(time.Now().Add(opts.pongTimeout))
+	})
+
+	wsConn.SetPingHandler(func(appData string) error {
+		if opts.onHealthyPing != nil {
+			opts.onHealthyPing()
+		}
+		_ = wsConn.SetReadDeadline(time.Now().Add(opts.pongTimeout))
+		return safeWS.writePong([]byte(appData), opts.writeTimeout)
+	})
+
+	wsConn.SetCloseHandler(func(_ int, _ string) error {
+		peerCloseSeen.Store(true)
+		closeWriteTCP(tcpConn)
+		return nil
+	})
 
 	mbLimit := parseSpeedLimit(tc.SpeedLimitMBps)
 	txLimiter := newThrottledWriter(io.Discard, &appTxBytes, mbLimit)
@@ -378,7 +575,7 @@ func bridgeWSSAndTCP(
 	// 1. WebSocket Control-Frame Keepalive (Periodic Ping -> Pong timeout detection)
 	go func() {
 		defer wg.Done()
-		ticker := time.NewTicker(pingInterval)
+		ticker := time.NewTicker(opts.pingInterval)
 		defer ticker.Stop()
 
 		var seq uint32
@@ -387,11 +584,14 @@ func bridgeWSSAndTCP(
 			case <-doneCh:
 				return
 			case <-ticker.C:
+				if safeWS.closeSent.Load() || peerCloseSeen.Load() {
+					return
+				}
 				seq++
 				var pingPayload [8]byte
 				binary.BigEndian.PutUint32(pingPayload[0:4], seq)
 				binary.BigEndian.PutUint32(pingPayload[4:8], uint32(time.Now().Unix()))
-				if err := safeWS.writePing(pingPayload[:], wssWriteTimeout); err != nil {
+				if err := safeWS.writePing(pingPayload[:], opts.writeTimeout); err != nil {
 					shutdownBridge()
 					return
 				}
@@ -407,14 +607,25 @@ func bridgeWSSAndTCP(
 			n, rErr := tcpConn.Read(buf)
 			if n > 0 {
 				_, _ = txLimiter.Write(buf[:n])
-				if wErr := safeWS.writeBinary(buf[:n], wssWriteTimeout); wErr != nil {
+				if wErr := safeWS.writeBinary(buf[:n], opts.writeTimeout); wErr != nil {
 					shutdownBridge()
 					return
 				}
 			}
 			if rErr != nil {
-				if errors.Is(rErr, io.EOF) {
+				if errors.Is(rErr, io.EOF) || peerCloseSeen.Load() {
+					// Send our RFC 6455 Close control frame.
 					safeWS.writeCloseFrame(websocket.CloseNormalClosure, "")
+					// Wait for wsToTCP to finish reading remaining data and the peer's Close response
+					// up to the bounded closeHandshakeTimeout.
+					if !peerCloseSeen.Load() {
+						_ = wsConn.SetReadDeadline(time.Now().Add(opts.closeHandshakeTimeout))
+					}
+					select {
+					case <-wsToTCPDone:
+					case <-doneCh:
+					case <-time.After(opts.closeHandshakeTimeout):
+					}
 				} else {
 					safeWS.writeCloseFrame(websocket.CloseInternalServerErr, "")
 				}
@@ -426,15 +637,44 @@ func bridgeWSSAndTCP(
 
 	// 3. WebSocket Binary Messages -> TCP
 	go func() {
-		defer wg.Done()
+		defer func() {
+			close(wsToTCPDone)
+			wg.Done()
+		}()
+
 		copyBuf := make([]byte, wssStreamChunkSize)
 		for {
 			msgType, reader, rErr := wsConn.NextReader()
 			if rErr != nil {
+				if peerCloseSeen.Load() || websocket.IsCloseError(
+					rErr,
+					websocket.CloseNormalClosure,
+					websocket.CloseGoingAway,
+					websocket.CloseNoStatusReceived,
+				) {
+					peerCloseSeen.Store(true)
+					// Propagate TCP half-close (FIN) to the local TCP connection.
+					closeWriteTCP(tcpConn)
+					// If tcpToWS has not sent our Close frame yet, bound the remaining TCP read drain
+					// so tcpToWS sends our reply Close frame and completes the handshake without deadlocking.
+					if !safeWS.closeSent.Load() {
+						drainTimer := time.AfterFunc(opts.closeHandshakeTimeout, func() {
+							_ = tcpConn.SetReadDeadline(time.Now())
+						})
+						select {
+						case <-doneCh:
+							drainTimer.Stop()
+						case <-time.After(opts.closeHandshakeTimeout + 100*time.Millisecond):
+							drainTimer.Stop()
+							shutdownBridge()
+						}
+					}
+					return
+				}
 				shutdownBridge()
 				return
 			}
-			_ = wsConn.SetReadDeadline(time.Now().Add(pongTimeout))
+			_ = wsConn.SetReadDeadline(time.Now().Add(opts.pongTimeout))
 
 			if msgType != websocket.BinaryMessage {
 				safeWS.writeCloseFrame(websocket.CloseUnsupportedData, "binary messages required")
@@ -494,19 +734,18 @@ type wssServerHandler struct {
 }
 
 func (h *wssServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if timeHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Time")); timeHdr != "" {
-		applyMasterTimeHeader(timeHdr)
-	}
-
 	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
-	effectivePeerID := h.peer.ID
-	if peerHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Peer")); peerHdr != "" {
-		effectivePeerID = peerHdr
-	}
 
-	// Engine 1: Parity Sync over HTTPS on the WSS port
+	// Engine 1: Authenticated Parity Sync over HTTPS on the WSS port
 	if syncB64 := strings.TrimSpace(r.Header.Get("X-Sahand-Sync")); syncB64 != "" {
-		handleWSSParitySyncHTTP(w, effectivePeerID, remoteHost, syncB64)
+		if err := verifyWSSPeerRequest(r, h.peer, "sync:"+syncB64); err != nil {
+			http.Error(w, "unauthorized peer sync request", http.StatusUnauthorized)
+			return
+		}
+		if timeHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Time")); timeHdr != "" {
+			applyMasterTimeHeader(timeHdr)
+		}
+		handleWSSParitySyncHTTP(w, h.peer, remoteHost, syncB64)
 		return
 	}
 
@@ -520,17 +759,31 @@ func (h *wssServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	targetPort := strings.TrimSpace(r.Header.Get("X-Target-Port"))
 
-	// Engine 1: Genuine RFC 6455 WebSocket Probe
+	// Engine 1: Authenticated RFC 6455 WebSocket Probe
 	if strings.HasPrefix(targetPort, "probe:") {
-		handleWSSProbeUpgrade(w, r, h.peer, h.tunnel, effectivePeerID, remoteHost)
+		if err := verifyWSSPeerRequest(r, h.peer, "probe:"+targetPort); err != nil {
+			http.Error(w, "unauthorized peer probe request", http.StatusUnauthorized)
+			return
+		}
+		if timeHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Time")); timeHdr != "" {
+			applyMasterTimeHeader(timeHdr)
+		}
+		handleWSSProbeUpgrade(w, r, h.peer, h.tunnel, h.peer.ID, remoteHost)
 		return
 	}
 
-	// Engine 2: Actual Traffic Forwarding
-	handleWSSIncomingTraffic(w, r, h.peer, h.tunnel, effectivePeerID, remoteHost, targetPort)
+	// Engine 2: Authenticated & Target-Port Authorized Traffic Forwarding
+	if err := verifyWSSPeerRequest(r, h.peer, "forward:"+targetPort); err != nil {
+		http.Error(w, "unauthorized peer forwarding request", http.StatusUnauthorized)
+		return
+	}
+	if timeHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Time")); timeHdr != "" {
+		applyMasterTimeHeader(timeHdr)
+	}
+	handleWSSIncomingTraffic(w, r, h.peer, h.tunnel, h.peer.ID, remoteHost, targetPort)
 }
 
-func handleWSSParitySyncHTTP(w http.ResponseWriter, effectivePeerID, remoteHost, syncPayloadB64 string) {
+func handleWSSParitySyncHTTP(w http.ResponseWriter, boundPeer ServerPeer, remoteHost, syncPayloadB64 string) {
 	raw, err := base64.StdEncoding.DecodeString(syncPayloadB64)
 	if err != nil {
 		http.Error(w, "invalid sync encoding", http.StatusBadRequest)
@@ -541,7 +794,12 @@ func handleWSSParitySyncHTTP(w http.ResponseWriter, effectivePeerID, remoteHost,
 		http.Error(w, "invalid sync payload", http.StatusBadRequest)
 		return
 	}
-	resp := processIncomingSync(effectivePeerID, remoteHost, pkt)
+	if strings.TrimSpace(pkt.SenderID) == "" || subtle.ConstantTimeCompare([]byte(pkt.PeerID), []byte(boundPeer.ID)) != 1 {
+		http.Error(w, "forged peer identity in sync payload", http.StatusUnauthorized)
+		return
+	}
+
+	resp := processIncomingSync(boundPeer.ID, remoteHost, pkt)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
@@ -594,20 +852,14 @@ func handleWSSIncomingTraffic(
 		return
 	}
 
-	if targetPort == "" {
-		ports := parsePortList(tc.ForwardPorts)
-		if len(ports) > 0 {
-			targetPort = ports[0]
-		} else {
-			targetPort = strconv.Itoa(32000 + tc.ID)
-		}
-	}
-	if portNum, err := strconv.Atoi(targetPort); err != nil || portNum < 1 || portNum > 65535 {
-		http.Error(w, "invalid target port", http.StatusBadRequest)
+	// Strictly validate targetPort against the configured tc.ForwardPorts allowlist before dialing localhost
+	authorizedPort, err := authorizeWSSTargetPort(tc, targetPort)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
-	targetConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", targetPort), 5*time.Second)
+	targetConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", authorizedPort), 5*time.Second)
 	if err != nil {
 		http.Error(w, "target service unreachable", http.StatusBadGateway)
 		return
@@ -616,7 +868,7 @@ func handleWSSIncomingTraffic(
 	enableKeepAlive(targetConn)
 
 	respHdr := http.Header{}
-	respHdr.Set("X-Sahand-Target", targetPort)
+	respHdr.Set("X-Sahand-Target", authorizedPort)
 
 	wsConn, err := wssUpgrader.Upgrade(w, r, respHdr)
 	if err != nil {
@@ -636,7 +888,7 @@ func handleWSSIncomingTraffic(
 }
 
 // ============================================================================
-// MASTER-SIDE RFC 6455 WEBSOCKET CLIENT & PROBE
+// MASTER-SIDE RFC 6455 WEBSOCKET CLIENT, PROBE & PARITY SYNC
 // ============================================================================
 
 func classifyWSSError(err error, resp *http.Response) string {
@@ -655,7 +907,12 @@ func classifyWSSError(err error, resp *http.Response) string {
 	switch {
 	case strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded"):
 		return "Timeout"
-	case strings.Contains(msg, "certificate") || strings.Contains(msg, "pin") || strings.Contains(msg, "tls") || strings.Contains(msg, "x509"):
+	case strings.Contains(msg, "certificate") ||
+		strings.Contains(msg, "pin") ||
+		strings.Contains(msg, "tls") ||
+		strings.Contains(msg, "x509") ||
+		strings.Contains(msg, "expired") ||
+		strings.Contains(msg, "hostname"):
 		return "TLS failure"
 	case strings.Contains(msg, "handshake") || strings.Contains(msg, "websocket") || strings.Contains(msg, "alpn"):
 		return "Protocol mismatch"
@@ -680,13 +937,18 @@ func probeWSS(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult
 
 	sni := normalizeWSSSNI(tc.SNI)
 	wsURL := buildWSSURL(peer.IP, tc.ListenPort, tc.WSPath)
+	probeTarget := fmt.Sprintf("probe:%d", tc.ListenPort)
 
 	reqHeader := http.Header{}
 	reqHeader.Set("Host", sni)
-	reqHeader.Set("X-Sahand-Peer", peer.ID)
 	reqHeader.Set("X-Sahand-Node", localNodeID)
 	reqHeader.Set("X-Sahand-Time", buildMasterTimeHeader())
-	reqHeader.Set("X-Target-Port", fmt.Sprintf("probe:%d", tc.ListenPort))
+	reqHeader.Set("X-Target-Port", probeTarget)
+	if err := attachWSSAuthHeaders(reqHeader, peer, "probe:"+probeTarget); err != nil {
+		res.Success = false
+		res.ErrorReason = "Authentication failure"
+		return res
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -706,7 +968,6 @@ func probeWSS(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult
 		return res
 	}
 
-	// Build a 32-byte binary probe frame: [16B prefix][8B random nonce][8B unix nano]
 	var probePayload [32]byte
 	copy(probePayload[0:16], []byte("SAHAND-WSS-PROBE"))
 	_, _ = io.ReadFull(rand.Reader, probePayload[16:24])
@@ -741,6 +1002,94 @@ func probeWSS(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult
 	return res
 }
 
+func pushWSSParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
+	tlsCfg, err := buildWSSClientTLSConfig(peer, tc)
+	if err != nil {
+		return false
+	}
+
+	stateMu.RLock()
+	senderID := appCfg.NodeID
+	role := appCfg.Role
+	certPin := appCfg.CertPin
+	stateMu.RUnlock()
+
+	padLen := 32 + randomIntN(128)
+	padHex, _ := randomHex(padLen)
+
+	pkt := SyncPacket{
+		Type:          "parity_sync",
+		SenderID:      senderID,
+		PeerID:        peer.ID,
+		MethodID:      tc.ID,
+		Port:          tc.ListenPort,
+		LatencyMS:     latencyMS,
+		ConfigVersion: peer.ConfigVersion,
+		CertPin:       certPin,
+		Padding:       padHex,
+	}
+	if role == "master" {
+		now := time.Now()
+		zName, zOff := now.Zone()
+		pkt.MasterUnix = now.Unix()
+		pkt.MasterTZName = zName
+		pkt.MasterTZOff = zOff
+		pkt.Tunnels = peer.Tunnels
+	}
+	rawPkt, err := json.Marshal(pkt)
+	if err != nil {
+		return false
+	}
+	b64 := base64.StdEncoding.EncodeToString(rawPkt)
+
+	syncURL := url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)),
+		Path:   normalizeWSSPath(tc.WSPath),
+	}
+
+	req, err := http.NewRequest(http.MethodGet, syncURL.String(), nil)
+	if err != nil {
+		return false
+	}
+	req.Host = normalizeWSSSNI(tc.SNI)
+	req.Header.Set("X-Sahand-Time", buildMasterTimeHeader())
+	req.Header.Set("X-Sahand-Sync", b64)
+	if err := attachWSSAuthHeaders(req.Header, peer, "sync:"+b64); err != nil {
+		return false
+	}
+
+	httpClient := &http.Client{
+		Timeout: 6 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig:   tlsCfg,
+			ForceAttemptHTTP2: false,
+			DisableKeepAlives: true,
+		},
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil {
+		return false
+	}
+	var syncResp SyncResponse
+	if json.Unmarshal(body, &syncResp) != nil || !syncResp.OK {
+		return false
+	}
+
+	applySyncResponseToPeer(peer.ID, syncResp)
+	return true
+}
+
 func forwardWSSTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targetPort string) {
 	defer client.Close()
 
@@ -749,13 +1098,9 @@ func forwardWSSTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, target
 		return
 	}
 
-	if strings.TrimSpace(targetPort) == "" {
-		ports := parsePortList(tc.ForwardPorts)
-		if len(ports) > 0 {
-			targetPort = ports[0]
-		} else {
-			targetPort = strconv.Itoa(32000 + tc.ID)
-		}
+	authorizedPort, err := authorizeWSSTargetPort(tc, targetPort)
+	if err != nil {
+		return
 	}
 
 	sni := normalizeWSSSNI(tc.SNI)
@@ -763,9 +1108,11 @@ func forwardWSSTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, target
 
 	reqHeader := http.Header{}
 	reqHeader.Set("Host", sni)
-	reqHeader.Set("X-Sahand-Peer", peer.ID)
-	reqHeader.Set("X-Target-Port", targetPort)
+	reqHeader.Set("X-Target-Port", authorizedPort)
 	reqHeader.Set("X-Sahand-Time", buildMasterTimeHeader())
+	if err := attachWSSAuthHeaders(reqHeader, peer, "forward:"+authorizedPort); err != nil {
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), wssHandshakeTimeout)
 	wsConn, resp, err := dialer.DialContext(ctx, wsURL, reqHeader)
