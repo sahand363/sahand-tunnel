@@ -216,6 +216,13 @@ func authorizeWSSTargetPort(tc TunnelConfig, requestedPort string) (string, erro
 // TLS VERIFICATION, DETERMINISTIC PAIR PKI & CERTIFICATE PINNING
 // ============================================================================
 
+type wssZeroReader struct{}
+
+func (wssZeroReader) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
 type wssPeerPKI struct {
 	caCert        *x509.Certificate
 	serverCert    tls.Certificate
@@ -225,7 +232,9 @@ type wssPeerPKI struct {
 // Deterministically derives a pair-specific Ed25519 Root CA and Server Certificate from the
 // shared pairing token key (`derivePeerAuthKey`) so both Master and Agent can verify each
 // other's TLS certificates across separate servers without pre-sharing random cert files.
-func buildPeerWSSPKI(peer ServerPeer, tc TunnelConfig) (*wssPeerPKI, error) {
+// Uses `wssZeroReader{}` and fixed SANs so the generated DER and SHA-256 pin are 100% identical
+// regardless of which SNI the client probes with.
+func buildPeerWSSPKI(peer ServerPeer, _ TunnelConfig) (*wssPeerPKI, error) {
 	stateMu.RLock()
 	cfgSnapshot := appCfg
 	stateMu.RUnlock()
@@ -267,7 +276,7 @@ func buildPeerWSSPKI(peer ServerPeer, tc TunnelConfig) (*wssPeerPKI, error) {
 		SubjectKeyId:          caKeyID[:20],
 	}
 
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, caPub, caPriv)
+	caDER, err := x509.CreateCertificate(wssZeroReader{}, caTmpl, caTmpl, caPub, caPriv)
 	if err != nil {
 		return nil, err
 	}
@@ -276,18 +285,8 @@ func buildPeerWSSPKI(peer ServerPeer, tc TunnelConfig) (*wssPeerPKI, error) {
 		return nil, err
 	}
 
-	sni := normalizeWSSSNI(tc.SNI)
-	dnsNames := []string{"www.speedtest.net", "localhost"}
+	dnsNames := []string{"www.speedtest.net", "localhost", "127.0.0.1", "::1"}
 	ipAddrs := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
-
-	if ip := net.ParseIP(sni); ip != nil {
-		ipAddrs = append(ipAddrs, ip)
-	} else if sni != "www.speedtest.net" && sni != "localhost" {
-		dnsNames = append(dnsNames, sni)
-	}
-	if peerIP := net.ParseIP(strings.TrimSpace(peer.IP)); peerIP != nil {
-		ipAddrs = append(ipAddrs, peerIP)
-	}
 
 	srvTmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1002),
@@ -307,7 +306,7 @@ func buildPeerWSSPKI(peer ServerPeer, tc TunnelConfig) (*wssPeerPKI, error) {
 		IPAddresses:           ipAddrs,
 	}
 
-	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, srvPub, caPriv)
+	srvDER, err := x509.CreateCertificate(wssZeroReader{}, srvTmpl, caCert, srvPub, caPriv)
 	if err != nil {
 		return nil, err
 	}
