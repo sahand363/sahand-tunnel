@@ -196,6 +196,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/servers", requireAuth(handleServers))
 	mux.HandleFunc("/api/v1/servers/action", requireAuth(handleServerAction))
 	mux.HandleFunc("/api/v1/tunnels", requireAuth(handleTunnelsUpdate))
+	mux.HandleFunc("/api/v1/tunnels/ports", requireAuth(handleBatchPortsUpdate))
 	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
 
 	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -344,7 +345,6 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Adopt the Master server's timezone from the token immediately
 	if tp.TZName != "" || tp.TZOff != 0 {
 		appCfg.MasterTZName = tp.TZName
 		appCfg.MasterTZOffsetSec = tp.TZOff
@@ -541,6 +541,9 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 			if updated.ListenPort < 1024 || updated.ListenPort > 65535 {
 				updated.ListenPort = srv.Tunnels[i].ListenPort
 			}
+			if strings.TrimSpace(updated.SpeedLimitMBps) == "" {
+				updated.SpeedLimitMBps = "0"
+			}
 			updated.Name = srv.Tunnels[i].Name
 			updated.Security = srv.Tunnels[i].Security
 			updated.TrafficType = srv.Tunnels[i].TrafficType
@@ -551,6 +554,101 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 				srv.ActivePort = updated.ListenPort
 			}
 			break
+		}
+	}
+
+	srv.ConfigVersion++
+	srv.SyncState = "pending_sync"
+	if tok, err := generatePeerToken(appCfg, *srv); err == nil {
+		srv.Token = tok
+	}
+	newVer := srv.ConfigVersion
+	newToken := srv.Token
+	peerCopy := *srv
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	syncServerListeners(peerCopy)
+	go func() {
+		for _, tc := range peerCopy.Tunnels {
+			if tc.Implemented {
+				if pushParitySyncOverMethod(peerCopy, tc, peerCopy.ActiveLatencyMS) {
+					return
+				}
+			}
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK            bool   `json:"ok"`
+		ConfigVersion int    `json:"config_version"`
+		Token         string `json:"token"`
+	}{
+		OK:            true,
+		ConfigVersion: newVer,
+		Token:         newToken,
+	})
+}
+
+type batchPortItem struct {
+	ID           int    `json:"id"`
+	ListenPort   int    `json:"listen_port"`
+	ForwardPorts string `json:"forward_ports,omitempty"`
+}
+
+func handleBatchPortsUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string          `json:"server_id"`
+		Items    []batchPortItem `json:"items"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.Lock()
+	if appCfg.Role != "master" {
+		stateMu.Unlock()
+		http.Error(w, "ports can only be edited on the master node", http.StatusForbidden)
+		return
+	}
+
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	byID := make(map[int]batchPortItem, len(req.Items))
+	for _, item := range req.Items {
+		byID[item.ID] = item
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	for i := range srv.Tunnels {
+		tid := srv.Tunnels[i].ID
+		if upd, ok := byID[tid]; ok {
+			if upd.ListenPort >= 1024 && upd.ListenPort <= 65535 {
+				srv.Tunnels[i].ListenPort = upd.ListenPort
+				if srv.ActiveMethodID == tid {
+					srv.ActivePort = upd.ListenPort
+				}
+			}
+			if strings.TrimSpace(upd.ForwardPorts) != "" {
+				srv.Tunnels[i].ForwardPorts = strings.TrimSpace(upd.ForwardPorts)
+			}
 		}
 	}
 
