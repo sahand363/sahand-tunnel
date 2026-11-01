@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -41,6 +45,149 @@ func allocateFreeUDPPort(t *testing.T) int {
 	port := uConn.LocalAddr().(*net.UDPAddr).Port
 	_ = uConn.Close()
 	return port
+}
+
+// In-memory IPv4 raw socket switch (`ip4:tcp`) used to test the complete RAW_IP backend
+// (bidirectional raw TCP packet transmission, reception, port/IP filtering, and RFC 1071 checksums)
+// in unprivileged CI environments where CAP_NET_RAW is not granted.
+type mockRawIPPacket struct {
+	srcIP      net.IP
+	rawSegment []byte
+}
+
+type mockRawIPSwitch struct {
+	mu      sync.RWMutex
+	sockets map[int]*mockRawIPSocket
+	nextID  int
+}
+
+func newMockRawIPSwitch() *mockRawIPSwitch {
+	return &mockRawIPSwitch{
+		sockets: make(map[int]*mockRawIPSocket),
+	}
+}
+
+type mockRawIPSocket struct {
+	id         int
+	sw         *mockRawIPSwitch
+	localIP    net.IP
+	inbox      chan mockRawIPPacket
+	deadlineMu sync.Mutex
+	readTimer  *time.Timer
+	deadlineCh chan struct{}
+	closed     atomic.Bool
+}
+
+func (sw *mockRawIPSwitch) newSocket(localIP net.IP) *mockRawIPSocket {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	sw.nextID++
+	s := &mockRawIPSocket{
+		id:         sw.nextID,
+		sw:         sw,
+		localIP:    cloneIP(localIP.To4()),
+		inbox:      make(chan mockRawIPPacket, 512),
+		deadlineCh: make(chan struct{}),
+	}
+	sw.sockets[s.id] = s
+	return s
+}
+
+func (s *mockRawIPSocket) WriteToIP(b []byte, addr *net.IPAddr) (int, error) {
+	if s.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+
+	srcIP := s.localIP
+	if addr != nil && addr.IP != nil && addr.IP.IsLoopback() {
+		srcIP = net.IPv4(127, 0, 0, 1).To4()
+	}
+
+	s.sw.mu.RLock()
+	targets := make([]*mockRawIPSocket, 0, len(s.sw.sockets))
+	for _, sock := range s.sw.sockets {
+		targets = append(targets, sock)
+	}
+	s.sw.mu.RUnlock()
+
+	// Just like Linux's ip4:tcp raw socket subsystem, every open ip4:tcp socket
+	// receives a copy of incoming IPPROTO_TCP segments and must filter by port/IP/checksum.
+	for _, sock := range targets {
+		if !sock.closed.Load() {
+			select {
+			case sock.inbox <- mockRawIPPacket{srcIP: cloneIP(srcIP), rawSegment: cp}:
+			default:
+			}
+		}
+	}
+	return len(b), nil
+}
+
+func (s *mockRawIPSocket) ReadFromIP(b []byte) (int, *net.IPAddr, error) {
+	if s.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	s.deadlineMu.Lock()
+	dlCh := s.deadlineCh
+	s.deadlineMu.Unlock()
+
+	select {
+	case pkt, ok := <-s.inbox:
+		if !ok {
+			return 0, nil, net.ErrClosed
+		}
+		n := copy(b, pkt.rawSegment)
+		return n, &net.IPAddr{IP: pkt.srcIP}, nil
+	case <-dlCh:
+		return 0, nil, os.ErrDeadlineExceeded
+	}
+}
+
+func (s *mockRawIPSocket) SetReadDeadline(t time.Time) error {
+	s.deadlineMu.Lock()
+	defer s.deadlineMu.Unlock()
+
+	if s.readTimer != nil {
+		s.readTimer.Stop()
+		s.readTimer = nil
+	}
+	select {
+	case <-s.deadlineCh:
+		s.deadlineCh = make(chan struct{})
+	default:
+	}
+
+	if t.IsZero() {
+		return nil
+	}
+	d := time.Until(t)
+	ch := s.deadlineCh
+	if d <= 0 {
+		close(ch)
+		return nil
+	}
+	s.readTimer = time.AfterFunc(d, func() {
+		defer func() { _ = recover() }()
+		close(ch)
+	})
+	return nil
+}
+
+func (s *mockRawIPSocket) SetWriteDeadline(_ time.Time) error {
+	return nil
+}
+
+func (s *mockRawIPSocket) Close() error {
+	if s.closed.Swap(true) {
+		return nil
+	}
+	s.sw.mu.Lock()
+	delete(s.sw.sockets, s.id)
+	s.sw.mu.Unlock()
+	close(s.inbox)
+	return nil
 }
 
 func TestSahandRawPacketCodecAndRFC1071Checksums(t *testing.T) {
@@ -177,6 +324,142 @@ func TestSahandRawSecurityAEADReplayAndKeyRotation(t *testing.T) {
 	}
 }
 
+func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
+	peer, tc := setupSahandRawTestEnv(t)
+	targetPort, closeTarget := startLocalTCPEchoTarget(t)
+	defer closeTarget()
+	tc.Enabled = true
+	tc.ForwardPorts = strconv.Itoa(targetPort)
+
+	// 1. Simulate an environment where RAW_IP initialization fails:
+	//    - "raw_ip" mode MUST fail with a clear error (never silently falling back to UDP).
+	//    - "auto" mode MUST fall back to UDP_FALLBACK and explicitly report the fallback reason.
+	//    - "udp" mode MUST initialize UDP_FALLBACK directly with no fallback warning.
+	rawIPSkipIPTablesForTest.Store(true)
+	rawIPTestHookMu.Lock()
+	rawIPCustomDialer = func(_ net.IP, _ uint16) (rawIPConnHandle, error) {
+		return nil, errors.New("operation not permitted (CAP_NET_RAW missing)")
+	}
+	rawIPTestHookMu.Unlock()
+	defer func() {
+		rawIPTestHookMu.Lock()
+		rawIPCustomDialer = nil
+		rawIPTestHookMu.Unlock()
+		rawIPSkipIPTablesForTest.Store(false)
+	}()
+
+	if _, err := openSahandRawBackend(RawTransportModeRawIP, "127.0.0.1", 0, net.IPv4(127, 0, 0, 1)); err == nil {
+		t.Fatalf("expected explicit raw_ip mode to fail when raw socket initialization fails")
+	}
+
+	autoBackend, err := openSahandRawBackend(RawTransportModeAuto, "127.0.0.1", 0, net.IPv4(127, 0, 0, 1))
+	if err != nil {
+		t.Fatalf("expected auto mode to fall back to UDP_FALLBACK, got error: %v", err)
+	}
+	if autoBackend.BackendName() != RawBackendNameUDPFallback {
+		t.Fatalf("expected autoBackend to report %q, got %q", RawBackendNameUDPFallback, autoBackend.BackendName())
+	}
+	if !strings.Contains(autoBackend.FallbackReason(), "CAP_NET_RAW") {
+		t.Fatalf("expected autoBackend.FallbackReason() to explain why RAW_IP failed, got %q", autoBackend.FallbackReason())
+	}
+	_ = autoBackend.Close()
+
+	udpBackend, err := openSahandRawBackend(RawTransportModeUDP, "127.0.0.1", 0, net.IPv4(127, 0, 0, 1))
+	if err != nil {
+		t.Fatalf("expected explicit udp mode to succeed, got: %v", err)
+	}
+	if udpBackend.BackendName() != RawBackendNameUDPFallback || udpBackend.FallbackReason() != "" {
+		t.Fatalf("unexpected UDP backend state: name=%q reason=%q", udpBackend.BackendName(), udpBackend.FallbackReason())
+	}
+	_ = udpBackend.Close()
+
+	// 2. Now enable the in-memory IPv4 raw socket switch (`ip4:tcp`) and test pure bidirectional RAW_IP mode:
+	//    - No UDP sockets are used; packets travel through `rawIPSocketBackend.SendPacket` & `ReceivePacket`.
+	//    - Verify port filtering (unrelated TCP ports are ignored) and checksum filtering.
+	sw := newMockRawIPSwitch()
+	rawIPTestHookMu.Lock()
+	rawIPCustomDialer = func(listenIP net.IP, _ uint16) (rawIPConnHandle, error) {
+		return sw.newSocket(listenIP), nil
+	}
+	rawIPTestHookMu.Unlock()
+
+	tc.ListenPort = 28924
+	tc.RawTransport = RawTransportModeRawIP
+
+	pConn, err := startSahandRawServer(peer, tc)
+	if err != nil {
+		t.Fatalf("startSahandRawServer in raw_ip mode failed: %v", err)
+	}
+	defer func() {
+		_ = pConn.Close()
+		stopSahandRawPeerResources(peer.ID)
+	}()
+
+	sahandRawMu.RLock()
+	srvMux := sahandRawServerByPeer[peer.ID]
+	sahandRawMu.RUnlock()
+	if srvMux == nil || srvMux.BackendName() != RawBackendNameRawIP {
+		t.Fatalf("expected server to run on %q backend, got %v", RawBackendNameRawIP, srvMux)
+	}
+
+	// Inject noise traffic (wrong port & corrupted checksum) into the raw IP switch to verify packet filtering
+	noiseSock := sw.newSocket(net.IPv4(127, 0, 0, 1))
+	defer noiseSock.Close()
+	wrongPortPkt, _ := encodeRawTCPPacket(rawTCPPacket{
+		SrcIP:   net.IPv4(127, 0, 0, 1).To4(),
+		DstIP:   net.IPv4(127, 0, 0, 1).To4(),
+		SrcPort: 55555,
+		DstPort: 9999, // Wrong destination port
+		SeqNum:  1,
+		Flags:   rawTCPFlagPSH | rawTCPFlagACK,
+		Payload: make([]byte, 32),
+	})
+	_, _ = noiseSock.WriteToIP(wrongPortPkt, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+
+	badCsumPkt, _ := encodeRawTCPPacket(rawTCPPacket{
+		SrcIP:   net.IPv4(127, 0, 0, 1).To4(),
+		DstIP:   net.IPv4(127, 0, 0, 1).To4(),
+		SrcPort: 55555,
+		DstPort: uint16(tc.ListenPort),
+		SeqNum:  2,
+		Flags:   rawTCPFlagPSH | rawTCPFlagACK,
+		Payload: make([]byte, 32),
+	})
+	// Corrupt checksum
+	binary.BigEndian.PutUint16(badCsumPkt[16:18], 0xDEAD)
+	_, _ = noiseSock.WriteToIP(badCsumPkt, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
+
+	// Probe & open a bidirectional stream strictly over the RAW_IP backend
+	probeRes := probeSahandRaw(peer, tc, "master-node-01")
+	if !probeRes.Success {
+		t.Fatalf("expected probeSahandRaw over RAW_IP backend to succeed, got: %s", probeRes.ErrorReason)
+	}
+
+	sess, err := getOrDialSahandRawSession(peer, tc, 4*time.Second)
+	if err != nil {
+		t.Fatalf("getOrDialSahandRawSession over RAW_IP failed: %v", err)
+	}
+	if sess.BackendName() != RawBackendNameRawIP {
+		t.Fatalf("expected client session to use %q, got %q", RawBackendNameRawIP, sess.BackendName())
+	}
+
+	st, err := sess.OpenStream(uint16(targetPort), 4*time.Second)
+	if err != nil {
+		t.Fatalf("OpenStream over RAW_IP failed: %v", err)
+	}
+	defer st.Close()
+
+	testData := make([]byte, 16*1024)
+	_, _ = io.ReadFull(rand.Reader, testData)
+	go func() {
+		_, _ = st.Write(testData)
+	}()
+	echoed := make([]byte, len(testData))
+	if _, err := io.ReadFull(st, echoed); err != nil || !bytes.Equal(testData, echoed) {
+		t.Fatalf("bidirectional stream over RAW_IP failed: err=%v", err)
+	}
+}
+
 func TestSahandRawTransportLossDuplicationAndReordering(t *testing.T) {
 	peer, tc := setupSahandRawTestEnv(t)
 
@@ -184,6 +467,7 @@ func TestSahandRawTransportLossDuplicationAndReordering(t *testing.T) {
 	defer closeTarget()
 
 	tc.ListenPort = allocateFreeUDPPort(t)
+	tc.RawTransport = RawTransportModeUDP
 	tc.Enabled = true
 	tc.ForwardPorts = strconv.Itoa(targetPort)
 
@@ -206,16 +490,13 @@ func TestSahandRawTransportLossDuplicationAndReordering(t *testing.T) {
 	sess.setTxHook(func(sendFn func() error) error {
 		n := pktCounter.Add(1)
 		if n%5 == 0 {
-			// Simulate packet loss (forces ARQ retransmission)
 			return nil
 		}
 		if n%7 == 0 {
-			// Simulate packet duplication
 			_ = sendFn()
 			return sendFn()
 		}
 		if n%9 == 0 {
-			// Simulate packet reordering
 			reorderWG.Add(1)
 			go func() {
 				defer reorderWG.Done()
@@ -285,6 +566,7 @@ func TestSahandRawProbeParitySyncAndMultiStreamIntegration(t *testing.T) {
 	}()
 
 	tc.ListenPort = allocateFreeUDPPort(t)
+	tc.RawTransport = RawTransportModeAuto
 	tc.Enabled = true
 	tc.StreamLimit = 32
 	tc.ForwardPorts = strconv.Itoa(tcpTarget1) + "," + strconv.Itoa(tcpTarget2) + "," + strconv.Itoa(udpTargetPort)
