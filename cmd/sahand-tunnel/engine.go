@@ -174,6 +174,16 @@ func formatConnectionInitiator(localRole, direction string) string {
 	return "Master → Agent"
 }
 
+// Strict Role-Aware Binding:
+// ONLY the Entry Server (Master) binds ForwardPorts (0.0.0.0:<targetPort>) to accept incoming client connections.
+// The Exit Server (Agent, where X-UI / Xray runs) NEVER binds ForwardPorts, preventing port collisions when Xray restarts.
+func shouldBindEntryPorts() bool {
+	stateMu.RLock()
+	role := appCfg.Role
+	stateMu.RUnlock()
+	return role != "agent"
+}
+
 func stopAllServerListeners(peerID string) {
 	stopQUICPeerResources(peerID)
 	stopRatholePeerResources(peerID)
@@ -207,6 +217,7 @@ func syncServerListeners(peer ServerPeer) {
 	var bound []net.Listener
 	var boundUDP []net.PacketConn
 	tunnels := normalizeTunnels(peer.Tunnels)
+	bindEntries := shouldBindEntryPorts()
 
 	for _, tun := range tunnels {
 		tc := tun
@@ -223,7 +234,7 @@ func syncServerListeners(peer ServerPeer) {
 			if tLn != nil {
 				bound = append(bound, tLn)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -245,7 +256,7 @@ func syncServerListeners(peer ServerPeer) {
 			if ln, err := startHTTPLongPollingServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -264,7 +275,7 @@ func syncServerListeners(peer ServerPeer) {
 			if ln, err := startTLSOverTCPServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -287,7 +298,7 @@ func syncServerListeners(peer ServerPeer) {
 			if tLn != nil {
 				bound = append(bound, tLn)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -313,7 +324,7 @@ func syncServerListeners(peer ServerPeer) {
 			if tLn != nil {
 				bound = append(bound, tLn)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -335,7 +346,7 @@ func syncServerListeners(peer ServerPeer) {
 			if ln, err := startRawTCPServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -354,7 +365,7 @@ func syncServerListeners(peer ServerPeer) {
 			if ln, err := startSSHTunnelServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -373,7 +384,7 @@ func syncServerListeners(peer ServerPeer) {
 			if ln, err := startSOCKS5ServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -397,13 +408,15 @@ func syncServerListeners(peer ServerPeer) {
 			}
 			if tc.Enabled && peer.IP != "" {
 				startReverseTCPClientWorker(peer, tc)
-				forwardPorts := parsePortList(tc.ForwardPorts)
-				for _, fp := range forwardPorts {
-					targetPort := fp
-					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
-					if err == nil {
-						bound = append(bound, entryLn)
-						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+				if bindEntries {
+					forwardPorts := parsePortList(tc.ForwardPorts)
+					for _, fp := range forwardPorts {
+						targetPort := fp
+						entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+						if err == nil {
+							bound = append(bound, entryLn)
+							go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						}
 					}
 				}
 			}
@@ -415,7 +428,7 @@ func syncServerListeners(peer ServerPeer) {
 			if ln, err := startNoiseStealthServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
 			}
-			if tc.Enabled && peer.IP != "" {
+			if tc.Enabled && peer.IP != "" && bindEntries {
 				forwardPorts := parsePortList(tc.ForwardPorts)
 				for _, fp := range forwardPorts {
 					targetPort := fp
@@ -439,15 +452,17 @@ func syncServerListeners(peer ServerPeer) {
 			}
 			if tc.Enabled && peer.IP != "" {
 				startRatholeReverseClient(peer, tc)
-				forwardPorts := parsePortList(tc.ForwardPorts)
-				for _, fp := range forwardPorts {
-					targetPort := fp
-					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
-					if err == nil {
-						bound = append(bound, entryLn)
-						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
-						if udpEntry := startRatholeUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
-							boundUDP = append(boundUDP, udpEntry)
+				if bindEntries {
+					forwardPorts := parsePortList(tc.ForwardPorts)
+					for _, fp := range forwardPorts {
+						targetPort := fp
+						entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+						if err == nil {
+							bound = append(bound, entryLn)
+							go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+							if udpEntry := startRatholeUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+								boundUDP = append(boundUDP, udpEntry)
+							}
 						}
 					}
 				}
@@ -484,8 +499,8 @@ func syncServerListeners(peer ServerPeer) {
 			go acceptTunnelServerLoop(ln, peer.ID, tc)
 		}
 
-		// Engine 2: Bind local forwarding entry ports ONLY when Traffic Tunnel toggle is ON
-		if tc.Enabled && peer.IP != "" {
+		// Engine 2: Bind local forwarding entry ports ONLY on the Entry Server (Master) when Traffic Tunnel toggle is ON
+		if tc.Enabled && peer.IP != "" && bindEntries {
 			forwardPorts := parsePortList(tc.ForwardPorts)
 			for _, fp := range forwardPorts {
 				targetPort := fp
@@ -632,7 +647,7 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		if len(ports) > 0 {
 			targetPort = ports[0]
 		} else {
-			targetPort = "2053"
+			targetPort = strconv.Itoa(32000 + tc.ID)
 		}
 	}
 
