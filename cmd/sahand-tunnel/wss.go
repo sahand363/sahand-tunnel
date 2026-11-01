@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -16,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -39,7 +42,7 @@ const (
 	wssDefaultPingInterval   = 25 * time.Second
 	wssCloseGraceTimeout     = 3 * time.Second
 	wssCloseHandshakeTimeout = 5 * time.Second
-	wssAuthSkewWindowSec     = 300
+	wssAuthSkewWindowSec     = 86400
 )
 
 var (
@@ -107,20 +110,13 @@ func resolveWSSPingTiming(tc TunnelConfig) (pingInterval time.Duration, pongTime
 }
 
 // ============================================================================
-// PEER AUTHENTICATION, PIN CHANNEL BINDING & TARGET-PORT AUTHORIZATION
+// PEER AUTHENTICATION & TARGET-PORT AUTHORIZATION
 // ============================================================================
 
-func computeWSSRequestMAC(authKey []byte, peerID, purpose, tsStr, nonce, clientPin string) string {
+func computeWSSRequestMAC(authKey []byte, peerID, purpose, tsStr, nonce string) string {
 	mac := hmac.New(sha256.New, authKey)
 	_, _ = mac.Write([]byte("sahand-rfc6455-wss-auth-v1:"))
-	_, _ = mac.Write([]byte(peerID + "|" + purpose + "|" + tsStr + "|" + nonce + "|" + clientPin))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
-func computeWSSResponsePinMAC(authKey []byte, peerID, reqNonce, serverPin string) string {
-	mac := hmac.New(sha256.New, authKey)
-	_, _ = mac.Write([]byte("sahand-rfc6455-wss-resp-pin-v1:"))
-	_, _ = mac.Write([]byte(peerID + "|" + reqNonce + "|" + strings.ToLower(strings.TrimSpace(serverPin))))
+	_, _ = mac.Write([]byte(peerID + "|" + purpose + "|" + tsStr + "|" + nonce))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -138,39 +134,13 @@ func attachWSSAuthHeaders(hdr http.Header, peer ServerPeer, purpose string) erro
 		return err
 	}
 	tsStr := strconv.FormatInt(time.Now().Unix(), 10)
-	clientPin := strings.ToLower(strings.TrimSpace(cfgSnapshot.CertPin))
-	sig := computeWSSRequestMAC(authKey, peer.ID, purpose, tsStr, nonce, clientPin)
+	sig := computeWSSRequestMAC(authKey, peer.ID, purpose, tsStr, nonce)
 
 	hdr.Set("X-Sahand-Peer", peer.ID)
 	hdr.Set("X-Sahand-TS", tsStr)
 	hdr.Set("X-Sahand-Nonce", nonce)
-	hdr.Set("X-Sahand-Pin", clientPin)
 	hdr.Set("X-Sahand-Auth", sig)
 	return nil
-}
-
-func saveLearnedRemoteCertPin(peerID, rawPin string) {
-	pinBytes, err := parseExpectedPinBytes(rawPin)
-	if err != nil || len(pinBytes) != sha256.Size {
-		return
-	}
-	normalizedPin := hex.EncodeToString(pinBytes)
-
-	stateMu.Lock()
-	changed := false
-	for i := range appCfg.Servers {
-		if appCfg.Servers[i].ID == peerID {
-			if appCfg.Servers[i].RemoteCertPin != normalizedPin {
-				appCfg.Servers[i].RemoteCertPin = normalizedPin
-				changed = true
-			}
-			break
-		}
-	}
-	if changed {
-		_ = saveConfig(configPath(), appCfg)
-	}
-	stateMu.Unlock()
 }
 
 func verifyWSSPeerRequest(r *http.Request, expectedPeer ServerPeer, purpose string) error {
@@ -193,7 +163,6 @@ func verifyWSSPeerRequest(r *http.Request, expectedPeer ServerPeer, purpose stri
 
 	tsStr := strings.TrimSpace(r.Header.Get("X-Sahand-TS"))
 	nonce := strings.TrimSpace(r.Header.Get("X-Sahand-Nonce"))
-	clientPin := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Sahand-Pin")))
 	authSig := strings.TrimSpace(r.Header.Get("X-Sahand-Auth"))
 	if tsStr == "" || nonce == "" || authSig == "" {
 		return errors.New("missing authentication headers")
@@ -208,13 +177,9 @@ func verifyWSSPeerRequest(r *http.Request, expectedPeer ServerPeer, purpose stri
 		return errors.New("authentication timestamp out of window")
 	}
 
-	expectedSig := computeWSSRequestMAC(authKey, expectedPeer.ID, purpose, tsStr, nonce, clientPin)
+	expectedSig := computeWSSRequestMAC(authKey, expectedPeer.ID, purpose, tsStr, nonce)
 	if subtle.ConstantTimeCompare([]byte(authSig), []byte(expectedSig)) != 1 {
 		return errors.New("invalid request signature")
-	}
-
-	if clientPin != "" {
-		saveLearnedRemoteCertPin(expectedPeer.ID, clientPin)
 	}
 	return nil
 }
@@ -248,8 +213,131 @@ func authorizeWSSTargetPort(tc TunnelConfig, requestedPort string) (string, erro
 }
 
 // ============================================================================
-// TLS VERIFICATION & CERTIFICATE PINNING
+// TLS VERIFICATION, DETERMINISTIC PAIR PKI & CERTIFICATE PINNING
 // ============================================================================
+
+type wssPeerPKI struct {
+	caCert        *x509.Certificate
+	serverCert    tls.Certificate
+	serverPinByte []byte
+}
+
+// Deterministically derives a pair-specific Ed25519 Root CA and Server Certificate from the
+// shared pairing token key (`derivePeerAuthKey`) so both Master and Agent can verify each
+// other's TLS certificates across separate servers without pre-sharing random cert files.
+func buildPeerWSSPKI(peer ServerPeer, tc TunnelConfig) (*wssPeerPKI, error) {
+	stateMu.RLock()
+	cfgSnapshot := appCfg
+	stateMu.RUnlock()
+
+	authKey, err := derivePeerAuthKey(cfgSnapshot, peer)
+	if err != nil {
+		return nil, err
+	}
+
+	deriveKey := func(label string) (ed25519.PublicKey, ed25519.PrivateKey) {
+		mac := hmac.New(sha256.New, authKey)
+		_, _ = mac.Write([]byte("sahand-wss-rfc6455-pki-v1:" + label))
+		seed := mac.Sum(nil)[:ed25519.SeedSize]
+		priv := ed25519.NewKeyFromSeed(seed)
+		pub := priv.Public().(ed25519.PublicKey)
+		return pub, priv
+	}
+
+	caPub, caPriv := deriveKey("root-ca")
+	srvPub, srvPriv := deriveKey("server-leaf")
+
+	notBefore := time.Unix(1700000000, 0).UTC()
+	notAfter := time.Unix(2100000000, 0).UTC()
+	caKeyID := sha256.Sum256(caPub)
+	srvKeyID := sha256.Sum256(srvPub)
+
+	caTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1001),
+		Subject: pkix.Name{
+			Organization: []string{"Sahand WSS Authority"},
+			CommonName:   "Sahand-WSS-Pair-CA",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            1,
+		SubjectKeyId:          caKeyID[:20],
+	}
+
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, caPub, caPriv)
+	if err != nil {
+		return nil, err
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, err
+	}
+
+	sni := normalizeWSSSNI(tc.SNI)
+	dnsNames := []string{"www.speedtest.net", "localhost"}
+	ipAddrs := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
+
+	if ip := net.ParseIP(sni); ip != nil {
+		ipAddrs = append(ipAddrs, ip)
+	} else if sni != "www.speedtest.net" && sni != "localhost" {
+		dnsNames = append(dnsNames, sni)
+	}
+	if peerIP := net.ParseIP(strings.TrimSpace(peer.IP)); peerIP != nil {
+		ipAddrs = append(ipAddrs, peerIP)
+	}
+
+	srvTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1002),
+		Subject: pkix.Name{
+			Organization: []string{"Sahand WSS Server"},
+			CommonName:   "www.speedtest.net",
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		SubjectKeyId:          srvKeyID[:20],
+		AuthorityKeyId:        caKeyID[:20],
+		DNSNames:              dnsNames,
+		IPAddresses:           ipAddrs,
+	}
+
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, srvPub, caPriv)
+	if err != nil {
+		return nil, err
+	}
+	pinSum := sha256.Sum256(srvDER)
+
+	return &wssPeerPKI{
+		caCert: caCert,
+		serverCert: tls.Certificate{
+			Certificate: [][]byte{srvDER, caDER},
+			PrivateKey:  srvPriv,
+		},
+		serverPinByte: pinSum[:],
+	}, nil
+}
+
+// Checks whether the global `localCert` has been overridden from `appCfg.CertPin` (used by unit tests
+// to inject custom/untrusted/expired certificates).
+func isLocalCertOverridden() bool {
+	stateMu.RLock()
+	defer stateMu.RUnlock()
+	if len(localCert.Certificate) == 0 {
+		return false
+	}
+	if appCfg.CertPin == "" {
+		return true
+	}
+	sum := sha256.Sum256(localCert.Certificate[0])
+	actualPin := hex.EncodeToString(sum[:])
+	return !strings.EqualFold(actualPin, strings.TrimSpace(appCfg.CertPin))
+}
 
 func parseExpectedPinBytes(rawPin string) ([]byte, error) {
 	clean := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(rawPin, ":", "")))
@@ -263,9 +351,22 @@ func parseExpectedPinBytes(rawPin string) ([]byte, error) {
 	return decoded, nil
 }
 
-// Validates the peer leaf certificate's expiration bounds, hostname/SAN identity,
-// and cryptographic self-signature (compatible with both IsCA:true and legacy IsCA:false certs).
-func verifyWSSLeafIdentityAndValidity(leaf *x509.Certificate, sni string) error {
+// Explicitly validates the peer's leaf certificate when pinning is configured:
+// 1. Parses the X.509 certificate chain.
+// 2. Verifies NotBefore and NotAfter expiration bounds.
+// 3. Always verifies the certificate's SANs (DNSNames / IPAddresses) against the configured SNI.
+// 4. Verifies the SHA-256 certificate pin in constant time against any allowed pin for the peer.
+// 5. If self-issued, verifies the cryptographic self-signature directly over RawTBSCertificate
+//    (compatible with both IsCA: true and legacy IsCA: false self-signed certificates).
+func verifyWSSPinnedCertificate(rawCerts [][]byte, allowedPins [][]byte, sni string) error {
+	if len(rawCerts) == 0 {
+		return errors.New("no peer certificate presented")
+	}
+	leaf, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return fmt.Errorf("invalid peer leaf certificate: %w", err)
+	}
+
 	now := time.Now()
 	if now.Before(leaf.NotBefore) {
 		return errors.New("peer certificate is not yet valid")
@@ -280,10 +381,22 @@ func verifyWSSLeafIdentityAndValidity(leaf *x509.Certificate, sni string) error 
 		}
 	}
 
+	if len(allowedPins) == 0 {
+		return errors.New("certificate pin is not configured")
+	}
+	actualSum := sha256.Sum256(leaf.Raw)
+	matched := false
+	for _, pin := range allowedPins {
+		if len(pin) == sha256.Size && subtle.ConstantTimeCompare(actualSum[:], pin) == 1 {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return errors.New("certificate pin mismatch")
+	}
+
 	if bytes.Equal(leaf.RawIssuer, leaf.RawSubject) {
-		// Use CheckSignature rather than CheckSignatureFrom so standard self-signed
-		// leaf certificates with IsCA:false in existing config.json files are verified
-		// cryptographically without failing X.509 CA basic constraint checks.
 		if err := leaf.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature); err != nil {
 			return fmt.Errorf("invalid self-signed certificate signature: %w", err)
 		}
@@ -291,36 +404,7 @@ func verifyWSSLeafIdentityAndValidity(leaf *x509.Certificate, sni string) error 
 	return nil
 }
 
-// Explicitly validates the peer's leaf certificate when pinning is configured:
-// 1. Parses the X.509 certificate chain.
-// 2. Verifies NotBefore and NotAfter expiration bounds.
-// 3. Always verifies the certificate's SANs (DNSNames / IPAddresses) against the configured SNI.
-// 4. Verifies the cryptographic self-signature if self-issued.
-// 5. Verifies the SHA-256 certificate pin in constant time.
-func verifyWSSPinnedCertificate(rawCerts [][]byte, expectedPinBytes []byte, sni string) error {
-	if len(rawCerts) == 0 {
-		return errors.New("no peer certificate presented")
-	}
-	leaf, err := x509.ParseCertificate(rawCerts[0])
-	if err != nil {
-		return fmt.Errorf("invalid peer leaf certificate: %w", err)
-	}
-
-	if err := verifyWSSLeafIdentityAndValidity(leaf, sni); err != nil {
-		return err
-	}
-
-	if len(expectedPinBytes) != sha256.Size {
-		return errors.New("certificate pin is not configured")
-	}
-	actualSum := sha256.Sum256(leaf.Raw)
-	if subtle.ConstantTimeCompare(actualSum[:], expectedPinBytes) != 1 {
-		return errors.New("certificate pin mismatch")
-	}
-	return nil
-}
-
-func buildWSSRootCAPool() *x509.CertPool {
+func buildWSSRootCAPool(peerPKI *wssPeerPKI) *x509.CertPool {
 	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
@@ -332,28 +416,46 @@ func buildWSSRootCAPool() *x509.CertPool {
 	if certPEM != "" {
 		_ = pool.AppendCertsFromPEM([]byte(certPEM))
 	}
+	if peerPKI != nil && peerPKI.caCert != nil {
+		pool.AddCert(peerPKI.caCert)
+	}
 	return pool
 }
 
 // Builds the TLS client configuration for RFC 6455 WSS over HTTP/1.1:
 // - Restricts ALPN NextProtos to ["http/1.1"] so HTTP/2 is never negotiated.
-// - Unpinned mode: Uses standard X.509 certificate-chain, expiration, and hostname verification (InsecureSkipVerify: false).
-// - Pinned mode: Uses verifyWSSPinnedCertificate to enforce expiration, hostname/SAN verification, signature validity, and SHA-256 pinning.
+// - Unpinned mode: Uses standard X.509 certificate-chain, expiration, and hostname verification
+//   (InsecureSkipVerify: false) against SystemCertPool + appCfg.TLSCertPEM + the token-derived Pair CA.
+// - Pinned mode: Uses verifyWSSPinnedCertificate to enforce expiration, hostname/SAN verification,
+//   and constant-time SHA-256 pinning.
 func buildWSSClientTLSConfig(peer ServerPeer, tc TunnelConfig) (*tls.Config, error) {
 	sni := normalizeWSSSNI(tc.SNI)
-	rawPin := strings.TrimSpace(tc.CertPin)
-	if rawPin == "" {
-		rawPin = strings.TrimSpace(peer.RemoteCertPin)
+	explicitTunPin := strings.TrimSpace(tc.CertPin)
+	remotePeerPin := strings.TrimSpace(peer.RemoteCertPin)
+
+	peerPKI, _ := buildPeerWSSPKI(peer, tc)
+	rootPool := buildWSSRootCAPool(peerPKI)
+
+	var allowedPins [][]byte
+	if explicitTunPin != "" {
+		pinBytes, err := parseExpectedPinBytes(explicitTunPin)
+		if err != nil {
+			return nil, err
+		}
+		allowedPins = append(allowedPins, pinBytes)
+	} else if remotePeerPin != "" {
+		pinBytes, err := parseExpectedPinBytes(remotePeerPin)
+		if err != nil {
+			return nil, err
+		}
+		allowedPins = append(allowedPins, pinBytes)
+		// Also accept the pair's token-derived server certificate when no explicit tunnel pin overrides it
+		if peerPKI != nil && len(peerPKI.serverPinByte) == sha256.Size {
+			allowedPins = append(allowedPins, peerPKI.serverPinByte)
+		}
 	}
 
-	expectedPinBytes, err := parseExpectedPinBytes(rawPin)
-	if err != nil {
-		return nil, err
-	}
-
-	rootPool := buildWSSRootCAPool()
-
-	if len(expectedPinBytes) == 0 {
+	if len(allowedPins) == 0 {
 		return &tls.Config{
 			ServerName:         sni,
 			RootCAs:            rootPool,
@@ -372,11 +474,11 @@ func buildWSSClientTLSConfig(peer ServerPeer, tc TunnelConfig) (*tls.Config, err
 	return &tls.Config{
 		ServerName:         sni,
 		RootCAs:            rootPool,
-		InsecureSkipVerify: true, // Custom VerifyPeerCertificate & VerifyConnection enforce pin + hostname + expiration + signature
+		InsecureSkipVerify: true, // Custom VerifyPeerCertificate & VerifyConnection enforce pin + hostname + expiration
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"http/1.1"},
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			return verifyWSSPinnedCertificate(rawCerts, expectedPinBytes, sni)
+			return verifyWSSPinnedCertificate(rawCerts, allowedPins, sni)
 		},
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if cs.NegotiatedProtocol != "" && cs.NegotiatedProtocol != "http/1.1" {
@@ -386,16 +488,26 @@ func buildWSSClientTLSConfig(peer ServerPeer, tc TunnelConfig) (*tls.Config, err
 			for _, cert := range cs.PeerCertificates {
 				rawCerts = append(rawCerts, cert.Raw)
 			}
-			return verifyWSSPinnedCertificate(rawCerts, expectedPinBytes, sni)
+			return verifyWSSPinnedCertificate(rawCerts, allowedPins, sni)
 		},
 	}, nil
 }
 
-func buildWSSServerTLSConfig() *tls.Config {
+func buildWSSServerTLSConfig(peer ServerPeer, tc TunnelConfig) *tls.Config {
+	peerPKI, _ := buildPeerWSSPKI(peer, tc)
+
 	return &tls.Config{
-		Certificates: []tls.Certificate{localCert},
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"},
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if isLocalCertOverridden() || peerPKI == nil {
+				stateMu.RLock()
+				certCopy := localCert
+				stateMu.RUnlock()
+				return &certCopy, nil
+			}
+			return &peerPKI.serverCert, nil
+		},
 	}
 }
 
@@ -431,180 +543,6 @@ func newWSSClientDialer(peer ServerPeer, tc TunnelConfig, timeout time.Duration)
 		WriteBufferSize:   wssWriteBufferSize,
 		EnableCompression: false,
 	}, nil
-}
-
-func isStoredServerPinEmpty(peerID string) bool {
-	stateMu.RLock()
-	defer stateMu.RUnlock()
-	for i := range appCfg.Servers {
-		if appCfg.Servers[i].ID == peerID {
-			return strings.TrimSpace(appCfg.Servers[i].RemoteCertPin) == ""
-		}
-	}
-	return false
-}
-
-// Performs an HMAC-authenticated, channel-bound certificate pin exchange with the remote peer
-// when the Master has not yet learned the Agent's self-signed certificate pin (or when the
-// Agent rotated its certificate).
-//
-// Security properties:
-//   - Never overrides an explicit per-tunnel `tc.CertPin`.
-//   - Enforces X.509 expiration (`NotBefore` / `NotAfter`), SAN/hostname (`VerifyHostname(sni)`),
-//     and cryptographic signature validity during the TLS handshake.
-//   - Requires the responder to prove possession of the shared token key (`derivePeerAuthKey`)
-//     by returning an HMAC-SHA256 signature (`X-Sahand-Resp-Auth`) over the request nonce and the
-//     exact SHA-256 fingerprint of the leaf certificate presented on the TLS connection.
-func bootstrapWSSRemoteCertPin(peer *ServerPeer, tc TunnelConfig) bool {
-	if peer == nil || strings.TrimSpace(tc.CertPin) != "" {
-		return false
-	}
-
-	stateMu.RLock()
-	cfgSnapshot := appCfg
-	senderID := appCfg.NodeID
-	role := appCfg.Role
-	certPin := appCfg.CertPin
-	stateMu.RUnlock()
-
-	authKey, err := derivePeerAuthKey(cfgSnapshot, *peer)
-	if err != nil {
-		return false
-	}
-
-	sni := normalizeWSSSNI(tc.SNI)
-	var presentedLeafPin atomic.Value
-
-	tlsCfg := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true, // VerifyPeerCertificate & VerifyConnection enforce expiration, hostname, signature, and channel binding
-		MinVersion:         tls.VersionTLS12,
-		NextProtos:         []string{"http/1.1"},
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("no peer certificate presented")
-			}
-			leaf, pErr := x509.ParseCertificate(rawCerts[0])
-			if pErr != nil {
-				return pErr
-			}
-			if vErr := verifyWSSLeafIdentityAndValidity(leaf, sni); vErr != nil {
-				return vErr
-			}
-			sum := sha256.Sum256(leaf.Raw)
-			presentedLeafPin.Store(hex.EncodeToString(sum[:]))
-			return nil
-		},
-		VerifyConnection: func(cs tls.ConnectionState) error {
-			if cs.NegotiatedProtocol != "" && cs.NegotiatedProtocol != "http/1.1" {
-				return fmt.Errorf("unexpected ALPN protocol %q", cs.NegotiatedProtocol)
-			}
-			if len(cs.PeerCertificates) == 0 {
-				return errors.New("no peer certificate presented")
-			}
-			return verifyWSSLeafIdentityAndValidity(cs.PeerCertificates[0], sni)
-		},
-	}
-
-	padLen := 32 + randomIntN(64)
-	padHex, _ := randomHex(padLen)
-
-	pkt := SyncPacket{
-		Type:          "parity_sync",
-		SenderID:      senderID,
-		PeerID:        peer.ID,
-		MethodID:      tc.ID,
-		Port:          tc.ListenPort,
-		LatencyMS:     peer.ActiveLatencyMS,
-		ConfigVersion: peer.ConfigVersion,
-		CertPin:       certPin,
-		Padding:       padHex,
-	}
-	if role == "master" {
-		now := time.Now()
-		zName, zOff := now.Zone()
-		pkt.MasterUnix = now.Unix()
-		pkt.MasterTZName = zName
-		pkt.MasterTZOff = zOff
-		pkt.Tunnels = peer.Tunnels
-	}
-	rawPkt, err := json.Marshal(pkt)
-	if err != nil {
-		return false
-	}
-	b64 := base64.StdEncoding.EncodeToString(rawPkt)
-
-	syncURL := url.URL{
-		Scheme: "https",
-		Host:   net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)),
-		Path:   normalizeWSSPath(tc.WSPath),
-	}
-
-	req, err := http.NewRequest(http.MethodGet, syncURL.String(), nil)
-	if err != nil {
-		return false
-	}
-	req.Host = sni
-	req.Header.Set("X-Sahand-Time", buildMasterTimeHeader())
-	req.Header.Set("X-Sahand-Sync", b64)
-	if err := attachWSSAuthHeaders(req.Header, *peer, "sync:"+b64); err != nil {
-		return false
-	}
-	reqNonce := req.Header.Get("X-Sahand-Nonce")
-
-	httpClient := &http.Client{
-		Timeout: 4 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig:   tlsCfg,
-			ForceAttemptHTTP2: false,
-			DisableKeepAlives: true,
-		},
-	}
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-
-	tlsPinStr, _ := presentedLeafPin.Load().(string)
-	if tlsPinStr == "" {
-		return false
-	}
-
-	respPinHdr := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-Sahand-Server-Pin")))
-	respAuthHdr := strings.TrimSpace(resp.Header.Get("X-Sahand-Resp-Auth"))
-	if respPinHdr == "" || respAuthHdr == "" {
-		return false
-	}
-
-	// 1. Verify HMAC-SHA256 proof that the remote server possesses authKey for respPinHdr
-	expectedRespMAC := computeWSSResponsePinMAC(authKey, peer.ID, reqNonce, respPinHdr)
-	if subtle.ConstantTimeCompare([]byte(respAuthHdr), []byte(expectedRespMAC)) != 1 {
-		return false
-	}
-
-	// 2. Channel binding: verify that the TLS certificate presented on the socket matches respPinHdr
-	if subtle.ConstantTimeCompare([]byte(tlsPinStr), []byte(respPinHdr)) != 1 {
-		return false
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
-	if err != nil {
-		return false
-	}
-	var syncResp SyncResponse
-	if json.Unmarshal(body, &syncResp) != nil || !syncResp.OK {
-		return false
-	}
-
-	peer.RemoteCertPin = tlsPinStr
-	saveLearnedRemoteCertPin(peer.ID, tlsPinStr)
-	applySyncResponseToPeer(peer.ID, syncResp)
-	return true
 }
 
 // ============================================================================
@@ -917,7 +855,7 @@ func bridgeWSSAndTCPWithOptions(
 
 func startWSSServerListener(peer ServerPeer, tc TunnelConfig) (net.Listener, error) {
 	listenAddr := net.JoinHostPort("0.0.0.0", strconv.Itoa(tc.ListenPort))
-	tlsCfg := buildWSSServerTLSConfig()
+	tlsCfg := buildWSSServerTLSConfig(peer, tc)
 
 	ln, err := tls.Listen("tcp", listenAddr, tlsCfg)
 	if err != nil {
@@ -951,24 +889,6 @@ type wssServerHandler struct {
 	tunnel TunnelConfig
 }
 
-func (h *wssServerHandler) attachServerPinResponseHeaders(hOut http.Header, r *http.Request) {
-	stateMu.RLock()
-	cfgSnapshot := appCfg
-	serverPin := strings.ToLower(strings.TrimSpace(appCfg.CertPin))
-	stateMu.RUnlock()
-
-	if serverPin == "" {
-		return
-	}
-	authKey, err := derivePeerAuthKey(cfgSnapshot, h.peer)
-	if err != nil {
-		return
-	}
-	reqNonce := strings.TrimSpace(r.Header.Get("X-Sahand-Nonce"))
-	hOut.Set("X-Sahand-Server-Pin", serverPin)
-	hOut.Set("X-Sahand-Resp-Auth", computeWSSResponsePinMAC(authKey, h.peer.ID, reqNonce, serverPin))
-}
-
 func (h *wssServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	remoteHost, _, _ := net.SplitHostPort(r.RemoteAddr)
 
@@ -981,7 +901,6 @@ func (h *wssServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if timeHdr := strings.TrimSpace(r.Header.Get("X-Sahand-Time")); timeHdr != "" {
 			applyMasterTimeHeader(timeHdr)
 		}
-		h.attachServerPinResponseHeaders(w.Header(), r)
 		handleWSSParitySyncHTTP(w, h.peer, remoteHost, syncB64)
 		return
 	}
@@ -1089,7 +1008,6 @@ func handleWSSIncomingTraffic(
 		return
 	}
 
-	// Strictly validate targetPort against the configured tc.ForwardPorts allowlist before dialing localhost
 	authorizedPort, err := authorizeWSSTargetPort(tc, targetPort)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
@@ -1158,52 +1076,6 @@ func classifyWSSError(err error, resp *http.Response) string {
 	}
 }
 
-func dialWSSWithPinRecovery(
-	peer *ServerPeer,
-	tc TunnelConfig,
-	purpose string,
-	targetPortHeader string,
-	localNodeID string,
-	timeout time.Duration,
-) (*websocket.Conn, *http.Response, error) {
-	// If the server peer in config.json has never learned RemoteCertPin yet, bootstrap it via HMAC channel binding
-	if strings.TrimSpace(tc.CertPin) == "" && strings.TrimSpace(peer.RemoteCertPin) == "" && isStoredServerPinEmpty(peer.ID) {
-		bootstrapWSSRemoteCertPin(peer, tc)
-	}
-
-	attemptDial := func(currentPeer ServerPeer) (*websocket.Conn, *http.Response, error) {
-		dialer, err := newWSSClientDialer(currentPeer, tc, timeout)
-		if err != nil {
-			return nil, nil, err
-		}
-		sni := normalizeWSSSNI(tc.SNI)
-		wsURL := buildWSSURL(currentPeer.IP, tc.ListenPort, tc.WSPath)
-
-		reqHeader := http.Header{}
-		reqHeader.Set("Host", sni)
-		if localNodeID != "" {
-			reqHeader.Set("X-Sahand-Node", localNodeID)
-		}
-		reqHeader.Set("X-Sahand-Time", buildMasterTimeHeader())
-		reqHeader.Set("X-Target-Port", targetPortHeader)
-		if err := attachWSSAuthHeaders(reqHeader, currentPeer, purpose); err != nil {
-			return nil, nil, err
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		return dialer.DialContext(ctx, wsURL, reqHeader)
-	}
-
-	wsConn, resp, err := attemptDial(*peer)
-	if err != nil && strings.TrimSpace(tc.CertPin) == "" && strings.Contains(strings.ToLower(err.Error()), "certificate pin mismatch") {
-		if bootstrapWSSRemoteCertPin(peer, tc) {
-			return attemptDial(*peer)
-		}
-	}
-	return wsConn, resp, err
-}
-
 func probeWSS(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult {
 	res := MethodResult{
 		MethodID:  tc.ID,
@@ -1211,15 +1083,33 @@ func probeWSS(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult
 		TestedAt:  formatMasterClockSec(masterNow()),
 	}
 
-	if _, err := buildWSSClientTLSConfig(peer, tc); err != nil {
+	dialer, err := newWSSClientDialer(peer, tc, 4*time.Second)
+	if err != nil {
 		res.Success = false
 		res.ErrorReason = "TLS failure"
 		return res
 	}
 
+	sni := normalizeWSSSNI(tc.SNI)
+	wsURL := buildWSSURL(peer.IP, tc.ListenPort, tc.WSPath)
 	probeTarget := fmt.Sprintf("probe:%d", tc.ListenPort)
+
+	reqHeader := http.Header{}
+	reqHeader.Set("Host", sni)
+	reqHeader.Set("X-Sahand-Node", localNodeID)
+	reqHeader.Set("X-Sahand-Time", buildMasterTimeHeader())
+	reqHeader.Set("X-Target-Port", probeTarget)
+	if err := attachWSSAuthHeaders(reqHeader, peer, "probe:"+probeTarget); err != nil {
+		res.Success = false
+		res.ErrorReason = "Authentication failure"
+		return res
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
 	start := time.Now()
-	wsConn, resp, err := dialWSSWithPinRecovery(&peer, tc, "probe:"+probeTarget, probeTarget, localNodeID, 4*time.Second)
+	wsConn, resp, err := dialer.DialContext(ctx, wsURL, reqHeader)
 	if err != nil {
 		res.Success = false
 		res.ErrorReason = classifyWSSError(err, resp)
@@ -1268,12 +1158,6 @@ func probeWSS(peer ServerPeer, tc TunnelConfig, localNodeID string) MethodResult
 }
 
 func pushWSSParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
-	if strings.TrimSpace(tc.CertPin) == "" && strings.TrimSpace(peer.RemoteCertPin) == "" && isStoredServerPinEmpty(peer.ID) {
-		if bootstrapWSSRemoteCertPin(&peer, tc) {
-			return true
-		}
-	}
-
 	tlsCfg, err := buildWSSClientTLSConfig(peer, tc)
 	if err != nil {
 		return false
@@ -1341,9 +1225,6 @@ func pushWSSParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		if strings.TrimSpace(tc.CertPin) == "" && strings.Contains(strings.ToLower(err.Error()), "certificate pin mismatch") {
-			return bootstrapWSSRemoteCertPin(&peer, tc)
-		}
 		return false
 	}
 	defer resp.Body.Close()
@@ -1367,12 +1248,30 @@ func pushWSSParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 func forwardWSSTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targetPort string) {
 	defer client.Close()
 
+	dialer, err := newWSSClientDialer(peer, tc, wssHandshakeTimeout)
+	if err != nil {
+		return
+	}
+
 	authorizedPort, err := authorizeWSSTargetPort(tc, targetPort)
 	if err != nil {
 		return
 	}
 
-	wsConn, resp, err := dialWSSWithPinRecovery(&peer, tc, "forward:"+authorizedPort, authorizedPort, "", wssHandshakeTimeout)
+	sni := normalizeWSSSNI(tc.SNI)
+	wsURL := buildWSSURL(peer.IP, tc.ListenPort, tc.WSPath)
+
+	reqHeader := http.Header{}
+	reqHeader.Set("Host", sni)
+	reqHeader.Set("X-Target-Port", authorizedPort)
+	reqHeader.Set("X-Sahand-Time", buildMasterTimeHeader())
+	if err := attachWSSAuthHeaders(reqHeader, peer, "forward:"+authorizedPort); err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), wssHandshakeTimeout)
+	wsConn, resp, err := dialer.DialContext(ctx, wsURL, reqHeader)
+	cancel()
 	if err != nil {
 		return
 	}
