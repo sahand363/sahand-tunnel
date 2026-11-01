@@ -215,7 +215,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{21, "TCP Multiplex", 68, "tcp", true, 28021, []string{"listen_port", "forward_ports", "stream_limit", "speed_limit_mbps"}},
 	{22, "WebSocket Multiplex", 89, "tcp", true, 28022, []string{"listen_port", "forward_ports", "sni", "ws_path", "stream_limit", "speed_limit_mbps"}},
 	{23, "HTTP Upgrade", 74, "tcp", true, 28023, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
-	{24, "Reverse Proxy", 78, "tcp", false, 28024, []string{"listen_port", "forward_ports", "sni"}},
+	{24, "SAHAND-RAW", 96, "tcp+udp", true, 28024, []string{"listen_port", "forward_ports", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{25, "Secure Relay", 85, "tcp", false, 28025, []string{"listen_port", "forward_ports", "sni"}},
 	{26, "Stream Bridge", 80, "tcp+udp", false, 28026, []string{"listen_port", "forward_ports", "stream_limit"}},
 	{27, "Fallback TCP", 42, "tcp", false, 28027, []string{"listen_port", "forward_ports"}},
