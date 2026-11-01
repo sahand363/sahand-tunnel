@@ -53,8 +53,9 @@ const (
 	rawARQCmdUDPDatagram   byte = 0x09
 	rawARQCmdProbe         byte = 0x0A
 	rawARQCmdProbeAck      byte = 0x0B
-	rawARQCmdParitySync    byte = 0x0C
-	rawARQCmdParityAck     byte = 0x0D
+
+	// Reserved virtual port for multiplexed Parity Sync streams
+	rawARQPortParitySync uint16 = 0xFFFF
 
 	rawTCPHeaderLen      = 20
 	rawEnvelopeHeaderLen = 18
@@ -75,22 +76,35 @@ var rawPacketBufPool = sync.Pool{
 	},
 }
 
+func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
+	if addr == nil {
+		return nil
+	}
+	ipCopy := make(net.IP, len(addr.IP))
+	copy(ipCopy, addr.IP)
+	return &net.UDPAddr{
+		IP:   ipCopy,
+		Port: addr.Port,
+		Zone: addr.Zone,
+	}
+}
+
 // ============================================================================
 // LAYER A: RAW PACKET ENGINE (RFC 793 TCP CODEC, CHECKSUMS, SOCKET & IPTABLES)
 // ============================================================================
 
 type rawTCPPacket struct {
-	SrcIP      net.IP
-	DstIP      net.IP
-	SrcPort    uint16
-	DstPort    uint16
-	SeqNum     uint32
-	AckNum     uint32
-	Flags      byte
-	Window     uint16
-	Checksum   uint16
-	Urgent     uint16
-	Payload    []byte
+	SrcIP    net.IP
+	DstIP    net.IP
+	SrcPort  uint16
+	DstPort  uint16
+	SeqNum   uint32
+	AckNum   uint32
+	Flags    byte
+	Window   uint16
+	Checksum uint16
+	Urgent   uint16
+	Payload  []byte
 }
 
 // Computes the RFC 1071 16-bit one's complement checksum over the IPv4 or IPv6
@@ -206,9 +220,11 @@ func decodeRawTCPPacket(srcIP, dstIP net.IP, raw []byte, verifyChecksum bool) (r
 	return pkt, nil
 }
 
-// Discovers the local IPv4 or IPv6 interface address used to reach remoteHost.
 func resolveOutboundInterfaceIP(remoteHost string) net.IP {
 	ip := net.ParseIP(strings.TrimSpace(remoteHost))
+	if ip != nil && ip.IsLoopback() {
+		return net.IPv4(127, 0, 0, 1)
+	}
 	network := "udp4"
 	target := "8.8.8.8:53"
 	if ip != nil {
@@ -217,13 +233,15 @@ func resolveOutboundInterfaceIP(remoteHost string) net.IP {
 		}
 		target = net.JoinHostPort(ip.String(), "80")
 	}
-	c, err := net.DialTimeout(network, target, time.Second)
+	c, err := net.DialTimeout(network, target, 500*time.Millisecond)
 	if err != nil {
 		return net.IPv4(127, 0, 0, 1)
 	}
 	defer c.Close()
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP != nil {
-		return udpAddr.IP
+		ipCopy := make(net.IP, len(udpAddr.IP))
+		copy(ipCopy, udpAddr.IP)
+		return ipCopy
 	}
 	return net.IPv4(127, 0, 0, 1)
 }
@@ -256,7 +274,7 @@ func (g *rawKernelRSTGuard) release() {
 	if !g.applied || runtime.GOOS != "linux" || g.port <= 0 {
 		return
 	}
-	portStr := strconv.Itoa(g.port)
+	portStr := strconv.Itoa(port)
 	_ = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "--sport", portStr, "--tcp-flags", "RST", "RST", "-j", "DROP").Run()
 	g.applied = false
 }
@@ -266,12 +284,12 @@ func (g *rawKernelRSTGuard) release() {
 // carrier so raw TCP packets with RFC 793 headers & RFC 1071 checksums are transmitted seamlessly
 // across both privileged bare-metal hosts and unprivileged/NAT environments.
 type rawPacketEndpoint struct {
-	localIP    net.IP
-	localPort  uint16
-	udpConn    *net.UDPConn
-	rawIPConn  *net.IPConn
-	rstGuard   *rawKernelRSTGuard
-	closed     atomic.Bool
+	localIP   net.IP
+	localPort uint16
+	udpConn   *net.UDPConn
+	rawIPConn *net.IPConn
+	rstGuard  *rawKernelRSTGuard
+	closed    atomic.Bool
 }
 
 func listenRawPacketEndpoint(listenIP string, port int) (*rawPacketEndpoint, error) {
@@ -295,7 +313,6 @@ func listenRawPacketEndpoint(listenIP string, port int) (*rawPacketEndpoint, err
 		ep.localIP = net.IPv4(127, 0, 0, 1)
 	}
 
-	// Attempt to open a native IPv4 raw TCP socket (requires root / CAP_NET_RAW).
 	if ipAddr, err := net.ResolveIPAddr("ip4", listenIP); err == nil {
 		if rawConn, err := net.ListenIP("ip4:tcp", ipAddr); err == nil {
 			ep.rawIPConn = rawConn
@@ -307,12 +324,11 @@ func listenRawPacketEndpoint(listenIP string, port int) (*rawPacketEndpoint, err
 }
 
 func (ep *rawPacketEndpoint) sendRawPacket(dstAddr *net.UDPAddr, seq, ack uint32, flags byte, wirePayload []byte) error {
-	if ep.closed.Load() {
+	if ep.closed.Load() || dstAddr == nil {
 		return net.ErrClosed
 	}
-	srcIP := resolveOutboundInterfaceIP(dstAddr.IP.String())
 	pkt := rawTCPPacket{
-		SrcIP:   srcIP,
+		SrcIP:   ep.localIP,
 		DstIP:   dstAddr.IP,
 		SrcPort: ep.localPort,
 		DstPort: uint16(dstAddr.Port),
@@ -327,7 +343,6 @@ func (ep *rawPacketEndpoint) sendRawPacket(dstAddr *net.UDPAddr, seq, ack uint32
 		return err
 	}
 
-	// Transmit over the UDP raw-frame socket carrier (and raw IP socket when bound to an external IP).
 	_, err = ep.udpConn.WriteToUDP(rawFrame, dstAddr)
 	if ep.rawIPConn != nil && !dstAddr.IP.IsLoopback() {
 		_, _ = ep.rawIPConn.WriteToIP(rawFrame, &net.IPAddr{IP: dstAddr.IP})
@@ -356,7 +371,7 @@ func (ep *rawPacketEndpoint) readRawPacket(deadline time.Time) (rawTCPPacket, *n
 	if err != nil {
 		return empty, nil, err
 	}
-	return pkt, rAddr, nil
+	return pkt, cloneUDPAddr(rAddr), nil
 }
 
 func (ep *rawPacketEndpoint) Close() error {
@@ -383,7 +398,6 @@ type rawReplayFilter struct {
 }
 
 // Sliding 64-packet anti-replay window (RFC 6479).
-// Returns true if seq is fresh and records it; returns false if duplicate or too old.
 func (rf *rawReplayFilter) accept(seq uint64) bool {
 	if seq == 0 {
 		return false
@@ -606,8 +620,6 @@ func (sb *rawSecurityBox) OpenEnvelope(wire []byte) (byte, []byte, uint64, error
 // MUTUAL X25519 HANDSHAKE FRAMES
 // ============================================================================
 
-// HandshakeInit wire layout (78 bytes):
-// [Magic:2][Ver:1][Type:1(0x01)][SessionID:4][Timestamp:8][ClientPub:32][HMAC-SHA256:30]
 const rawHandshakeFrameLen = 78
 
 func buildRawHandshakePacket(pktType byte, sessionID uint32, pubKey []byte, authKey []byte) ([]byte, error) {
@@ -677,13 +689,17 @@ type rawARQFrame struct {
 func encodeRawARQFrame(f rawARQFrame) []byte {
 	out := make([]byte, rawARQHeaderLen+len(f.Payload))
 	out[0] = f.Cmd
-	binary.BigEndian.PutUint32(out[1:5], f.StreamID)
+	binary.BigEndian.PutUint32(out[1:5], frameStreamID(f))
 	binary.BigEndian.PutUint16(out[5:7], f.TargetPort)
 	binary.BigEndian.PutUint32(out[7:11], f.FragSeq)
 	binary.BigEndian.PutUint32(out[11:15], f.AckUna)
 	binary.BigEndian.PutUint16(out[15:17], uint16(len(f.Payload)))
 	copy(out[rawARQHeaderLen:], f.Payload)
 	return out
+}
+
+func frameStreamID(f rawARQFrame) uint32 {
+	return f.StreamID
 }
 
 func decodeRawARQFrame(raw []byte) (rawARQFrame, error) {
@@ -707,24 +723,23 @@ func decodeRawARQFrame(raw []byte) (rawARQFrame, error) {
 	return f, nil
 }
 
-// Reliable in-order ARQ reassembly & retransmission state per multiplexed stream.
 type rawMuxStream struct {
-	session      *rawARQSession
-	id           uint32
-	targetPort   uint16
-	sendMu       sync.Mutex
-	nextSendSeq  uint32
-	ackChMapMu   sync.Mutex
-	ackWaiters   map[uint32]chan struct{}
-	recvMu       sync.Mutex
-	expectedSeq  uint32
-	oooBuffer    map[uint32][]byte
-	readCh       chan []byte
-	readMu       sync.Mutex
-	readBuf      bytes.Buffer
-	openAckCh    chan bool
-	closedRead   atomic.Bool
-	closedWrite  atomic.Bool
+	session     *rawARQSession
+	id          uint32
+	targetPort  uint16
+	sendMu      sync.Mutex
+	nextSendSeq uint32
+	ackChMapMu  sync.Mutex
+	ackWaiters  map[uint32]chan struct{}
+	recvMu      sync.Mutex
+	expectedSeq uint32
+	oooBuffer   map[uint32][]byte
+	readCh      chan []byte
+	readMu      sync.Mutex
+	readBuf     bytes.Buffer
+	openAckCh   chan bool
+	closedRead  atomic.Bool
+	closedWrite atomic.Bool
 }
 
 func newRawMuxStream(sess *rawARQSession, id uint32, targetPort uint16) *rawMuxStream {
@@ -749,7 +764,6 @@ func (st *rawMuxStream) handleIncomingSegment(fragSeq uint32, payload []byte) {
 		return
 	}
 
-	// Always acknowledge the fragment so the sender stops retransmitting it.
 	_ = st.session.sendEncryptedARQFrame(rawARQFrame{
 		Cmd:        rawARQCmdACK,
 		StreamID:   st.id,
@@ -759,11 +773,9 @@ func (st *rawMuxStream) handleIncomingSegment(fragSeq uint32, payload []byte) {
 	})
 
 	if fragSeq < st.expectedSeq {
-		// Duplicate segment already delivered
 		return
 	}
 	if fragSeq > st.expectedSeq {
-		// Out-of-order segment: buffer up to 128 segments
 		if len(st.oooBuffer) < 128 {
 			if _, exists := st.oooBuffer[fragSeq]; !exists {
 				cp := make([]byte, len(payload))
@@ -774,7 +786,6 @@ func (st *rawMuxStream) handleIncomingSegment(fragSeq uint32, payload []byte) {
 		return
 	}
 
-	// fragSeq == st.expectedSeq: deliver immediately and drain contiguous buffered segments
 	st.deliverChunkLocked(payload)
 	st.expectedSeq++
 
@@ -911,7 +922,6 @@ func (st *rawMuxStream) sendReliableSegment(fragSeq uint32, chunk []byte) error 
 			timer.Stop()
 			return io.ErrClosedPipe
 		case <-timer.C:
-			// Exponential backoff clamped to 600ms
 			rto = rto * 3 / 2
 			if rto > 600*time.Millisecond {
 				rto = 600 * time.Millisecond
@@ -943,11 +953,13 @@ func (st *rawMuxStream) Close() error {
 // SAHAND-RAW ARQ SESSION MANAGER
 // ============================================================================
 
+type rawTxHookFunc func(sendFn func() error) error
+
 type rawARQSession struct {
 	sessionID    uint32
 	endpoint     *rawPacketEndpoint
 	ownsEndpoint bool
-	remoteAddr   *net.UDPAddr
+	remoteAddr   atomic.Pointer[net.UDPAddr]
 	sec          *rawSecurityBox
 	peer         ServerPeer
 	tunnel       TunnelConfig
@@ -957,15 +969,15 @@ type rawARQSession struct {
 	streams      map[uint32]*rawMuxStream
 	nextStreamID atomic.Uint32
 
-	pingMu       sync.Mutex
-	pingWaiters  map[uint32]chan time.Duration
+	pingMu      sync.Mutex
+	pingWaiters map[uint32]chan time.Duration
 
-	ctrlMu       sync.Mutex
-	ctrlWaiters  map[uint32]chan []byte
+	ctrlMu      sync.Mutex
+	ctrlWaiters map[uint32]chan []byte
 
-	rttMu        sync.Mutex
-	srtt         time.Duration
-	rto          time.Duration
+	rttMu sync.Mutex
+	srtt  time.Duration
+	rto   time.Duration
 
 	tcpSeq       atomic.Uint32
 	tcpAck       atomic.Uint32
@@ -973,8 +985,7 @@ type rawARQSession struct {
 	stopCh       chan struct{}
 	closed       atomic.Bool
 
-	// Optional test hook for simulating packet loss, duplication, or reordering
-	txHook       func(sendFn func() error) error
+	txHook atomic.Pointer[rawTxHookFunc]
 }
 
 func newRawARQSession(
@@ -991,7 +1002,6 @@ func newRawARQSession(
 		sessionID:    sessionID,
 		endpoint:     ep,
 		ownsEndpoint: ownsEndpoint,
-		remoteAddr:   remoteAddr,
 		sec:          sec,
 		peer:         peer,
 		tunnel:       tc,
@@ -1003,6 +1013,7 @@ func newRawARQSession(
 		rto:          80 * time.Millisecond,
 		stopCh:       make(chan struct{}),
 	}
+	s.remoteAddr.Store(cloneUDPAddr(remoteAddr))
 	if isClient {
 		s.nextStreamID.Store(1)
 	} else {
@@ -1012,6 +1023,14 @@ func newRawARQSession(
 	s.tcpAck.Store(uint32(10000 + randomIntN(90000)))
 	s.lastActivity.Store(time.Now().Unix())
 	return s
+}
+
+func (s *rawARQSession) setTxHook(fn rawTxHookFunc) {
+	if fn == nil {
+		s.txHook.Store(nil)
+		return
+	}
+	s.txHook.Store(&fn)
 }
 
 func (s *rawARQSession) updateRTT(sample time.Duration) {
@@ -1040,6 +1059,11 @@ func (s *rawARQSession) sendEncryptedARQFrame(frame rawARQFrame) error {
 	if s.closed.Load() {
 		return net.ErrClosed
 	}
+	dst := s.remoteAddr.Load()
+	if dst == nil {
+		return net.ErrClosed
+	}
+
 	rawFrame := encodeRawARQFrame(frame)
 	wire, pktSeq, err := s.sec.SealEnvelope(rawPktData, rawFrame)
 	if err != nil {
@@ -1051,10 +1075,13 @@ func (s *rawARQSession) sendEncryptedARQFrame(frame rawARQFrame) error {
 	flags := rawTCPFlagPSH | rawTCPFlagACK
 
 	sendFn := func() error {
-		return s.endpoint.sendRawPacket(s.remoteAddr, seq, ack, flags, wire)
+		if s.closed.Load() {
+			return net.ErrClosed
+		}
+		return s.endpoint.sendRawPacket(dst, seq, ack, flags, wire)
 	}
-	if s.txHook != nil {
-		return s.txHook(sendFn)
+	if hookPtr := s.txHook.Load(); hookPtr != nil && *hookPtr != nil {
+		return (*hookPtr)(sendFn)
 	}
 	return sendFn()
 }
@@ -1070,7 +1097,10 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 
 	s.lastActivity.Store(time.Now().Unix())
 	if senderAddr != nil {
-		s.remoteAddr = senderAddr
+		cur := s.remoteAddr.Load()
+		if cur == nil || cur.Port != senderAddr.Port || !cur.IP.Equal(senderAddr.IP) {
+			s.remoteAddr.Store(cloneUDPAddr(senderAddr))
+		}
 	}
 
 	frame, err := decodeRawARQFrame(plaintext)
@@ -1093,7 +1123,7 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 			_ = s.sendEncryptedARQFrame(rawARQFrame{
 				Cmd:        rawARQCmdStreamOpenAck,
 				StreamID:   frame.StreamID,
-				TargetPort: 1, // non-zero = rejected
+				TargetPort: 1,
 			})
 			return
 		}
@@ -1102,6 +1132,13 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 			st = newRawMuxStream(s, frame.StreamID, frame.TargetPort)
 			s.streams[frame.StreamID] = st
 			go s.handleServerStream(st, frame.TargetPort)
+		} else {
+			// Retransmitted StreamOpen: re-send StreamOpenAck
+			_ = s.sendEncryptedARQFrame(rawARQFrame{
+				Cmd:        rawARQCmdStreamOpenAck,
+				StreamID:   frame.StreamID,
+				TargetPort: 0,
+			})
 		}
 		s.streamsMu.Unlock()
 
@@ -1142,8 +1179,8 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 		}
 
 	case rawARQCmdPing:
-		if s.remoteAddr != nil {
-			markPeerConnectedInbound(s.peer.ID, s.remoteAddr.IP.String(), s.tunnel.ID, s.tunnel.ListenPort, 1)
+		if rem := s.remoteAddr.Load(); rem != nil {
+			markPeerConnectedInbound(s.peer.ID, rem.IP.String(), s.tunnel.ID, s.tunnel.ListenPort, 1)
 		}
 		_ = s.sendEncryptedARQFrame(rawARQFrame{
 			Cmd:      rawARQCmdPong,
@@ -1166,8 +1203,8 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 		if len(frame.Payload) > 0 {
 			applyMasterTimeHeader(string(frame.Payload))
 		}
-		if s.remoteAddr != nil {
-			markPeerConnectedInbound(s.peer.ID, s.remoteAddr.IP.String(), s.tunnel.ID, s.tunnel.ListenPort, 1)
+		if rem := s.remoteAddr.Load(); rem != nil {
+			markPeerConnectedInbound(s.peer.ID, rem.IP.String(), s.tunnel.ID, s.tunnel.ListenPort, 1)
 		}
 		_ = s.sendEncryptedARQFrame(rawARQFrame{
 			Cmd:     rawARQCmdProbeAck,
@@ -1175,7 +1212,7 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 			Payload: []byte(buildMasterTimeHeader()),
 		})
 
-	case rawARQCmdProbeAck, rawARQCmdParityAck:
+	case rawARQCmdProbeAck:
 		s.ctrlMu.Lock()
 		if ch, ok := s.ctrlWaiters[frame.FragSeq]; ok {
 			cp := make([]byte, len(frame.Payload))
@@ -1186,23 +1223,6 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 			}
 		}
 		s.ctrlMu.Unlock()
-
-	case rawARQCmdParitySync:
-		var pkt SyncPacket
-		if json.Unmarshal(frame.Payload, &pkt) == nil {
-			remoteIP := ""
-			if s.remoteAddr != nil {
-				remoteIP = s.remoteAddr.IP.String()
-			}
-			resp := processIncomingSync(s.peer.ID, remoteIP, pkt)
-			if respBytes, err := json.Marshal(resp); err == nil {
-				_ = s.sendEncryptedARQFrame(rawARQFrame{
-					Cmd:     rawARQCmdParityAck,
-					FragSeq: frame.FragSeq,
-					Payload: respBytes,
-				})
-			}
-		}
 
 	case rawARQCmdUDPDatagram:
 		if !s.tunnel.Enabled {
@@ -1254,6 +1274,24 @@ func (s *rawARQSession) forwardUDPDatagramToLocal(udpSessionID uint32, targetPor
 func (s *rawARQSession) handleServerStream(st *rawMuxStream, targetPort uint16) {
 	defer st.Close()
 
+	// Engine 1: Multiplexed Parity Sync Stream (supports multi-kilobyte SyncPacket/SyncResponse)
+	if targetPort == rawARQPortParitySync {
+		if err := s.sendEncryptedARQFrame(rawARQFrame{
+			Cmd:        rawARQCmdStreamOpenAck,
+			StreamID:   st.id,
+			TargetPort: 0,
+		}); err != nil {
+			return
+		}
+		remoteHost := ""
+		if rem := s.remoteAddr.Load(); rem != nil {
+			remoteHost = rem.IP.String()
+		}
+		handleWebTransportParitySyncStream(st, s.peer.ID, remoteHost)
+		return
+	}
+
+	// Engine 2: Authorized Target Port Stream
 	if !s.tunnel.Enabled {
 		_ = s.sendEncryptedARQFrame(rawARQFrame{
 			Cmd:        rawARQCmdStreamOpenAck,
@@ -1476,6 +1514,7 @@ func (s *rawARQSession) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+	s.setTxHook(nil)
 	close(s.stopCh)
 	if s.ownsEndpoint && s.endpoint != nil {
 		_ = s.endpoint.Close()
@@ -1580,7 +1619,6 @@ func (sm *rawServerMux) serveLoop() {
 			continue
 		}
 
-		// Check if this is an X25519 HandshakeInit packet
 		if len(pkt.Payload) == rawHandshakeFrameLen && pkt.Payload[3] == rawPktHandshakeInit {
 			sm.handleHandshakeInit(pkt, clientAddr)
 			continue
@@ -1676,6 +1714,7 @@ func getOrDialSahandRawSession(peer ServerPeer, tc TunnelConfig, timeout time.Du
 	if err != nil {
 		return nil, err
 	}
+	ep.localIP = resolveOutboundInterfaceIP(peer.IP)
 
 	curve := ecdh.X25519()
 	cliPriv, err := curve.GenerateKey(rand.Reader)
@@ -1805,6 +1844,13 @@ func pushSahandRawParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) 
 		return false
 	}
 
+	st, err := sess.OpenStream(rawARQPortParitySync, 4*time.Second)
+	if err != nil {
+		_ = sess.Close()
+		return false
+	}
+	defer st.Close()
+
 	stateMu.RLock()
 	senderID := appCfg.NodeID
 	role := appCfg.Role
@@ -1835,17 +1881,33 @@ func pushSahandRawParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) 
 	}
 
 	rawPkt, err := json.Marshal(pkt)
-	if err != nil || len(rawPkt) > rawMaxFragmentPayload {
-		return false
-	}
-
-	repBytes, _, err := sess.ExchangeControlFrame(rawARQCmdParitySync, rawPkt, 4*time.Second)
 	if err != nil {
 		return false
 	}
 
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(rawPkt)))
+	if _, err := st.Write(lenBuf[:]); err != nil {
+		return false
+	}
+	if _, err := st.Write(rawPkt); err != nil {
+		return false
+	}
+
+	if _, err := io.ReadFull(st, lenBuf[:]); err != nil {
+		return false
+	}
+	respLen := binary.BigEndian.Uint32(lenBuf[:])
+	if respLen == 0 || respLen > 256*1024 {
+		return false
+	}
+	respBytes := make([]byte, respLen)
+	if _, err := io.ReadFull(st, respBytes); err != nil {
+		return false
+	}
+
 	var resp SyncResponse
-	if json.Unmarshal(repBytes, &resp) != nil || !resp.OK {
+	if json.Unmarshal(respBytes, &resp) != nil || !resp.OK {
 		return false
 	}
 
@@ -1967,13 +2029,8 @@ func startSahandRawUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetPor
 			sid, ok := uFwd.byAddr[addrKey]
 			if !ok {
 				sid = uFwd.nextSID.Add(1)
-				addrCopy := &net.UDPAddr{
-					IP:   append([]byte(nil), cliAddr.IP...),
-					Port: cliAddr.Port,
-					Zone: cliAddr.Zone,
-				}
 				uFwd.byAddr[addrKey] = sid
-				uFwd.bySID[sid] = addrCopy
+				uFwd.bySID[sid] = cloneUDPAddr(cliAddr)
 			}
 			uFwd.mu.Unlock()
 
