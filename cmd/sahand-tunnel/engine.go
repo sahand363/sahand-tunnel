@@ -194,6 +194,7 @@ func stopAllServerListeners(peerID string) {
 	stopWebTransportPeerResources(peerID)
 	stopTCPMultiplexPeerResources(peerID)
 	stopWSMultiplexPeerResources(peerID)
+	stopSahandRawPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -222,6 +223,28 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 24 (SAHAND-RAW): Raw Packet Tunnel Engine (RFC 793 Framing + X25519/ChaCha20-Poly1305 + ARQ + Mux)
+		if tc.ID == 24 {
+			if pConn, err := startSahandRawServer(peer, tc); err == nil && pConn != nil {
+				boundUDP = append(boundUDP, pConn)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startSahandRawUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
 			continue
 		}
 
@@ -813,6 +836,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardWSMultiplexTraffic(client, peer, tc, targetPort)
 	case 23:
 		forwardHTTPUpgradeTraffic(client, peer, tc, targetPort)
+	case 24:
+		forwardSahandRawTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -1037,6 +1062,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeWSMultiplex(peer, tc, localNodeID)
 	case 23:
 		res = probeHTTPUpgrade(peer, tc, localNodeID)
+	case 24:
+		res = probeSahandRaw(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -1047,6 +1074,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 24:
+		return pushSahandRawParitySync(peer, tc, latencyMS)
 	case 1:
 		return pushWSSParitySync(peer, tc, latencyMS)
 	case 23:
