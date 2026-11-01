@@ -182,6 +182,7 @@ func shouldBindEntryPorts() bool {
 }
 
 func stopAllServerListeners(peerID string) {
+	stopWSSPeerResources(peerID)
 	stopQUICPeerResources(peerID)
 	stopRatholePeerResources(peerID)
 	stopNoiseStealthPeerResources(peerID)
@@ -221,6 +222,25 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 01 (WSS): Standards-compliant RFC 6455 WebSocket Secure Server & Upgrader
+		if tc.ID == 1 {
+			if ln, err := startWSSServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
 			continue
 		}
 
@@ -632,16 +652,14 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		return
 	}
 
-	var wsKey, targetPort, syncPayloadB64, tunnelMode, peerHeader, timeHeader string
+	var targetPort, syncPayloadB64, tunnelMode, peerHeader, timeHeader string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil || line == "\r\n" || line == "\n" {
 			break
 		}
 		low := strings.ToLower(line)
-		if strings.HasPrefix(low, "sec-websocket-key:") {
-			wsKey = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
-		} else if strings.HasPrefix(low, "x-target-port:") {
+		if strings.HasPrefix(low, "x-target-port:") {
 			targetPort = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
 		} else if strings.HasPrefix(low, "x-sahand-sync:") {
 			syncPayloadB64 = strings.TrimSpace(strings.SplitN(line, ":", 2)[1])
@@ -688,7 +706,7 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		return
 	}
 
-	// Engine 1: Discovery Probe (responds regardless of Traffic Tunnel toggle, and marks peer CONNECTED)
+	// Engine 1: Discovery Probe (Methods 02–08)
 	if strings.HasPrefix(targetPort, "probe:") {
 		markPeerConnectedInbound(effectivePeerID, remoteHost, tc.ID, tc.ListenPort, 1)
 		switch {
@@ -704,8 +722,6 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 			handleTLSStreamProbeReply(conn)
 		case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
 			handleQUICStreamProbeReply(conn)
-		default:
-			handleWSSProbeReply(conn, wsKey)
 		}
 		return
 	}
@@ -739,8 +755,6 @@ func handleIncomingTunnelConn(conn net.Conn, peerID string, tc TunnelConfig) {
 		handleTLSStreamIncomingTraffic(conn, br, tc, targetPort)
 	case tc.ID == 8 || parts[0] == "QUIC" || tunnelMode == "quic":
 		handleQUICStreamIncomingTraffic(conn, br, tc, targetPort)
-	default:
-		handleWSSIncomingTraffic(conn, br, tc, wsKey, targetPort)
 	}
 }
 
@@ -912,6 +926,9 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 	for i := range appCfg.Servers {
 		srv := &appCfg.Servers[i]
 		if srv.ID == localPeerID || srv.ID == pkt.PeerID || srv.ID == pkt.SenderID || srv.IP == remoteIP || len(appCfg.Servers) == 1 {
+			if pkt.CertPin != "" {
+				srv.RemoteCertPin = pkt.CertPin
+			}
 			if appCfg.Role == "agent" && len(pkt.Tunnels) == 30 && pkt.ConfigVersion >= srv.ConfigVersion {
 				srv.Tunnels = normalizeTunnels(pkt.Tunnels)
 				srv.ConfigVersion = pkt.ConfigVersion
@@ -1087,11 +1104,21 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 
 	var conn net.Conn = rawConn
 	if tc.ID != 6 {
-		tlsConn := tls.Client(rawConn, &tls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-		})
+		var tlsCfg *tls.Config
+		if tc.ID == 1 {
+			var cfgErr error
+			tlsCfg, cfgErr = buildWSSClientTLSConfig(peer, tc)
+			if cfgErr != nil {
+				return false
+			}
+		} else {
+			tlsCfg = &tls.Config{
+				ServerName:         sni,
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS12,
+			}
+		}
+		tlsConn := tls.Client(rawConn, tlsCfg)
 		if err := tlsConn.Handshake(); err != nil {
 			return false
 		}
