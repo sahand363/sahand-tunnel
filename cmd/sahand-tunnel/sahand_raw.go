@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os/exec"
 	"runtime"
@@ -28,6 +29,15 @@ const (
 	sahandRawVersion byte   = 0x01
 	sahandRawMagic   uint16 = 0x5352 // 'S''R'
 
+	// Explicit transport selection modes
+	RawTransportModeAuto  = "auto"
+	RawTransportModeRawIP = "raw_ip"
+	RawTransportModeUDP   = "udp"
+
+	// Explicit backend identifiers
+	RawBackendNameRawIP       = "RAW_IP"
+	RawBackendNameUDPFallback = "UDP_FALLBACK"
+
 	// Raw TCP Header flags (RFC 793)
 	rawTCPFlagFIN byte = 0x01
 	rawTCPFlagSYN byte = 0x02
@@ -40,6 +50,7 @@ const (
 	rawPktHandshakeResp byte = 0x02
 	rawPktData          byte = 0x03
 	rawPktRekey         byte = 0x04
+	rawPktSelfTest      byte = 0x7F
 
 	// Encrypted ARQ & Multiplexer Commands
 	rawARQCmdStreamOpen    byte = 0x01
@@ -59,6 +70,7 @@ const (
 
 	rawTCPHeaderLen      = 20
 	rawEnvelopeHeaderLen = 18
+	rawUDPFrameHeaderLen = 8
 	rawARQHeaderLen      = 17
 
 	// MTU & Buffer bounds (clamped to prevent IP fragmentation over PPPoE/GRE/VPN)
@@ -76,21 +88,42 @@ var rawPacketBufPool = sync.Pool{
 	},
 }
 
+func cloneIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	cp := make(net.IP, len(ip))
+	copy(cp, ip)
+	return cp
+}
+
 func cloneUDPAddr(addr *net.UDPAddr) *net.UDPAddr {
 	if addr == nil {
 		return nil
 	}
-	ipCopy := make(net.IP, len(addr.IP))
-	copy(ipCopy, addr.IP)
 	return &net.UDPAddr{
-		IP:   ipCopy,
+		IP:   cloneIP(addr.IP),
 		Port: addr.Port,
 		Zone: addr.Zone,
 	}
 }
 
+func normalizeRawTransportMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	switch mode {
+	case "", RawTransportModeAuto:
+		return RawTransportModeAuto, nil
+	case RawTransportModeRawIP:
+		return RawTransportModeRawIP, nil
+	case RawTransportModeUDP:
+		return RawTransportModeUDP, nil
+	default:
+		return "", fmt.Errorf("invalid SAHAND-RAW transport mode %q (expected raw_ip, udp, or auto)", raw)
+	}
+}
+
 // ============================================================================
-// LAYER A: RAW PACKET ENGINE (RFC 793 TCP CODEC, CHECKSUMS, SOCKET & IPTABLES)
+// LAYER A: PACKET ENGINE & INDEPENDENT TRANSPORT BACKENDS (RAW_IP vs UDP_FALLBACK)
 // ============================================================================
 
 type rawTCPPacket struct {
@@ -156,6 +189,9 @@ func encodeRawTCPPacket(pkt rawTCPPacket) ([]byte, error) {
 	if len(pkt.Payload) > rawMaxWireMTU {
 		return nil, errors.New("raw packet payload exceeds MTU")
 	}
+	if len(pkt.SrcIP) == 0 || len(pkt.DstIP) == 0 {
+		return nil, errors.New("raw TCP packet requires valid source and destination IPs for checksum calculation")
+	}
 	totalLen := rawTCPHeaderLen + len(pkt.Payload)
 	out := make([]byte, totalLen)
 
@@ -170,7 +206,7 @@ func encodeRawTCPPacket(pkt rawTCPPacket) ([]byte, error) {
 		win = 65535
 	}
 	binary.BigEndian.PutUint16(out[14:16], win)
-	binary.BigEndian.PutUint16(out[16:18], 0) // Checksum placeholder
+	binary.BigEndian.PutUint16(out[16:18], 0)
 	binary.BigEndian.PutUint16(out[18:20], pkt.Urgent)
 	copy(out[rawTCPHeaderLen:], pkt.Payload)
 
@@ -189,8 +225,8 @@ func decodeRawTCPPacket(srcIP, dstIP net.IP, raw []byte, verifyChecksum bool) (r
 		return pkt, errors.New("invalid TCP data offset")
 	}
 
-	pkt.SrcIP = srcIP
-	pkt.DstIP = dstIP
+	pkt.SrcIP = cloneIP(srcIP)
+	pkt.DstIP = cloneIP(dstIP)
 	pkt.SrcPort = binary.BigEndian.Uint16(raw[0:2])
 	pkt.DstPort = binary.BigEndian.Uint16(raw[2:4])
 	pkt.SeqNum = binary.BigEndian.Uint32(raw[4:8])
@@ -203,14 +239,20 @@ func decodeRawTCPPacket(srcIP, dstIP net.IP, raw []byte, verifyChecksum bool) (r
 	if pkt.Flags&rawTCPFlagRST != 0 {
 		return pkt, errors.New("ignoring TCP RST packet")
 	}
+	if pkt.SrcPort == 0 || pkt.DstPort == 0 {
+		return pkt, errors.New("invalid zero TCP source or destination port")
+	}
 
-	if verifyChecksum && len(srcIP) > 0 && len(dstIP) > 0 {
+	if verifyChecksum {
+		if len(srcIP) == 0 || len(dstIP) == 0 {
+			return pkt, errors.New("missing source or destination IP for TCP checksum verification")
+		}
 		verifyCopy := make([]byte, len(raw))
 		copy(verifyCopy, raw)
 		binary.BigEndian.PutUint16(verifyCopy[16:18], 0)
 		expected := computeRFC1071TCPChecksum(srcIP, dstIP, verifyCopy)
-		if pkt.Checksum != 0 && pkt.Checksum != expected {
-			return pkt, errors.New("TCP checksum mismatch")
+		if pkt.Checksum != expected {
+			return pkt, fmt.Errorf("TCP checksum mismatch: got 0x%04x, expected 0x%04x", pkt.Checksum, expected)
 		}
 	}
 
@@ -220,10 +262,44 @@ func decodeRawTCPPacket(srcIP, dstIP net.IP, raw []byte, verifyChecksum bool) (r
 	return pkt, nil
 }
 
+// Extracts the TCP segment and source/destination IPv4 addresses from a raw socket read buffer,
+// handling both stripped TCP segments (returned by Go's net.IPConn.ReadFromIP) and raw IPv4-prefixed packets.
+func extractTCPFromRawIPBuffer(raw []byte, fromIP net.IP, defaultDstIP net.IP) (srcIP, dstIP net.IP, tcpSeg []byte, err error) {
+	if len(raw) < rawTCPHeaderLen {
+		return nil, nil, nil, errors.New("raw IP buffer shorter than TCP header")
+	}
+
+	// Check if an outer IPv4 header is present by inspecting Version==4, Protocol==6 (TCP),
+	// TotalLength==len(raw), and verifying that the SAHAND-RAW magic sits after the IPv4+TCP headers.
+	if len(raw) >= 40 && (raw[0]>>4) == 4 {
+		ihl := int(raw[0]&0x0F) * 4
+		totalLen := int(binary.BigEndian.Uint16(raw[2:4]))
+		proto := raw[9]
+		if ihl >= 20 && proto == 6 && totalLen == len(raw) && len(raw) >= ihl+rawTCPHeaderLen {
+			tcpOffset := int(raw[ihl+12]>>4) * 4
+			if tcpOffset >= rawTCPHeaderLen && len(raw) >= ihl+tcpOffset+3 {
+				if binary.BigEndian.Uint16(raw[ihl+tcpOffset:ihl+tcpOffset+2]) == sahandRawMagic &&
+					raw[ihl+tcpOffset+2] == sahandRawVersion {
+					sIP := cloneIP( net.IP(raw[12:16]).To4() )
+					dIP := cloneIP( net.IP(raw[16:20]).To4() )
+					return sIP, dIP, raw[ihl:], nil
+				}
+			}
+		}
+	}
+
+	sIP := cloneIP(fromIP.To4())
+	dIP := cloneIP(defaultDstIP.To4())
+	if sIP != nil && sIP.IsLoopback() {
+		dIP = net.IPv4(127, 0, 0, 1).To4()
+	}
+	return sIP, dIP, raw, nil
+}
+
 func resolveOutboundInterfaceIP(remoteHost string) net.IP {
 	ip := net.ParseIP(strings.TrimSpace(remoteHost))
 	if ip != nil && ip.IsLoopback() {
-		return net.IPv4(127, 0, 0, 1)
+		return net.IPv4(127, 0, 0, 1).To4()
 	}
 	network := "udp4"
 	target := "8.8.8.8:53"
@@ -235,156 +311,546 @@ func resolveOutboundInterfaceIP(remoteHost string) net.IP {
 	}
 	c, err := net.DialTimeout(network, target, 500*time.Millisecond)
 	if err != nil {
-		return net.IPv4(127, 0, 0, 1)
+		return net.IPv4(127, 0, 0, 1).To4()
 	}
 	defer c.Close()
 	if udpAddr, ok := c.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP != nil {
-		ipCopy := make(net.IP, len(udpAddr.IP))
-		copy(ipCopy, udpAddr.IP)
-		return ipCopy
+		if ip4 := udpAddr.IP.To4(); ip4 != nil {
+			return cloneIP(ip4)
+		}
+		return cloneIP(udpAddr.IP)
 	}
-	return net.IPv4(127, 0, 0, 1)
+	return net.IPv4(127, 0, 0, 1).To4()
 }
 
-// Manages optional Linux iptables rules to suppress kernel-generated TCP RST packets
-// when privileged raw `ip4:tcp` sockets are active on a tunnel port.
+// Manages Linux iptables rules to suppress kernel-generated TCP RST packets
+// when the RAW_IP backend is active on a port.
 type rawKernelRSTGuard struct {
 	port    int
 	applied bool
 }
 
-func acquireKernelRSTGuard(port int) *rawKernelRSTGuard {
-	g := &rawKernelRSTGuard{port: port}
-	if runtime.GOOS != "linux" || port <= 0 {
-		return g
+func acquireKernelRSTGuard(port int) (*rawKernelRSTGuard, error) {
+	if runtime.GOOS != "linux" {
+		return nil, errors.New("kernel RST suppression requires Linux iptables")
 	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %d for kernel RST guard", port)
+	}
+	g := &rawKernelRSTGuard{port: port}
 	portStr := strconv.Itoa(port)
+
 	checkCmd := exec.Command("iptables", "-C", "OUTPUT", "-p", "tcp", "--sport", portStr, "--tcp-flags", "RST", "RST", "-j", "DROP")
 	if checkCmd.Run() == nil {
-		return g
+		return g, nil
 	}
+
 	addCmd := exec.Command("iptables", "-I", "OUTPUT", "-p", "tcp", "--sport", portStr, "--tcp-flags", "RST", "RST", "-j", "DROP")
-	if addCmd.Run() == nil {
-		g.applied = true
+	if err := addCmd.Run(); err != nil {
+		return nil, fmt.Errorf("failed to install iptables TCP RST drop rule on port %d: %w", port, err)
 	}
-	return g
+	g.applied = true
+	return g, nil
 }
 
 func (g *rawKernelRSTGuard) release() {
-	if !g.applied || runtime.GOOS != "linux" || g.port <= 0 {
+	if g == nil || !g.applied || runtime.GOOS != "linux" || g.port <= 0 {
 		return
 	}
-	portStr := strconv.Itoa(port)
+	portStr := strconv.Itoa(g.port)
 	_ = exec.Command("iptables", "-D", "OUTPUT", "-p", "tcp", "--sport", portStr, "--tcp-flags", "RST", "RST", "-j", "DROP").Run()
 	g.applied = false
 }
 
-// Pluggable raw packet link abstraction:
-// Binds both an `ip4:tcp` raw socket (when CAP_NET_RAW is granted) and a UDP raw-frame socket
-// carrier so raw TCP packets with RFC 793 headers & RFC 1071 checksums are transmitted seamlessly
-// across both privileged bare-metal hosts and unprivileged/NAT environments.
-type rawPacketEndpoint struct {
-	localIP   net.IP
-	localPort uint16
-	udpConn   *net.UDPConn
-	rawIPConn *net.IPConn
-	rstGuard  *rawKernelRSTGuard
-	closed    atomic.Bool
+// Transport Backend Abstraction
+type rawInboundPacket struct {
+	Payload    []byte
+	SenderAddr *net.UDPAddr
+	TCPSeq     uint32
+	TCPAck     uint32
+	TCPFlags   byte
 }
 
-func listenRawPacketEndpoint(listenIP string, port int) (*rawPacketEndpoint, error) {
-	uAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(listenIP, strconv.Itoa(port)))
+type rawTransportBackend interface {
+	BackendName() string
+	TransportMode() string
+	FallbackReason() string
+	LocalPort() uint16
+	SendPacket(dstAddr *net.UDPAddr, seq, ack uint32, flags byte, payload []byte) error
+	ReceivePacket(deadline time.Time) (rawInboundPacket, error)
+	Close() error
+}
+
+// Low-level raw IP packet socket interface (implemented by *net.IPConn in production
+// and testable via in-memory raw IP link in unit tests without root).
+type rawIPConnHandle interface {
+	ReadFromIP(b []byte) (int, *net.IPAddr, error)
+	WriteToIP(b []byte, addr *net.IPAddr) (int, error)
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	Close() error
+}
+
+var (
+	rawIPTestHookMu      sync.RWMutex
+	rawIPCustomDialer    func(listenIP net.IP, localPort uint16) (rawIPConnHandle, error)
+	rawIPSkipIPTablesForTest atomic.Bool
+)
+
+// ============================================================================
+// BACKEND A: RAW_IP (Bidirectional Linux IPv4 Raw TCP Socket Backend)
+// ============================================================================
+
+type rawIPSocketBackend struct {
+	localIP        net.IP
+	localPort      uint16
+	expectedPeerIP net.IP
+	rawConn        rawIPConnHandle
+	rstGuard       *rawKernelRSTGuard
+	writeMu        sync.Mutex
+	closed         atomic.Bool
+}
+
+func allocateEphemeralRawTCPPort() uint16 {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err == nil {
+		p := uint16(ln.Addr().(*net.TCPAddr).Port)
+		_ = ln.Close()
+		if p >= 1024 {
+			return p
+		}
+	}
+	return uint16(42000 + randomIntN(16000))
+}
+
+func newRawIPSocketBackend(listenIP string, port int, peerIP net.IP) (*rawIPSocketBackend, error) {
+	rawIPTestHookMu.RLock()
+	customDialer := rawIPCustomDialer
+	rawIPTestHookMu.RUnlock()
+
+	if customDialer == nil && runtime.GOOS != "linux" {
+		return nil, errors.New("RAW_IP backend requires Linux ip4:tcp raw socket support")
+	}
+
+	actualPort := uint16(port)
+	if actualPort == 0 {
+		actualPort = allocateEphemeralRawTCPPort()
+	}
+
+	resolvedLocalIP := net.ParseIP(strings.TrimSpace(listenIP))
+	if resolvedLocalIP == nil || resolvedLocalIP.IsUnspecified() {
+		if len(peerIP) > 0 && !peerIP.IsUnspecified() {
+			resolvedLocalIP = resolveOutboundInterfaceIP(peerIP.String())
+		} else {
+			resolvedLocalIP = resolveOutboundInterfaceIP("8.8.8.8")
+		}
+	}
+	resolvedLocalIP = resolvedLocalIP.To4()
+	if resolvedLocalIP == nil {
+		resolvedLocalIP = net.IPv4(127, 0, 0, 1).To4()
+	}
+
+	var rstGuard *rawKernelRSTGuard
+	if !rawIPSkipIPTablesForTest.Load() {
+		var err error
+		rstGuard, err = acquireKernelRSTGuard(int(actualPort))
+		if err != nil {
+			return nil, fmt.Errorf("kernel RST guard failed: %w", err)
+		}
+	}
+
+	var handle rawIPConnHandle
+	if customDialer != nil {
+		var err error
+		handle, err = customDialer(resolvedLocalIP, actualPort)
+		if err != nil {
+			if rstGuard != nil {
+				rstGuard.release()
+			}
+			return nil, err
+		}
+	} else {
+		bindAddr := &net.IPAddr{IP: net.IPv4zero}
+		if ip := net.ParseIP(strings.TrimSpace(listenIP)); ip != nil && !ip.IsUnspecified() {
+			if ip4 := ip.To4(); ip4 != nil {
+				bindAddr = &net.IPAddr{IP: ip4}
+			}
+		}
+		ipConn, err := net.ListenIP("ip4:tcp", bindAddr)
+		if err != nil {
+			if rstGuard != nil {
+				rstGuard.release()
+			}
+			return nil, fmt.Errorf("ip4:tcp raw socket listen failed: %w", err)
+		}
+		_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
+		_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
+		handle = ipConn
+	}
+
+	var peerIPv4 net.IP
+	if len(peerIP) > 0 {
+		peerIPv4 = cloneIP(peerIP.To4())
+	}
+
+	b := &rawIPSocketBackend{
+		localIP:        cloneIP(resolvedLocalIP),
+		localPort:      actualPort,
+		expectedPeerIP: peerIPv4,
+		rawConn:        handle,
+		rstGuard:       rstGuard,
+	}
+
+	// Verify that RAW_IP can actually transmit, capture, filter, and checksum-validate
+	// a real raw TCP packet before reporting the backend as operational.
+	if err := b.verifySelfTest(); err != nil {
+		_ = b.Close()
+		return nil, fmt.Errorf("RAW_IP operational self-test failed: %w", err)
+	}
+
+	return b, nil
+}
+
+func (b *rawIPSocketBackend) verifySelfTest() error {
+	var token [16]byte
+	if _, err := io.ReadFull(rand.Reader, token[:]); err != nil {
+		return err
+	}
+
+	probeWire := make([]byte, rawEnvelopeHeaderLen+len(token))
+	binary.BigEndian.PutUint16(probeWire[0:2], sahandRawMagic)
+	probeWire[2] = sahandRawVersion
+	probeWire[3] = rawPktSelfTest
+	copy(probeWire[rawEnvelopeHeaderLen:], token[:])
+
+	loopbackDst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1).To4(), Port: int(b.localPort)}
+	if err := b.SendPacket(loopbackDst, 1, 1, rawTCPFlagPSH|rawTCPFlagACK, probeWire); err != nil {
+		return fmt.Errorf("self-test raw transmit failed: %w", err)
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		pkt, err := b.receiveInternal(deadline, true)
+		if err != nil {
+			return fmt.Errorf("self-test raw receive failed: %w", err)
+		}
+		if len(pkt.Payload) == len(probeWire) &&
+			pkt.Payload[3] == rawPktSelfTest &&
+			subtle.ConstantTimeCompare(pkt.Payload[rawEnvelopeHeaderLen:], token[:]) == 1 {
+			return nil
+		}
+	}
+	return errors.New("self-test packet was not received on ip4:tcp socket")
+}
+
+func (b *rawIPSocketBackend) BackendName() string {
+	return RawBackendNameRawIP
+}
+
+func (b *rawIPSocketBackend) TransportMode() string {
+	return RawTransportModeRawIP
+}
+
+func (b *rawIPSocketBackend) FallbackReason() string {
+	return ""
+}
+
+func (b *rawIPSocketBackend) LocalPort() uint16 {
+	return b.localPort
+}
+
+func (b *rawIPSocketBackend) SendPacket(dstAddr *net.UDPAddr, seq, ack uint32, flags byte, payload []byte) error {
+	if b.closed.Load() || dstAddr == nil {
+		return net.ErrClosed
+	}
+	dstIP := dstAddr.IP.To4()
+	if dstIP == nil {
+		return errors.New("RAW_IP backend requires an IPv4 destination address")
+	}
+	if dstAddr.Port <= 0 || dstAddr.Port > 65535 {
+		return errors.New("RAW_IP backend requires a valid destination port")
+	}
+
+	srcIP := b.localIP
+	if dstIP.IsLoopback() {
+		srcIP = net.IPv4(127, 0, 0, 1).To4()
+	}
+
+	rawSegment, err := encodeRawTCPPacket(rawTCPPacket{
+		SrcIP:   srcIP,
+		DstIP:   dstIP,
+		SrcPort: b.localPort,
+		DstPort: uint16(dstAddr.Port),
+		SeqNum:  seq,
+		AckNum:  ack,
+		Flags:   flags,
+		Window:  65535,
+		Payload: payload,
+	})
+	if err != nil {
+		return err
+	}
+
+	b.writeMu.Lock()
+	defer b.writeMu.Unlock()
+	if b.closed.Load() {
+		return net.ErrClosed
+	}
+	_ = b.rawConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = b.rawConn.WriteToIP(rawSegment, &net.IPAddr{IP: dstIP})
+	_ = b.rawConn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func (b *rawIPSocketBackend) ReceivePacket(deadline time.Time) (rawInboundPacket, error) {
+	return b.receiveInternal(deadline, false)
+}
+
+func (b *rawIPSocketBackend) receiveInternal(deadline time.Time, allowSelfTest bool) (rawInboundPacket, error) {
+	var empty rawInboundPacket
+	if b.closed.Load() {
+		return empty, net.ErrClosed
+	}
+	_ = b.rawConn.SetReadDeadline(deadline)
+
+	bufPtr := rawPacketBufPool.Get().(*[]byte)
+	defer rawPacketBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	for {
+		if b.closed.Load() {
+			return empty, net.ErrClosed
+		}
+		n, rAddr, err := b.rawConn.ReadFromIP(buf)
+		if err != nil {
+			return empty, err
+		}
+		if n < rawTCPHeaderLen {
+			continue
+		}
+
+		var fromIP net.IP
+		if rAddr != nil {
+			fromIP = rAddr.IP
+		}
+		srcIP, dstIP, tcpSeg, err := extractTCPFromRawIPRead(buf[:n], fromIP, b.localIP)
+		if err != nil || len(tcpSeg) < rawTCPHeaderLen {
+			continue
+		}
+
+		// 1. Fast destination port filter: ignore unrelated host TCP traffic
+		dstPort := binary.BigEndian.Uint16(tcpSeg[2:4])
+		if dstPort != b.localPort {
+			continue
+		}
+
+		// 2. Source address filter when bound to a specific peer IP
+		if !allowSelfTest && len(b.expectedPeerIP) > 0 && !b.expectedPeerIP.IsLoopback() && !srcIP.IsLoopback() {
+			if !srcIP.Equal(b.expectedPeerIP) {
+				continue
+			}
+		}
+
+		// 3. Full RFC 793 TCP decode, RST rejection, and RFC 1071 checksum verification
+		pkt, err := decodeRawTCPPacket(srcIP, dstIP, tcpSeg, true)
+		if err != nil {
+			continue
+		}
+
+		// 4. SAHAND-RAW protocol magic & version validation
+		if len(pkt.Payload) < rawEnvelopeHeaderLen {
+			continue
+		}
+		if binary.BigEndian.Uint16(pkt.Payload[0:2]) != sahandRawMagic || pkt.Payload[2] != sahandRawVersion {
+			continue
+		}
+		if !allowSelfTest && pkt.Payload[3] == rawPktSelfTest {
+			continue
+		}
+
+		return rawInboundPacket{
+			Payload: pkt.Payload,
+			SenderAddr: &net.UDPAddr{
+				IP:   cloneIP(srcIP),
+				Port: int(pkt.SrcPort),
+			},
+			TCPSeq:   pkt.SeqNum,
+			TCPAck:   pkt.AckNum,
+			TCPFlags: pkt.Flags,
+		}, nil
+	}
+}
+
+func extractTCPFromRawIPRead(raw []byte, fromIP net.IP, defaultDstIP net.IP) (srcIP, dstIP net.IP, tcpSeg []byte, err error) {
+	return extractTCPFromRawIPBuffer(raw, fromIP, defaultDstIP)
+}
+
+func (b *rawIPSocketBackend) Close() error {
+	if b.closed.Swap(true) {
+		return nil
+	}
+	if b.rstGuard != nil {
+		b.rstGuard.release()
+	}
+	if b.rawConn != nil {
+		return b.rawConn.Close()
+	}
+	return nil
+}
+
+// ============================================================================
+// BACKEND B: UDP_FALLBACK (Independent Normal UDP Socket Backend)
+// ============================================================================
+
+type udpFallbackBackend struct {
+	udpConn        *net.UDPConn
+	localPort      uint16
+	fallbackReason string
+	closed         atomic.Bool
+}
+
+func newUDPFallbackBackend(listenIP string, port int, fallbackReason string) (*udpFallbackBackend, error) {
+	bindHost := strings.TrimSpace(listenIP)
+	if bindHost == "" {
+		bindHost = "0.0.0.0"
+	}
+	uAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(bindHost, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
-	uConn, err := net.ListenUDP("udp", uAddr)
+	uConn, err := net.ListenUDP("udp4", uAddr)
 	if err != nil {
 		return nil, err
 	}
 	configureUDPSocketBuffers(uConn)
 
 	actualPort := uint16(uConn.LocalAddr().(*net.UDPAddr).Port)
-	ep := &rawPacketEndpoint{
-		localIP:   net.ParseIP(listenIP),
-		localPort: actualPort,
-		udpConn:   uConn,
-	}
-	if ep.localIP == nil || ep.localIP.IsUnspecified() {
-		ep.localIP = net.IPv4(127, 0, 0, 1)
-	}
-
-	if ipAddr, err := net.ResolveIPAddr("ip4", listenIP); err == nil {
-		if rawConn, err := net.ListenIP("ip4:tcp", ipAddr); err == nil {
-			ep.rawIPConn = rawConn
-			ep.rstGuard = acquireKernelRSTGuard(int(actualPort))
-		}
-	}
-
-	return ep, nil
+	return &udpFallbackBackend{
+		udpConn:        uConn,
+		localPort:      actualPort,
+		fallbackReason: fallbackReason,
+	}, nil
 }
 
-func (ep *rawPacketEndpoint) sendRawPacket(dstAddr *net.UDPAddr, seq, ack uint32, flags byte, wirePayload []byte) error {
-	if ep.closed.Load() || dstAddr == nil {
+func (u *udpFallbackBackend) BackendName() string {
+	return RawBackendNameUDPFallback
+}
+
+func (u *udpFallbackBackend) TransportMode() string {
+	return RawTransportModeUDP
+}
+
+func (u *udpFallbackBackend) FallbackReason() string {
+	return u.fallbackReason
+}
+
+func (u *udpFallbackBackend) LocalPort() uint16 {
+	return u.localPort
+}
+
+func (u *udpFallbackBackend) SendPacket(dstAddr *net.UDPAddr, seq, _ uint32, flags byte, payload []byte) error {
+	if u.closed.Load() || dstAddr == nil {
 		return net.ErrClosed
 	}
-	pkt := rawTCPPacket{
-		SrcIP:   ep.localIP,
-		DstIP:   dstAddr.IP,
-		SrcPort: ep.localPort,
-		DstPort: uint16(dstAddr.Port),
-		SeqNum:  seq,
-		AckNum:  ack,
-		Flags:   flags,
-		Window:  65535,
-		Payload: wirePayload,
-	}
-	rawFrame, err := encodeRawTCPPacket(pkt)
-	if err != nil {
-		return err
+	if len(payload)+rawUDPFrameHeaderLen > rawMaxWireMTU {
+		return errors.New("UDP_FALLBACK frame exceeds MTU")
 	}
 
-	_, err = ep.udpConn.WriteToUDP(rawFrame, dstAddr)
-	if ep.rawIPConn != nil && !dstAddr.IP.IsLoopback() {
-		_, _ = ep.rawIPConn.WriteToIP(rawFrame, &net.IPAddr{IP: dstAddr.IP})
-	}
+	// 8-byte UDP_FALLBACK transport header: [Magic:2(0x5352)][Ver:1(0x01)][Flags:1][Seq:4][Payload...]
+	frame := make([]byte, rawUDPFrameHeaderLen+len(payload))
+	binary.BigEndian.PutUint16(frame[0:2], sahandRawMagic)
+	frame[2] = sahandRawVersion
+	frame[3] = flags
+	binary.BigEndian.PutUint32(frame[4:8], seq)
+	copy(frame[rawUDPFrameHeaderLen:], payload)
+
+	_, err := u.udpConn.WriteToUDP(frame, dstAddr)
 	return err
 }
 
-func (ep *rawPacketEndpoint) readRawPacket(deadline time.Time) (rawTCPPacket, *net.UDPAddr, error) {
-	var empty rawTCPPacket
-	if !deadline.IsZero() {
-		_ = ep.udpConn.SetReadDeadline(deadline)
-	} else {
-		_ = ep.udpConn.SetReadDeadline(time.Time{})
+func (u *udpFallbackBackend) ReceivePacket(deadline time.Time) (rawInboundPacket, error) {
+	var empty rawInboundPacket
+	if u.closed.Load() {
+		return empty, net.ErrClosed
 	}
+	_ = u.udpConn.SetReadDeadline(deadline)
 
 	bufPtr := rawPacketBufPool.Get().(*[]byte)
 	defer rawPacketBufPool.Put(bufPtr)
 	buf := *bufPtr
 
-	n, rAddr, err := ep.udpConn.ReadFromUDP(buf)
-	if err != nil {
-		return empty, nil, err
-	}
+	for {
+		if u.closed.Load() {
+			return empty, net.ErrClosed
+		}
+		n, rAddr, err := u.udpConn.ReadFromUDP(buf)
+		if err != nil {
+			return empty, err
+		}
+		if n < rawUDPFrameHeaderLen+rawEnvelopeHeaderLen {
+			continue
+		}
+		if binary.BigEndian.Uint16(buf[0:2]) != sahandRawMagic || buf[2] != sahandRawVersion {
+			continue
+		}
+		flags := buf[3]
+		seq := binary.BigEndian.Uint32(buf[4:8])
+		payload := make([]byte, n-rawUDPFrameHeaderLen)
+		copy(payload, buf[rawUDPFrameHeaderLen:n])
 
-	pkt, err := decodeRawTCPPacket(nil, nil, buf[:n], false)
-	if err != nil {
-		return empty, nil, err
+		return rawInboundPacket{
+			Payload:    payload,
+			SenderAddr: cloneUDPAddr(rAddr),
+			TCPSeq:     seq,
+			TCPFlags:   flags,
+		}, nil
 	}
-	return pkt, cloneUDPAddr(rAddr), nil
 }
 
-func (ep *rawPacketEndpoint) Close() error {
-	if ep.closed.Swap(true) {
+func (u *udpFallbackBackend) Close() error {
+	if u.closed.Swap(true) {
 		return nil
 	}
-	if ep.rstGuard != nil {
-		ep.rstGuard.release()
+	return u.udpConn.Close()
+}
+
+// ============================================================================
+// TRANSPORT SELECTION FACTORY (raw_ip | udp | auto)
+// ============================================================================
+
+func openSahandRawBackend(requestedMode string, listenIP string, port int, peerIP net.IP) (rawTransportBackend, error) {
+	mode, err := normalizeRawTransportMode(requestedMode)
+	if err != nil {
+		return nil, err
 	}
-	if ep.rawIPConn != nil {
-		_ = ep.rawIPConn.Close()
+
+	switch mode {
+	case RawTransportModeRawIP:
+		rawBackend, err := newRawIPSocketBackend(listenIP, port, peerIP)
+		if err != nil {
+			return nil, fmt.Errorf("SAHAND-RAW raw_ip mode initialization failed: %w", err)
+		}
+		return rawBackend, nil
+
+	case RawTransportModeUDP:
+		udpBackend, err := newUDPFallbackBackend(listenIP, port, "")
+		if err != nil {
+			return nil, fmt.Errorf("SAHAND-RAW udp mode initialization failed: %w", err)
+		}
+		return udpBackend, nil
+
+	default: // RawTransportModeAuto
+		rawBackend, rawErr := newRawIPSocketBackend(listenIP, port, peerIP)
+		if rawErr == nil {
+			return rawBackend, nil
+		}
+		reason := fmt.Sprintf("RAW_IP unavailable (%v); fell back to UDP_FALLBACK", rawErr)
+		udpBackend, udpErr := newUDPFallbackBackend(listenIP, port, reason)
+		if udpErr != nil {
+			return nil, fmt.Errorf("%s, and UDP_FALLBACK failed: %w", reason, udpErr)
+		}
+		return udpBackend, nil
 	}
-	return ep.udpConn.Close()
 }
 
 // ============================================================================
@@ -397,7 +863,6 @@ type rawReplayFilter struct {
 	bitmap  uint64
 }
 
-// Sliding 64-packet anti-replay window (RFC 6479).
 func (rf *rawReplayFilter) accept(seq uint64) bool {
 	if seq == 0 {
 		return false
@@ -689,17 +1154,13 @@ type rawARQFrame struct {
 func encodeRawARQFrame(f rawARQFrame) []byte {
 	out := make([]byte, rawARQHeaderLen+len(f.Payload))
 	out[0] = f.Cmd
-	binary.BigEndian.PutUint32(out[1:5], frameStreamID(f))
+	binary.BigEndian.PutUint32(out[1:5], f.StreamID)
 	binary.BigEndian.PutUint16(out[5:7], f.TargetPort)
 	binary.BigEndian.PutUint32(out[7:11], f.FragSeq)
 	binary.BigEndian.PutUint32(out[11:15], f.AckUna)
 	binary.BigEndian.PutUint16(out[15:17], uint16(len(f.Payload)))
 	copy(out[rawARQHeaderLen:], f.Payload)
 	return out
-}
-
-func frameStreamID(f rawARQFrame) uint32 {
-	return f.StreamID
 }
 
 func decodeRawARQFrame(raw []byte) (rawARQFrame, error) {
@@ -957,8 +1418,8 @@ type rawTxHookFunc func(sendFn func() error) error
 
 type rawARQSession struct {
 	sessionID    uint32
-	endpoint     *rawPacketEndpoint
-	ownsEndpoint bool
+	backend      rawTransportBackend
+	ownsBackend  bool
 	remoteAddr   atomic.Pointer[net.UDPAddr]
 	sec          *rawSecurityBox
 	peer         ServerPeer
@@ -990,8 +1451,8 @@ type rawARQSession struct {
 
 func newRawARQSession(
 	sessionID uint32,
-	ep *rawPacketEndpoint,
-	ownsEndpoint bool,
+	backend rawTransportBackend,
+	ownsBackend bool,
 	remoteAddr *net.UDPAddr,
 	sec *rawSecurityBox,
 	peer ServerPeer,
@@ -999,19 +1460,19 @@ func newRawARQSession(
 	isClient bool,
 ) *rawARQSession {
 	s := &rawARQSession{
-		sessionID:    sessionID,
-		endpoint:     ep,
-		ownsEndpoint: ownsEndpoint,
-		sec:          sec,
-		peer:         peer,
-		tunnel:       tc,
-		isClient:     isClient,
-		streams:      make(map[uint32]*rawMuxStream),
-		pingWaiters:  make(map[uint32]chan time.Duration),
-		ctrlWaiters:  make(map[uint32]chan []byte),
-		srtt:         40 * time.Millisecond,
-		rto:          80 * time.Millisecond,
-		stopCh:       make(chan struct{}),
+		sessionID:   sessionID,
+		backend:     backend,
+		ownsBackend: ownsBackend,
+		sec:         sec,
+		peer:        peer,
+		tunnel:      tc,
+		isClient:    isClient,
+		streams:     make(map[uint32]*rawMuxStream),
+		pingWaiters: make(map[uint32]chan time.Duration),
+		ctrlWaiters: make(map[uint32]chan []byte),
+		srtt:        40 * time.Millisecond,
+		rto:         80 * time.Millisecond,
+		stopCh:      make(chan struct{}),
 	}
 	s.remoteAddr.Store(cloneUDPAddr(remoteAddr))
 	if isClient {
@@ -1023,6 +1484,27 @@ func newRawARQSession(
 	s.tcpAck.Store(uint32(10000 + randomIntN(90000)))
 	s.lastActivity.Store(time.Now().Unix())
 	return s
+}
+
+func (s *rawARQSession) BackendName() string {
+	if s.backend == nil {
+		return ""
+	}
+	return s.backend.BackendName()
+}
+
+func (s *rawARQSession) TransportMode() string {
+	if s.backend == nil {
+		return ""
+	}
+	return s.backend.TransportMode()
+}
+
+func (s *rawARQSession) FallbackReason() string {
+	if s.backend == nil {
+		return ""
+	}
+	return s.backend.FallbackReason()
 }
 
 func (s *rawARQSession) setTxHook(fn rawTxHookFunc) {
@@ -1056,7 +1538,7 @@ func (s *rawARQSession) currentRTO() time.Duration {
 }
 
 func (s *rawARQSession) sendEncryptedARQFrame(frame rawARQFrame) error {
-	if s.closed.Load() {
+	if s.closed.Load() || s.backend == nil {
 		return net.ErrClosed
 	}
 	dst := s.remoteAddr.Load()
@@ -1078,7 +1560,7 @@ func (s *rawARQSession) sendEncryptedARQFrame(frame rawARQFrame) error {
 		if s.closed.Load() {
 			return net.ErrClosed
 		}
-		return s.endpoint.sendRawPacket(dst, seq, ack, flags, wire)
+		return s.backend.SendPacket(dst, seq, ack, flags, wire)
 	}
 	if hookPtr := s.txHook.Load(); hookPtr != nil && *hookPtr != nil {
 		return (*hookPtr)(sendFn)
@@ -1133,7 +1615,6 @@ func (s *rawARQSession) handleIncomingWireEnvelope(wire []byte, senderAddr *net.
 			s.streams[frame.StreamID] = st
 			go s.handleServerStream(st, frame.TargetPort)
 		} else {
-			// Retransmitted StreamOpen: re-send StreamOpenAck
 			_ = s.sendEncryptedARQFrame(rawARQFrame{
 				Cmd:        rawARQCmdStreamOpenAck,
 				StreamID:   frame.StreamID,
@@ -1274,7 +1755,6 @@ func (s *rawARQSession) forwardUDPDatagramToLocal(udpSessionID uint32, targetPor
 func (s *rawARQSession) handleServerStream(st *rawMuxStream, targetPort uint16) {
 	defer st.Close()
 
-	// Engine 1: Multiplexed Parity Sync Stream (supports multi-kilobyte SyncPacket/SyncResponse)
 	if targetPort == rawARQPortParitySync {
 		if err := s.sendEncryptedARQFrame(rawARQFrame{
 			Cmd:        rawARQCmdStreamOpenAck,
@@ -1291,7 +1771,6 @@ func (s *rawARQSession) handleServerStream(st *rawMuxStream, targetPort uint16) 
 		return
 	}
 
-	// Engine 2: Authorized Target Port Stream
 	if !s.tunnel.Enabled {
 		_ = s.sendEncryptedARQFrame(rawARQFrame{
 			Cmd:        rawARQCmdStreamOpenAck,
@@ -1471,12 +1950,12 @@ func (s *rawARQSession) startClientReadAndKeepaliveLoop() {
 	go func() {
 		defer s.Close()
 		for {
-			pkt, senderAddr, err := s.endpoint.readRawPacket(time.Now().Add(rawSessionIdleTTL))
+			pkt, err := s.backend.ReceivePacket(time.Now().Add(rawSessionIdleTTL))
 			if err != nil {
 				return
 			}
 			if len(pkt.Payload) >= rawEnvelopeHeaderLen {
-				s.handleIncomingWireEnvelope(pkt.Payload, senderAddr)
+				s.handleIncomingWireEnvelope(pkt.Payload, pkt.SenderAddr)
 			}
 		}
 	}()
@@ -1516,8 +1995,8 @@ func (s *rawARQSession) Close() error {
 	}
 	s.setTxHook(nil)
 	close(s.stopCh)
-	if s.ownsEndpoint && s.endpoint != nil {
-		_ = s.endpoint.Close()
+	if s.ownsBackend && s.backend != nil {
+		_ = s.backend.Close()
 	}
 	s.streamsMu.Lock()
 	for id, st := range s.streams {
@@ -1540,13 +2019,34 @@ var (
 )
 
 type rawServerMux struct {
-	endpoint *rawPacketEndpoint
+	backend  rawTransportBackend
 	peer     ServerPeer
 	tunnel   TunnelConfig
 	mu       sync.RWMutex
 	sessions map[uint32]*rawARQSession
 	stopCh   chan struct{}
 	closed   atomic.Bool
+}
+
+type rawServerCloser struct {
+	sm *rawServerMux
+}
+
+func (c *rawServerCloser) ReadFrom(_ []byte) (int, net.Addr, error) {
+	return 0, nil, net.ErrClosed
+}
+func (c *rawServerCloser) WriteTo(_ []byte, _ net.Addr) (int, error) {
+	return 0, net.ErrClosed
+}
+func (c *rawServerCloser) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4zero, Port: int(c.sm.backend.LocalPort())}
+}
+func (c *rawServerCloser) SetDeadline(_ time.Time) error      { return nil }
+func (c *rawServerCloser) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *rawServerCloser) SetWriteDeadline(_ time.Time) error { return nil }
+func (c *rawServerCloser) Close() error {
+	c.sm.closeAll()
+	return nil
 }
 
 func stopSahandRawPeerResources(peerID string) {
@@ -1568,12 +2068,24 @@ func stopSahandRawPeerResources(peerID string) {
 	sahandRawMu.Unlock()
 }
 
+func (sm *rawServerMux) BackendName() string {
+	return sm.backend.BackendName()
+}
+
+func (sm *rawServerMux) TransportMode() string {
+	return sm.backend.TransportMode()
+}
+
+func (sm *rawServerMux) FallbackReason() string {
+	return sm.backend.FallbackReason()
+}
+
 func (sm *rawServerMux) closeAll() {
 	if sm.closed.Swap(true) {
 		return
 	}
 	close(sm.stopCh)
-	_ = sm.endpoint.Close()
+	_ = sm.backend.Close()
 	sm.mu.Lock()
 	for sid, sess := range sm.sessions {
 		_ = sess.Close()
@@ -1583,13 +2095,17 @@ func (sm *rawServerMux) closeAll() {
 }
 
 func startSahandRawServer(peer ServerPeer, tc TunnelConfig) (net.PacketConn, error) {
-	ep, err := listenRawPacketEndpoint("0.0.0.0", tc.ListenPort)
+	peerIP := net.ParseIP(strings.TrimSpace(peer.IP))
+	backend, err := openSahandRawBackend(tc.RawTransport, "0.0.0.0", tc.ListenPort, peerIP)
 	if err != nil {
 		return nil, err
 	}
+	if reason := backend.FallbackReason(); reason != "" {
+		log.Printf("SAHAND-RAW server (peer %s, port %d): %s", peer.ID, backend.LocalPort(), reason)
+	}
 
 	sm := &rawServerMux{
-		endpoint: ep,
+		backend:  backend,
 		peer:     peer,
 		tunnel:   tc,
 		sessions: make(map[uint32]*rawARQSession),
@@ -1604,14 +2120,14 @@ func startSahandRawServer(peer ServerPeer, tc TunnelConfig) (net.PacketConn, err
 	sahandRawMu.Unlock()
 
 	go sm.serveLoop()
-	return ep.udpConn, nil
+	return &rawServerCloser{sm: sm}, nil
 }
 
 func (sm *rawServerMux) serveLoop() {
 	defer sm.closeAll()
 
 	for {
-		pkt, clientAddr, err := sm.endpoint.readRawPacket(time.Time{})
+		pkt, err := sm.backend.ReceivePacket(time.Time{})
 		if err != nil {
 			return
 		}
@@ -1620,7 +2136,7 @@ func (sm *rawServerMux) serveLoop() {
 		}
 
 		if len(pkt.Payload) == rawHandshakeFrameLen && pkt.Payload[3] == rawPktHandshakeInit {
-			sm.handleHandshakeInit(pkt, clientAddr)
+			sm.handleHandshakeInit(pkt)
 			continue
 		}
 
@@ -1629,12 +2145,12 @@ func (sm *rawServerMux) serveLoop() {
 		sess := sm.sessions[sid]
 		sm.mu.RUnlock()
 		if sess != nil {
-			sess.handleIncomingWireEnvelope(pkt.Payload, clientAddr)
+			sess.handleIncomingWireEnvelope(pkt.Payload, pkt.SenderAddr)
 		}
 	}
 }
 
-func (sm *rawServerMux) handleHandshakeInit(pkt rawTCPPacket, clientAddr *net.UDPAddr) {
+func (sm *rawServerMux) handleHandshakeInit(pkt rawInboundPacket) {
 	stateMu.RLock()
 	cfgSnapshot := appCfg
 	stateMu.RUnlock()
@@ -1669,7 +2185,7 @@ func (sm *rawServerMux) handleHandshakeInit(pkt rawTCPPacket, clientAddr *net.UD
 	}
 
 	secBox := newRawSecurityBox(sessionID, sharedSecret, authKey, false)
-	sess := newRawARQSession(sessionID, sm.endpoint, false, clientAddr, secBox, sm.peer, sm.tunnel, false)
+	sess := newRawARQSession(sessionID, sm.backend, false, pkt.SenderAddr, secBox, sm.peer, sm.tunnel, false)
 
 	sm.mu.Lock()
 	if old, exists := sm.sessions[sessionID]; exists {
@@ -1678,22 +2194,29 @@ func (sm *rawServerMux) handleHandshakeInit(pkt rawTCPPacket, clientAddr *net.UD
 	sm.sessions[sessionID] = sess
 	sm.mu.Unlock()
 
-	_ = sm.endpoint.sendRawPacket(
-		clientAddr,
+	_ = sm.backend.SendPacket(
+		pkt.SenderAddr,
 		sess.tcpSeq.Load(),
-		pkt.SeqNum+1,
+		pkt.TCPSeq+1,
 		rawTCPFlagSYN|rawTCPFlagACK,
 		respWire,
 	)
 }
 
 func getOrDialSahandRawSession(peer ServerPeer, tc TunnelConfig, timeout time.Duration) (*rawARQSession, error) {
+	reqMode, err := normalizeRawTransportMode(tc.RawTransport)
+	if err != nil {
+		return nil, err
+	}
+
 	sahandRawMu.RLock()
 	existing := sahandRawClientByPeer[peer.ID]
 	sahandRawMu.RUnlock()
 
 	if existing != nil && !existing.closed.Load() && existing.tunnel.ListenPort == tc.ListenPort {
-		return existing, nil
+		if reqMode == RawTransportModeAuto || existing.TransportMode() == reqMode {
+			return existing, nil
+		}
 	}
 
 	stateMu.RLock()
@@ -1705,21 +2228,23 @@ func getOrDialSahandRawSession(peer ServerPeer, tc TunnelConfig, timeout time.Du
 		return nil, err
 	}
 
-	rAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)))
+	rAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)))
 	if err != nil {
 		return nil, err
 	}
 
-	ep, err := listenRawPacketEndpoint("0.0.0.0", 0)
+	backend, err := openSahandRawBackend(tc.RawTransport, "0.0.0.0", 0, rAddr.IP)
 	if err != nil {
 		return nil, err
 	}
-	ep.localIP = resolveOutboundInterfaceIP(peer.IP)
+	if reason := backend.FallbackReason(); reason != "" {
+		log.Printf("SAHAND-RAW client (peer %s): %s", peer.ID, reason)
+	}
 
 	curve := ecdh.X25519()
 	cliPriv, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
-		_ = ep.Close()
+		_ = backend.Close()
 		return nil, err
 	}
 
@@ -1732,7 +2257,7 @@ func getOrDialSahandRawSession(peer ServerPeer, tc TunnelConfig, timeout time.Du
 
 	initWire, err := buildRawHandshakePacket(rawPktHandshakeInit, sessionID, cliPriv.PublicKey().Bytes(), authKey)
 	if err != nil {
-		_ = ep.Close()
+		_ = backend.Close()
 		return nil, err
 	}
 
@@ -1741,15 +2266,15 @@ func getOrDialSahandRawSession(peer ServerPeer, tc TunnelConfig, timeout time.Du
 	var srvPubBytes []byte
 
 	for attempt := 0; attempt < 4 && time.Now().Before(deadline); attempt++ {
-		if err := ep.sendRawPacket(rAddr, initSeq, 0, rawTCPFlagSYN, initWire); err != nil {
-			_ = ep.Close()
+		if err := backend.SendPacket(rAddr, initSeq, 0, rawTCPFlagSYN, initWire); err != nil {
+			_ = backend.Close()
 			return nil, err
 		}
 		waitUntil := time.Now().Add(700 * time.Millisecond)
 		if waitUntil.After(deadline) {
 			waitUntil = deadline
 		}
-		repPkt, _, rErr := ep.readRawPacket(waitUntil)
+		repPkt, rErr := backend.ReceivePacket(waitUntil)
 		if rErr != nil {
 			continue
 		}
@@ -1761,23 +2286,23 @@ func getOrDialSahandRawSession(peer ServerPeer, tc TunnelConfig, timeout time.Du
 	}
 
 	if len(srvPubBytes) != 32 {
-		_ = ep.Close()
-		return nil, errors.New("SAHAND-RAW handshake timeout")
+		_ = backend.Close()
+		return nil, fmt.Errorf("SAHAND-RAW (%s) handshake timeout", backend.BackendName())
 	}
 
 	srvPub, err := curve.NewPublicKey(srvPubBytes)
 	if err != nil {
-		_ = ep.Close()
+		_ = backend.Close()
 		return nil, err
 	}
 	sharedSecret, err := cliPriv.ECDH(srvPub)
 	if err != nil {
-		_ = ep.Close()
+		_ = backend.Close()
 		return nil, err
 	}
 
 	secBox := newRawSecurityBox(sessionID, sharedSecret, authKey, true)
-	sess := newRawARQSession(sessionID, ep, true, rAddr, secBox, peer, tc, true)
+	sess := newRawARQSession(sessionID, backend, true, rAddr, secBox, peer, tc, true)
 	sess.startClientReadAndKeepaliveLoop()
 
 	sahandRawMu.Lock()
@@ -1801,18 +2326,34 @@ func probeSahandRaw(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 		TestedAt:  formatMasterClockSec(masterNow()),
 	}
 
+	reqMode, modeErr := normalizeRawTransportMode(tc.RawTransport)
+	if modeErr != nil {
+		res.Success = false
+		res.ErrorReason = modeErr.Error()
+		return res
+	}
+
 	start := time.Now()
 	sess, err := getOrDialSahandRawSession(peer, tc, 3500*time.Millisecond)
 	if err != nil {
 		res.Success = false
 		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "timeout") {
+		if reqMode == RawTransportModeRawIP && strings.Contains(msg, "raw_ip") {
+			res.ErrorReason = fmt.Sprintf("Raw IP init failed: %v", err)
+		} else if strings.Contains(msg, "timeout") {
 			res.ErrorReason = "Timeout"
 		} else if strings.Contains(msg, "auth") || strings.Contains(msg, "token") {
 			res.ErrorReason = "Authentication failure"
 		} else {
 			res.ErrorReason = "Port unreachable"
 		}
+		return res
+	}
+
+	// Never report Raw IP as active if raw_ip was explicitly requested and the session is not RAW_IP
+	if reqMode == RawTransportModeRawIP && sess.BackendName() != RawBackendNameRawIP {
+		res.Success = false
+		res.ErrorReason = "Raw IP backend not active"
 		return res
 	}
 
