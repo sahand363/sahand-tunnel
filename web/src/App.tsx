@@ -151,8 +151,9 @@ export default function App() {
   const [draftTunnels, setDraftTunnels] = useState<Record<string, TunnelConfig>>({});
   const [savingTunnelKey, setSavingTunnelKey] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<Record<string, string>>({});
+  const [pingingKey, setPingingKey] = useState<string | null>(null);
 
-  // Top-bar Nut Icon (Port Settings Modal) state
+  // Top-bar Nut Icon (Port & Theme Settings Modal) state
   const [showPortSettings, setShowPortSettings] = useState(false);
   const [portDrafts, setPortDrafts] = useState<PortDraftMap>({});
   const [engine1BasePort, setEngine1BasePort] = useState(28001);
@@ -162,10 +163,14 @@ export default function App() {
 
   const [analyticsRange, setAnalyticsRange] = useState<7 | 30>(7);
   const [daysUsage, setDaysUsage] = useState<DailyUsage[]>([]);
-  const [darkMode, setDarkMode] = useState(true);
+  const [darkMode, setDarkMode] = useState<boolean>(() => {
+    const saved = localStorage.getItem("sahand_theme");
+    return saved ? saved === "dark" : true;
+  });
 
   useEffect(() => {
     document.documentElement.dataset.theme = darkMode ? "dark" : "light";
+    localStorage.setItem("sahand_theme", darkMode ? "dark" : "light");
   }, [darkMode]);
 
   const switchTab = (tab: Tab) => {
@@ -309,6 +314,24 @@ export default function App() {
       }
     } finally {
       setSavingBatchPorts(false);
+    }
+  }
+
+  async function handlePingTunnel(serverID: string, methodID: number) {
+    const key = `${serverID}:${methodID}`;
+    if (pingingKey) return;
+    setPingingKey(key);
+    try {
+      const res = await fetch("/api/v1/tunnels/ping", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ server_id: serverID, method_id: methodID }),
+      });
+      if (res.ok) {
+        await fetchState();
+      }
+    } finally {
+      setPingingKey(null);
     }
   }
 
@@ -482,26 +505,39 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">
-            <Shield size={19} strokeWidth={2.2} />
+            <Shield size={18} strokeWidth={2.2} />
           </div>
           <span>
             Sahand<span className="brand-light">Tunnel</span>
           </span>
         </div>
 
-        <div className="topbar-right">
-          {masterTime && <span className="master-clock-pill">{masterTime}</span>}
+        <div className="topbar-right" style={{ gap: "8px" }}>
+          {masterTime && (
+            <span
+              className="master-clock-pill"
+              style={{ whiteSpace: "nowrap", fontSize: "11.5px", padding: "4px 9px" }}
+            >
+              {masterTime}
+            </span>
+          )}
 
-          <div className="system-status">
+          <div
+            className="system-status"
+            title={role === "master" ? "MASTER NODE" : "AGENT NODE"}
+            style={{ padding: "4px 9px", gap: "6px" }}
+          >
             <span className="status-dot" />
-            <span>{role.toUpperCase()}</span>
+            <span style={{ fontWeight: 700 }}>
+              {role === "master" ? "M" : "A"}
+            </span>
           </div>
 
           <button
             className="icon-button theme-button"
             onClick={openPortSettingsModal}
-            aria-label="Engine 1 & 2 Port Settings"
-            title="Engine 1 & 2 Port Settings (28001–28030 / 32001–32030)"
+            aria-label="Settings"
+            title="Settings (Ports & Theme)"
           >
             <svg
               width="17"
@@ -517,15 +553,6 @@ export default function App() {
               <circle cx="12" cy="12" r="4" />
             </svg>
           </button>
-
-          <button
-            className="icon-button theme-button"
-            onClick={() => setDarkMode((value) => !value)}
-            aria-label="Change theme"
-            title="Change theme"
-          >
-            {darkMode ? <Globe2 size={17} /> : <Activity size={17} />}
-          </button>
         </div>
       </header>
 
@@ -540,14 +567,14 @@ export default function App() {
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            padding: "18px",
+            padding: "14px",
           }}
           onClick={() => setShowPortSettings(false)}
         >
           <div
             style={{
               width: "min(860px, 100%)",
-              maxHeight: "88vh",
+              maxHeight: "90vh",
               backgroundColor: "var(--card-bg, #12192b)",
               border: "1px solid var(--border-color, #26334d)",
               borderRadius: "16px",
@@ -560,34 +587,47 @@ export default function App() {
           >
             <div
               style={{
-                padding: "18px 22px",
+                padding: "16px 20px",
                 borderBottom: "1px solid var(--border-color, #26334d)",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "space-between",
-                gap: "12px",
+                gap: "10px",
+                flexWrap: "wrap",
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
                 <Settings2 size={18} />
                 <div>
                   <div style={{ fontWeight: 700, fontSize: "15px" }}>
-                    Engine 1 & Engine 2 Port Settings
+                    Application & Port Settings
                   </div>
                   <div style={{ fontSize: "12px", opacity: 0.7 }}>
-                    Engine 1 carrier ports are embedded directly into your connection token
+                    Customize appearance and Engine 1 / Engine 2 port mappings
                   </div>
                 </div>
               </div>
 
-              <button
-                type="button"
-                className="icon-button"
-                onClick={() => setShowPortSettings(false)}
-                title="Close settings"
-              >
-                ✕
-              </button>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <button
+                  type="button"
+                  className="next-method-btn"
+                  onClick={() => setDarkMode((value) => !value)}
+                  title="Switch Light / Dark Theme"
+                >
+                  <Globe2 size={14} />
+                  <span>{darkMode ? "Theme: Dark" : "Theme: Light"}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => setShowPortSettings(false)}
+                  title="Close settings"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {!selectedServer ? (
@@ -598,7 +638,7 @@ export default function App() {
               <>
                 <div
                   style={{
-                    padding: "14px 22px",
+                    padding: "14px 20px",
                     borderBottom: "1px solid var(--border-color, #26334d)",
                     display: "flex",
                     flexWrap: "wrap",
@@ -658,7 +698,7 @@ export default function App() {
                             setEngine1BasePort(Number(e.target.value) || 28001)
                           }
                           style={{
-                            width: "86px",
+                            width: "82px",
                             padding: "6px 8px",
                             borderRadius: "8px",
                             border: "1px solid var(--border-color, #2c3a57)",
@@ -687,7 +727,7 @@ export default function App() {
                             setEngine2BasePort(Number(e.target.value) || 32001)
                           }
                           style={{
-                            width: "86px",
+                            width: "82px",
                             padding: "6px 8px",
                             borderRadius: "8px",
                             border: "1px solid var(--border-color, #2c3a57)",
@@ -710,10 +750,10 @@ export default function App() {
 
                 <div
                   style={{
-                    padding: "16px 22px",
+                    padding: "16px 20px",
                     overflowY: "auto",
                     display: "grid",
-                    gridTemplateColumns: "repeat(auto-fill, minmax(245px, 1fr))",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
                     gap: "10px",
                   }}
                 >
@@ -838,12 +878,13 @@ export default function App() {
 
                 <div
                   style={{
-                    padding: "14px 22px",
+                    padding: "14px 20px",
                     borderTop: "1px solid var(--border-color, #26334d)",
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "space-between",
                     gap: "12px",
+                    flexWrap: "wrap",
                   }}
                 >
                   <div style={{ fontSize: "13px", color: "#34d399", fontWeight: 600 }}>
@@ -1257,6 +1298,7 @@ export default function App() {
                     const draft = getDraftTunnel(selectedServer.id, tunnel);
                     const tunnelKey = `${selectedServer.id}:${tunnel.id}`;
                     const isSaving = savingTunnelKey === tunnelKey;
+                    const isPinging = pingingKey === tunnelKey;
                     const noticeText = savedNotice[tunnelKey];
 
                     return (
@@ -1277,28 +1319,6 @@ export default function App() {
                             </span>
 
                             <span className="tunnel-title">{tunnel.name}</span>
-
-                            <span className="port-chip">:{tunnel.listen_port}</span>
-
-                            <span className={`sec-badge ${securityTierClass(tunnel.security)}`}>
-                              {tunnel.security}%
-                            </span>
-
-                            <span className="proto-badge">
-                              {tunnel.traffic_type.toUpperCase()}
-                            </span>
-
-                            {disc?.tested_at && (
-                              <span
-                                className={`disc-pill ${
-                                  disc.success ? "disc-ok" : "disc-fail"
-                                }`}
-                              >
-                                {disc.success
-                                  ? `OK ${disc.latency_ms}ms`
-                                  : disc.error_reason || "Failed"}
-                              </span>
-                            )}
 
                             {noticeText && !expanded && (
                               <span className="save-feedback-inline">✓ {noticeText}</span>
@@ -1328,6 +1348,62 @@ export default function App() {
                             aria-label={`Toggle ${tunnel.name}`}
                           >
                             <span />
+                          </button>
+                        </div>
+
+                        {/* Lower narrow footer bar for mobile-friendly metadata & live Ping button */}
+                        <div
+                          className="server-subbar"
+                          style={{
+                            padding: "6px 14px",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "8px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "6px",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <span className="port-chip">:{tunnel.listen_port}</span>
+
+                            <span className={`sec-badge ${securityTierClass(tunnel.security)}`}>
+                              {tunnel.security}%
+                            </span>
+
+                            <span className="proto-badge">
+                              {tunnel.traffic_type.toUpperCase()}
+                            </span>
+
+                            {disc?.tested_at && (
+                              <span
+                                className={`disc-pill ${
+                                  disc.success ? "disc-ok" : "disc-fail"
+                                }`}
+                              >
+                                {disc.success
+                                  ? `OK ${disc.latency_ms}ms`
+                                  : disc.error_reason || "Failed"}
+                              </span>
+                            )}
+                          </div>
+
+                          <button
+                            type="button"
+                            className="next-method-btn"
+                            style={{ padding: "4px 10px", fontSize: "11.5px" }}
+                            disabled={isPinging || !tunnel.implemented}
+                            onClick={() => handlePingTunnel(selectedServer.id, tunnel.id)}
+                            title={`Test ping on ${tunnel.name} (:${tunnel.listen_port})`}
+                          >
+                            <Activity size={12} />
+                            <span>{isPinging ? "Pinging..." : "Ping"}</span>
                           </button>
                         </div>
 
