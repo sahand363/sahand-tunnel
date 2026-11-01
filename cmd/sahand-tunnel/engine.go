@@ -224,6 +224,25 @@ func syncServerListeners(peer ServerPeer) {
 			continue
 		}
 
+		// Method 23 (HTTP Upgrade): Genuine RFC 9110 Section 7.8 / Xray httpupgrade (101 Switching Protocols + Raw Stream)
+		if tc.ID == 23 {
+			if ln, err := startHTTPUpgradeServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
+			continue
+		}
+
 		// Method 22 (WebSocket Multiplex): Genuine RFC 6455 Binary WebSocket Stream Multiplexer
 		if tc.ID == 22 {
 			if ln, err := startWSMultiplexServerListener(peer, tc); err == nil {
@@ -778,6 +797,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardTCPMultiplexTraffic(client, peer, tc, targetPort)
 	case 22:
 		forwardWSMultiplexTraffic(client, peer, tc, targetPort)
+	case 23:
+		forwardHTTPUpgradeTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -807,7 +828,7 @@ func recordLifelineEvent(peer *ServerPeer, mID int, mName string, port int, sec 
 	}
 	history := []LifelineEvent{ev}
 	for _, old := range peer.RecentLifelines {
-		if len(history) >= 5 {
+		if len(history) >= 20 {
 			break
 		}
 		history = append(history, old)
@@ -997,6 +1018,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeTCPMultiplex(peer, tc, localNodeID)
 	case 22:
 		res = probeWSMultiplex(peer, tc, localNodeID)
+	case 23:
+		res = probeHTTPUpgrade(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -1007,6 +1030,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 23:
+		return pushHTTPUpgradeParitySync(peer, tc, latencyMS)
 	case 22:
 		return pushWSMultiplexParitySync(peer, tc, latencyMS)
 	case 21:
