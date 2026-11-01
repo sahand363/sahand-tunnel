@@ -500,7 +500,6 @@ export default function App() {
   const totalRx = visibleAnalytics.reduce((acc, d) => acc + d.rx_bytes, 0);
   const totalTx = visibleAnalytics.reduce((acc, d) => acc + d.tx_bytes, 0);
 
-  // Explicit theme-aware palette for the Settings Modal
   const modalTheme = darkMode
     ? {
         backdrop: "rgba(5, 9, 20, 0.78)",
@@ -1331,7 +1330,7 @@ export default function App() {
                           }
                         >
                           <span>
-                            Recent Working Methods ({server.recent_lifelines?.length || 0}/5)
+                            Recent Working Methods ({server.recent_lifelines?.length || 0}/20)
                           </span>
                           {historyOpen ? (
                             <ChevronDown size={14} />
@@ -1462,7 +1461,6 @@ export default function App() {
                         className={`tunnel-card ${expanded ? "expanded" : ""}`}
                         key={tunnel.id}
                       >
-                        {/* Top Ribbon: Method ID, Name, Protocol Badge (TCP / TCP+UDP), and Toggle */}
                         <div className="tunnel-row">
                           <button
                             className="tunnel-expand"
@@ -1512,7 +1510,6 @@ export default function App() {
                           </button>
                         </div>
 
-                        {/* Lower Narrow Footer: Port, Security %, Ping Result, and Ping Button */}
                         <div
                           className="server-subbar"
                           style={{
