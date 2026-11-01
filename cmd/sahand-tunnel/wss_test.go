@@ -120,7 +120,7 @@ func allocateFreeTCPPort(t *testing.T) int {
 	return port
 }
 
-func generateCustomTestCert(t *testing.T, notBefore, notAfter time.Time, dnsNames []string) (tls.Certificate, string, string) {
+func generateCustomTestCert(t *testing.T, notBefore, notAfter time.Time, dnsNames []string, isCA bool) (tls.Certificate, string, string) {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -134,6 +134,10 @@ func generateCustomTestCert(t *testing.T, notBefore, notAfter time.Time, dnsName
 	if len(dnsNames) > 0 {
 		cn = dnsNames[0]
 	}
+	keyUsage := x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature
+	if isCA {
+		keyUsage |= x509.KeyUsageCertSign
+	}
 	tmpl := x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -141,10 +145,10 @@ func generateCustomTestCert(t *testing.T, notBefore, notAfter time.Time, dnsName
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		KeyUsage:              keyUsage,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		IsCA:                  true,
+		IsCA:                  isCA,
 		DNSNames:              dnsNames,
 		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
@@ -195,7 +199,7 @@ func TestWSSRFC6455ProbeAndPinVerification(t *testing.T) {
 		}
 	}
 
-	// 2. Valid RFC 6455 probe with empty pin (uses standard RootCAs + hostname verification)
+	// 2. Valid RFC 6455 probe with empty pin (simulating Master dialing Agent before RemoteCertPin is known)
 	unpinnedPeer := peer
 	unpinnedPeer.RemoteCertPin = ""
 	unpinnedTC := tc
@@ -238,7 +242,6 @@ func TestWSSCertificateValidationPolicies(t *testing.T) {
 	}()
 
 	// 1. Hostname mismatch must fail in BOTH pinned mode and unpinned mode
-	// (generateSelfSignedCert only includes DNSNames: "www.speedtest.net", "localhost" and IPs 127.0.0.1, ::1)
 	mismatchPinnedTC := tc
 	mismatchPinnedTC.SNI = "unlisted.example.org"
 	resMismatchPinned := probeWSS(peer, mismatchPinnedTC, "master-node-01")
@@ -258,9 +261,8 @@ func TestWSSCertificateValidationPolicies(t *testing.T) {
 			resMismatchUnpinned.Success, resMismatchUnpinned.ErrorReason)
 	}
 
-	// 2. Untrusted self-signed certificate:
-	// Presenting a self-signed server certificate that is NOT in RootCAs (appCfg.TLSCertPEM)
-	// must fail in unpinned mode, but succeed when its SHA-256 pin is configured in pinned mode.
+	// 2. Untrusted self-signed certificate (also with legacy IsCA: false):
+	// Must fail in unpinned mode, and succeed when its SHA-256 pin is configured in pinned mode.
 	stateMu.Lock()
 	origCert := localCert
 	untrustedCert, _, untrustedPin := generateCustomTestCert(
@@ -268,6 +270,7 @@ func TestWSSCertificateValidationPolicies(t *testing.T) {
 		time.Now().Add(-1*time.Hour),
 		time.Now().Add(24*time.Hour),
 		[]string{"www.speedtest.net", "localhost"},
+		false, // Legacy IsCA: false self-signed certificate
 	)
 	localCert = untrustedCert
 	stateMu.Unlock()
@@ -287,19 +290,17 @@ func TestWSSCertificateValidationPolicies(t *testing.T) {
 	}
 	defer lnUntrusted.Close()
 
-	// Unpinned mode must reject the unknown self-signed certificate
 	resUntrustedUnpinned := probeWSS(unpinnedPeer, untrustedTC, "master-node-01")
 	if resUntrustedUnpinned.Success || resUntrustedUnpinned.ErrorReason != "TLS failure" {
 		t.Fatalf("expected unpinned probe against untrusted self-signed cert to fail with TLS failure, got success=%v reason=%q",
 			resUntrustedUnpinned.Success, resUntrustedUnpinned.ErrorReason)
 	}
 
-	// Pinned mode with matching pin must accept the self-signed certificate
 	pinnedSelfSignedTC := untrustedTC
 	pinnedSelfSignedTC.CertPin = untrustedPin
 	resPinnedSelfSigned := probeWSS(unpinnedPeer, pinnedSelfSignedTC, "master-node-01")
 	if !resPinnedSelfSigned.Success {
-		t.Fatalf("expected pinned probe against self-signed cert with matching pin to succeed, got: %s",
+		t.Fatalf("expected pinned probe against legacy IsCA=false self-signed cert with matching pin to succeed, got: %s",
 			resPinnedSelfSigned.ErrorReason)
 	}
 
@@ -310,6 +311,7 @@ func TestWSSCertificateValidationPolicies(t *testing.T) {
 		time.Now().Add(-48*time.Hour),
 		time.Now().Add(-2*time.Hour),
 		[]string{"www.speedtest.net", "localhost"},
+		true,
 	)
 	localCert = expiredCert
 	origPEM := appCfg.TLSCertPEM
@@ -352,7 +354,6 @@ func TestWSSTargetPortAuthorization(t *testing.T) {
 	allowedPort, closeAllowed := startLocalTCPEchoTarget(t)
 	defer closeAllowed()
 
-	// Start a second local TCP service that is NOT in tc.ForwardPorts
 	unauthorizedLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to bind unauthorized target listener: %v", err)
@@ -392,7 +393,6 @@ func TestWSSTargetPortAuthorization(t *testing.T) {
 	}
 	wsURL := buildWSSURL(peer.IP, tc.ListenPort, tc.WSPath)
 
-	// 1. Attempt to forward to unauthorizedPort via X-Target-Port
 	unauthStr := strconv.Itoa(unauthorizedPort)
 	hdr := http.Header{}
 	hdr.Set("Host", tc.SNI)
@@ -415,7 +415,6 @@ func TestWSSTargetPortAuthorization(t *testing.T) {
 		t.Fatalf("Agent dialed unauthorized localhost port %d!", unauthorizedPort)
 	}
 
-	// 2. Attempt to forward to authorized allowedPort via X-Target-Port
 	allowedStr := strconv.Itoa(allowedPort)
 	hdrOK := http.Header{}
 	hdrOK.Set("Host", tc.SNI)
@@ -469,7 +468,6 @@ func TestWSSPeerAuthentication(t *testing.T) {
 	wsURL := buildWSSURL(peer.IP, tc.ListenPort, tc.WSPath)
 	portStr := strconv.Itoa(targetPort)
 
-	// 1. Missing X-Sahand-Peer / authentication headers must be rejected with 401 Unauthorized
 	hdrMissing := http.Header{}
 	hdrMissing.Set("Host", tc.SNI)
 	hdrMissing.Set("X-Target-Port", portStr)
@@ -484,7 +482,6 @@ func TestWSSPeerAuthentication(t *testing.T) {
 		t.Fatalf("expected 401 Unauthorized for missing X-Sahand-Peer, got %v", resp1)
 	}
 
-	// 2. Forged X-Sahand-Peer header must be rejected with 401 Unauthorized
 	hdrForgedPeer := http.Header{}
 	hdrForgedPeer.Set("Host", tc.SNI)
 	hdrForgedPeer.Set("X-Target-Port", portStr)
@@ -502,7 +499,6 @@ func TestWSSPeerAuthentication(t *testing.T) {
 		t.Fatalf("expected 401 Unauthorized for forged X-Sahand-Peer, got %v", resp2)
 	}
 
-	// 3. Forged parity sync request without valid HMAC must be rejected with 401 Unauthorized
 	tlsCfg, err := buildWSSClientTLSConfig(peer, tc)
 	if err != nil {
 		t.Fatalf("buildWSSClientTLSConfig failed: %v", err)
@@ -542,7 +538,6 @@ func TestWSSPeerAuthentication(t *testing.T) {
 		t.Fatalf("expected 401 Unauthorized for forged parity sync, got %d", respSyncForged.StatusCode)
 	}
 
-	// 4. Authentic pushWSSParitySync must succeed
 	if !pushWSSParitySync(peer, tc, 25) {
 		t.Fatalf("expected authentic pushWSSParitySync to succeed")
 	}
@@ -551,7 +546,6 @@ func TestWSSPeerAuthentication(t *testing.T) {
 func TestWSSClosingHandshakeAndTCPHalfClose(t *testing.T) {
 	peer, tc := setupWSSTestEnv(t)
 
-	// Start a target TCP server that waits for client EOF (TCP half-close FIN) BEFORE writing its response
 	halfCloseLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to bind half-close target listener: %v", err)
@@ -567,7 +561,6 @@ func TestWSSClosingHandshakeAndTCPHalfClose(t *testing.T) {
 			}
 			go func(conn net.Conn) {
 				defer conn.Close()
-				// Read all bytes until client half-closes (sends FIN / EOF)
 				reqData, err := io.ReadAll(conn)
 				if err != nil {
 					return
@@ -600,7 +593,6 @@ func TestWSSClosingHandshakeAndTCPHalfClose(t *testing.T) {
 	defer entryLn.Close()
 	go acceptTrafficEntryLoop(entryLn, peer, tc, strconv.Itoa(halfClosePort))
 
-	// Part 1: Verify end-to-end TCP half-close across Master -> WSS -> Agent -> Target
 	clientConn, err := net.DialTimeout("tcp", entryLn.Addr().String(), 5*time.Second)
 	if err != nil {
 		t.Fatalf("failed to dial entry listener: %v", err)
@@ -612,7 +604,6 @@ func TestWSSClosingHandshakeAndTCPHalfClose(t *testing.T) {
 	if _, err := clientConn.Write(payload); err != nil {
 		t.Fatalf("clientConn.Write failed: %v", err)
 	}
-	// Perform TCP half-close on the write side
 	if err := clientConn.(*net.TCPConn).CloseWrite(); err != nil {
 		t.Fatalf("CloseWrite failed: %v", err)
 	}
@@ -626,7 +617,6 @@ func TestWSSClosingHandshakeAndTCPHalfClose(t *testing.T) {
 		t.Fatalf("expected half-close response %q, got %q", string(expectedReply), string(replyBytes))
 	}
 
-	// Part 2: Verify RFC 6455 two-way Close control frame handshake on the wire
 	dialer, err := newWSSClientDialer(peer, tc, 4*time.Second)
 	if err != nil {
 		t.Fatalf("newWSSClientDialer failed: %v", err)
@@ -657,19 +647,16 @@ func TestWSSClosingHandshakeAndTCPHalfClose(t *testing.T) {
 	if err := wsConn.WriteMessage(websocket.BinaryMessage, payload); err != nil {
 		t.Fatalf("wsConn.WriteMessage failed: %v", err)
 	}
-	// Send RFC 6455 Close control frame from client
 	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "client done")
 	if err := wsConn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(3*time.Second)); err != nil {
 		t.Fatalf("wsConn.WriteControl CloseMessage failed: %v", err)
 	}
 
-	// Read remaining BinaryMessage (sent by target after EOF) and then the server's reply Close frame
 	_ = wsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	msgType, wsReply, err := wsConn.ReadMessage()
 	if err != nil || msgType != websocket.BinaryMessage || !bytes.Equal(wsReply, expectedReply) {
 		t.Fatalf("expected BinaryMessage %q before Close, got err=%v reply=%q", string(expectedReply), err, string(wsReply))
 	}
-	// Next ReadMessage must encounter the server's Close frame
 	_, _, closeErr := wsConn.ReadMessage()
 	if closeErr == nil {
 		t.Fatalf("expected CloseError from server")
@@ -690,7 +677,6 @@ func TestWSSPingPongKeepaliveAndDeadPeerDetection(t *testing.T) {
 		CheckOrigin: func(_ *http.Request) bool { return true },
 	}
 
-	// Start a test WebSocket peer that counts incoming Ping frames and optionally suppresses Pong replies
 	srvLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("net.Listen failed: %v", err)
@@ -708,7 +694,6 @@ func TestWSSPingPongKeepaliveAndDeadPeerDetection(t *testing.T) {
 		ws.SetPingHandler(func(appData string) error {
 			pingCount.Add(1)
 			if suppressPong.Load() {
-				// Simulate an unresponsive peer by not sending Pong
 				return nil
 			}
 			return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
@@ -733,7 +718,6 @@ func TestWSSPingPongKeepaliveAndDeadPeerDetection(t *testing.T) {
 
 	wsURL := "ws://" + srvLn.Addr().String() + "/ws"
 
-	// Part 1: Verify periodic Ping frames, automatic Pong responses, and read-deadline refresh
 	wsConn1, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatalf("Dial failed: %v", err)
@@ -757,14 +741,12 @@ func TestWSSPingPongKeepaliveAndDeadPeerDetection(t *testing.T) {
 		bridgeWSSAndTCPWithOptions(wsConn1, bridgeTCP1, tc, opts1)
 	}()
 
-	// Wait 380ms (> 2x pongTimeout and ~7 ping intervals)
 	time.Sleep(380 * time.Millisecond)
 
 	if pingCount.Load() < 3 || pongCount.Load() < 3 {
 		t.Fatalf("expected at least 3 Ping/Pong cycles, got pings=%d pongs=%d", pingCount.Load(), pongCount.Load())
 	}
 
-	// Verify the connection remained alive past pongTimeout and still echoes data
 	_ = clientTCP1.SetDeadline(time.Now().Add(2 * time.Second))
 	testPayload := []byte("alive-after-multiple-pongs")
 	if _, err := clientTCP1.Write(testPayload); err != nil {
@@ -777,7 +759,6 @@ func TestWSSPingPongKeepaliveAndDeadPeerDetection(t *testing.T) {
 	_ = clientTCP1.Close()
 	<-bridgeDone1
 
-	// Part 2: Verify detection and clean shutdown when peer stops responding to Pings
 	suppressPong.Store(true)
 	wsConn2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
