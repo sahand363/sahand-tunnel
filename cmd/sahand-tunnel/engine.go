@@ -1047,6 +1047,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 1:
+		return pushWSSParitySync(peer, tc, latencyMS)
 	case 23:
 		return pushHTTPUpgradeParitySync(peer, tc, latencyMS)
 	case 22:
@@ -1104,21 +1106,11 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 
 	var conn net.Conn = rawConn
 	if tc.ID != 6 {
-		var tlsCfg *tls.Config
-		if tc.ID == 1 {
-			var cfgErr error
-			tlsCfg, cfgErr = buildWSSClientTLSConfig(peer, tc)
-			if cfgErr != nil {
-				return false
-			}
-		} else {
-			tlsCfg = &tls.Config{
-				ServerName:         sni,
-				InsecureSkipVerify: true,
-				MinVersion:         tls.VersionTLS12,
-			}
-		}
-		tlsConn := tls.Client(rawConn, tlsCfg)
+		tlsConn := tls.Client(rawConn, &tls.Config{
+			ServerName:         sni,
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		})
 		if err := tlsConn.Handshake(); err != nil {
 			return false
 		}
