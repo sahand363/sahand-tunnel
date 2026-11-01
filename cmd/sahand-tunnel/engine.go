@@ -174,9 +174,6 @@ func formatConnectionInitiator(localRole, direction string) string {
 	return "Master → Agent"
 }
 
-// Strict Role-Aware Binding:
-// ONLY the Entry Server (Master) binds ForwardPorts (0.0.0.0:<targetPort>) to accept incoming client connections.
-// The Exit Server (Agent, where X-UI / Xray runs) NEVER binds ForwardPorts, preventing port collisions when Xray restarts.
 func shouldBindEntryPorts() bool {
 	stateMu.RLock()
 	role := appCfg.Role
@@ -194,6 +191,8 @@ func stopAllServerListeners(peerID string) {
 	stopUDPRelayPeerResources(peerID)
 	stopDNSTransportPeerResources(peerID)
 	stopWebTransportPeerResources(peerID)
+	stopTCPMultiplexPeerResources(peerID)
+	stopWSMultiplexPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -222,6 +221,63 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 22 (WebSocket Multiplex): Genuine RFC 6455 Binary WebSocket Stream Multiplexer
+		if tc.ID == 22 {
+			if ln, err := startWSMultiplexServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 21 (TCP Multiplex): Genuine Yamux-style Binary Stream Multiplexer
+		if tc.ID == 21 {
+			if ln, err := startTCPMultiplexServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
+			continue
+		}
+
+		// Method 20 (mTLS Stream): Genuine TLS 1.3 Mutual X.509 Certificate Authentication
+		if tc.ID == 20 {
+			if ln, err := startMTLSStreamServerListener(peer, tc); err == nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+					}
+				}
+			}
 			continue
 		}
 
@@ -716,6 +772,12 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardHTTPLongPollingTraffic(client, peer, tc, targetPort)
 	case 19:
 		forwardWebTransportTraffic(client, peer, tc, targetPort)
+	case 20:
+		forwardMTLSStreamTraffic(client, peer, tc, targetPort)
+	case 21:
+		forwardTCPMultiplexTraffic(client, peer, tc, targetPort)
+	case 22:
+		forwardWSMultiplexTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -929,6 +991,12 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeHTTPLongPolling(peer, tc, localNodeID)
 	case 19:
 		res = probeWebTransport(peer, tc, localNodeID)
+	case 20:
+		res = probeMTLSStream(peer, tc, localNodeID)
+	case 21:
+		res = probeTCPMultiplex(peer, tc, localNodeID)
+	case 22:
+		res = probeWSMultiplex(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -939,6 +1007,12 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 22:
+		return pushWSMultiplexParitySync(peer, tc, latencyMS)
+	case 21:
+		return pushTCPMultiplexParitySync(peer, tc, latencyMS)
+	case 20:
+		return pushMTLSStreamParitySync(peer, tc, latencyMS)
 	case 19:
 		return pushWebTransportParitySync(peer, tc, latencyMS)
 	case 18:
