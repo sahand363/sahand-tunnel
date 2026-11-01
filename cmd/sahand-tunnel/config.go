@@ -191,36 +191,36 @@ type Session struct {
 }
 
 var methodCatalogue = []MethodCatalogueItem{
-	{1, "WSS", 95, "tcp", true, 11301, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
-	{2, "gRPC", 95, "tcp", true, 11302, []string{"listen_port", "forward_ports", "sni", "cert_pin", "stream_limit", "speed_limit_mbps"}},
-	{3, "HTTP/2", 90, "tcp", true, 11303, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec", "speed_limit_mbps"}},
-	{4, "HTTP CONNECT", 76, "tcp", true, 11304, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
-	{5, "HTTPS Proxy", 82, "tcp", true, 11305, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
-	{6, "TCP Relay", 45, "tcp", true, 11306, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
-	{7, "TLS Stream", 88, "tcp", true, 11307, []string{"listen_port", "forward_ports", "sni", "cert_pin", "speed_limit_mbps"}},
-	{8, "QUIC", 92, "tcp+udp", true, 11308, []string{"listen_port", "forward_ports", "sni", "cert_pin", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
-	{9, "Rathole", 94, "tcp+udp", true, 11309, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
-	{10, "Noise TCP Stealth", 97, "tcp+udp", true, 11310, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
-	{11, "Reverse TCP", 50, "tcp", true, 11311, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
-	{12, "SOCKS5", 60, "tcp+udp", true, 11312, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
-	{13, "SSH Tunnel", 86, "tcp", true, 11313, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
-	{14, "Raw TCP", 35, "tcp", true, 11314, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
-	{15, "UDP Relay", 40, "udp", true, 11315, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
-	{16, "DNS Transport", 70, "tcp+udp", true, 11316, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
-	{17, "TLS over TCP", 84, "tcp", true, 11317, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
-	{18, "HTTP Long Polling", 72, "tcp", true, 11318, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
-	{19, "WebTransport", 93, "tcp+udp", true, 11319, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
-	{20, "mTLS Stream", 99, "tcp", false, 11320, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
-	{21, "TCP Multiplex", 68, "tcp", false, 11321, []string{"listen_port", "forward_ports", "stream_limit"}},
-	{22, "WebSocket Multiplex", 89, "tcp", false, 11322, []string{"listen_port", "forward_ports", "sni", "ws_path", "stream_limit"}},
-	{23, "HTTP Upgrade", 74, "tcp", false, 11323, []string{"listen_port", "forward_ports", "ws_path"}},
-	{24, "Reverse Proxy", 78, "tcp", false, 11324, []string{"listen_port", "forward_ports", "sni"}},
-	{25, "Secure Relay", 85, "tcp", false, 11325, []string{"listen_port", "forward_ports", "sni"}},
-	{26, "Stream Bridge", 80, "tcp+udp", false, 11326, []string{"listen_port", "forward_ports", "stream_limit"}},
-	{27, "Fallback TCP", 42, "tcp", false, 11327, []string{"listen_port", "forward_ports"}},
-	{28, "Custom TLS", 91, "tcp", false, 11328, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
-	{29, "Hybrid Transport", 87, "tcp+udp", false, 11329, []string{"listen_port", "forward_ports", "sni"}},
-	{30, "Experimental", 62, "tcp+udp", false, 11330, []string{"listen_port", "forward_ports"}},
+	{1, "WSS", 95, "tcp", true, 28001, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
+	{2, "gRPC", 95, "tcp", true, 28002, []string{"listen_port", "forward_ports", "sni", "cert_pin", "stream_limit", "speed_limit_mbps"}},
+	{3, "HTTP/2", 90, "tcp", true, 28003, []string{"listen_port", "forward_ports", "sni", "heartbeat_sec", "speed_limit_mbps"}},
+	{4, "HTTP CONNECT", 76, "tcp", true, 28004, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
+	{5, "HTTPS Proxy", 82, "tcp", true, 28005, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
+	{6, "TCP Relay", 45, "tcp", true, 28006, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
+	{7, "TLS Stream", 88, "tcp", true, 28007, []string{"listen_port", "forward_ports", "sni", "cert_pin", "speed_limit_mbps"}},
+	{8, "QUIC", 92, "tcp+udp", true, 28008, []string{"listen_port", "forward_ports", "sni", "cert_pin", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
+	{9, "Rathole", 94, "tcp+udp", true, 28009, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
+	{10, "Noise TCP Stealth", 97, "tcp+udp", true, 28010, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
+	{11, "Reverse TCP", 50, "tcp", true, 28011, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
+	{12, "SOCKS5", 60, "tcp+udp", true, 28012, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
+	{13, "SSH Tunnel", 86, "tcp", true, 28013, []string{"listen_port", "forward_ports", "heartbeat_sec", "speed_limit_mbps"}},
+	{14, "Raw TCP", 35, "tcp", true, 28014, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
+	{15, "UDP Relay", 40, "udp", true, 28015, []string{"listen_port", "forward_ports", "speed_limit_mbps"}},
+	{16, "DNS Transport", 70, "tcp+udp", true, 28016, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
+	{17, "TLS over TCP", 84, "tcp", true, 28017, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
+	{18, "HTTP Long Polling", 72, "tcp", true, 28018, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
+	{19, "WebTransport", 93, "tcp+udp", true, 28019, []string{"listen_port", "forward_ports", "sni", "speed_limit_mbps"}},
+	{20, "mTLS Stream", 99, "tcp", false, 28020, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
+	{21, "TCP Multiplex", 68, "tcp", false, 28021, []string{"listen_port", "forward_ports", "stream_limit"}},
+	{22, "WebSocket Multiplex", 89, "tcp", false, 28022, []string{"listen_port", "forward_ports", "sni", "ws_path", "stream_limit"}},
+	{23, "HTTP Upgrade", 74, "tcp", false, 28023, []string{"listen_port", "forward_ports", "ws_path"}},
+	{24, "Reverse Proxy", 78, "tcp", false, 28024, []string{"listen_port", "forward_ports", "sni"}},
+	{25, "Secure Relay", 85, "tcp", false, 28025, []string{"listen_port", "forward_ports", "sni"}},
+	{26, "Stream Bridge", 80, "tcp+udp", false, 28026, []string{"listen_port", "forward_ports", "stream_limit"}},
+	{27, "Fallback TCP", 42, "tcp", false, 28027, []string{"listen_port", "forward_ports"}},
+	{28, "Custom TLS", 91, "tcp", false, 28028, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
+	{29, "Hybrid Transport", 87, "tcp+udp", false, 28029, []string{"listen_port", "forward_ports", "sni"}},
+	{30, "Experimental", 62, "tcp+udp", false, 28030, []string{"listen_port", "forward_ports"}},
 }
 
 var (
@@ -464,7 +464,7 @@ func defaultTunnelsForServer() []TunnelConfig {
 			Implemented:    item.Implemented,
 			Enabled:        item.ID == 1,
 			ListenPort:     item.DefaultPort,
-			ForwardPorts:   "2053",
+			ForwardPorts:   strconv.Itoa(32000 + item.ID),
 			SpeedLimitMBps: "0",
 			LastDiscovery: MethodResult{
 				MethodID: item.ID,
@@ -502,10 +502,15 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			cur.Security = def.Security
 			cur.TrafficType = def.TrafficType
 			cur.Implemented = def.Implemented
-			if cur.ListenPort < 1024 || cur.ListenPort > 65535 || cur.ListenPort == 10200+def.ID {
+			if cur.ListenPort < 1024 ||
+				cur.ListenPort > 65535 ||
+				cur.ListenPort == 10200+def.ID ||
+				cur.ListenPort == 11300+def.ID ||
+				cur.ListenPort == 11400+def.ID {
 				cur.ListenPort = def.ListenPort
 			}
-			if strings.TrimSpace(cur.ForwardPorts) == "" {
+			trimmedFwd := strings.TrimSpace(cur.ForwardPorts)
+			if trimmedFwd == "" || trimmedFwd == "2053" {
 				cur.ForwardPorts = def.ForwardPorts
 			}
 			if cur.SNI == "" {
