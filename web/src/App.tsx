@@ -89,6 +89,11 @@ type DailyUsage = {
   tx_bytes: number;
 };
 
+type PortDraftMap = Record<
+  number,
+  { listen_port: number; forward_ports: string }
+>;
+
 function formatBytes(bytes: number): string {
   if (!bytes || bytes <= 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -146,6 +151,14 @@ export default function App() {
   const [draftTunnels, setDraftTunnels] = useState<Record<string, TunnelConfig>>({});
   const [savingTunnelKey, setSavingTunnelKey] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<Record<string, string>>({});
+
+  // Top-bar Nut Icon (Port Settings Modal) state
+  const [showPortSettings, setShowPortSettings] = useState(false);
+  const [portDrafts, setPortDrafts] = useState<PortDraftMap>({});
+  const [engine1BasePort, setEngine1BasePort] = useState(28001);
+  const [engine2BasePort, setEngine2BasePort] = useState(32001);
+  const [savingBatchPorts, setSavingBatchPorts] = useState(false);
+  const [batchPortNotice, setBatchPortNotice] = useState("");
 
   const [analyticsRange, setAnalyticsRange] = useState<7 | 30>(7);
   const [daysUsage, setDaysUsage] = useState<DailyUsage[]>([]);
@@ -219,6 +232,85 @@ export default function App() {
       fetchAnalytics();
     }
   }, [activeTab]);
+
+  const selectedServer =
+    servers.find((s) => s.id === selectedServerID) || servers[0] || null;
+
+  function openPortSettingsModal() {
+    if (selectedServer) {
+      const initial: PortDraftMap = {};
+      for (const t of selectedServer.tunnels) {
+        initial[t.id] = {
+          listen_port: t.listen_port || 28000 + t.id,
+          forward_ports: t.forward_ports || String(32000 + t.id),
+        };
+      }
+      setPortDrafts(initial);
+    }
+    setBatchPortNotice("");
+    setShowPortSettings(true);
+  }
+
+  function applyEngine1BaseRange(base: number) {
+    const start = Math.max(1024, Math.min(65500, base));
+    setEngine1BasePort(start);
+    setPortDrafts((prev) => {
+      const next: PortDraftMap = { ...prev };
+      for (let id = 1; id <= 30; id++) {
+        next[id] = {
+          listen_port: start + id - 1,
+          forward_ports: next[id]?.forward_ports || String(32000 + id),
+        };
+      }
+      return next;
+    });
+  }
+
+  function applyEngine2BaseRange(base: number) {
+    const start = Math.max(1024, Math.min(65500, base));
+    setEngine2BasePort(start);
+    setPortDrafts((prev) => {
+      const next: PortDraftMap = { ...prev };
+      for (let id = 1; id <= 30; id++) {
+        next[id] = {
+          listen_port: next[id]?.listen_port || 28000 + id,
+          forward_ports: String(start + id - 1),
+        };
+      }
+      return next;
+    });
+  }
+
+  async function handleSaveAllPorts() {
+    if (!selectedServer || role !== "master") return;
+    setSavingBatchPorts(true);
+    setBatchPortNotice("");
+
+    const items = selectedServer.tunnels.map((t) => ({
+      id: t.id,
+      listen_port: portDrafts[t.id]?.listen_port ?? t.listen_port,
+      forward_ports: portDrafts[t.id]?.forward_ports ?? t.forward_ports,
+    }));
+
+    try {
+      const res = await fetch("/api/v1/tunnels/ports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          server_id: selectedServer.id,
+          items,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const verText = data.config_version ? ` (v${data.config_version})` : "";
+        setBatchPortNotice(`Saved & Token Updated${verText}`);
+        await fetchState();
+      }
+    } finally {
+      setSavingBatchPorts(false);
+    }
+  }
 
   async function handleAddOrConnectServer(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -369,8 +461,6 @@ export default function App() {
     }
   }
 
-  const selectedServer =
-    servers.find((s) => s.id === selectedServerID) || servers[0] || null;
   const visibleAnalytics = daysUsage.slice(-analyticsRange);
   const rawMaxBytes = Math.max(
     0,
@@ -409,6 +499,27 @@ export default function App() {
 
           <button
             className="icon-button theme-button"
+            onClick={openPortSettingsModal}
+            aria-label="Engine 1 & 2 Port Settings"
+            title="Engine 1 & 2 Port Settings (28001–28030 / 32001–32030)"
+          >
+            <svg
+              width="17"
+              height="17"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+              <circle cx="12" cy="12" r="4" />
+            </svg>
+          </button>
+
+          <button
+            className="icon-button theme-button"
             onClick={() => setDarkMode((value) => !value)}
             aria-label="Change theme"
             title="Change theme"
@@ -417,6 +528,368 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {showPortSettings && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            backgroundColor: "rgba(5, 9, 20, 0.78)",
+            backdropFilter: "blur(6px)",
+            zIndex: 9999,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "18px",
+          }}
+          onClick={() => setShowPortSettings(false)}
+        >
+          <div
+            style={{
+              width: "min(860px, 100%)",
+              maxHeight: "88vh",
+              backgroundColor: "var(--card-bg, #12192b)",
+              border: "1px solid var(--border-color, #26334d)",
+              borderRadius: "16px",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              boxShadow: "0 24px 60px rgba(0,0,0,0.55)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div
+              style={{
+                padding: "18px 22px",
+                borderBottom: "1px solid var(--border-color, #26334d)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <Settings2 size={18} />
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: "15px" }}>
+                    Engine 1 & Engine 2 Port Settings
+                  </div>
+                  <div style={{ fontSize: "12px", opacity: 0.7 }}>
+                    Engine 1 carrier ports are embedded directly into your connection token
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                className="icon-button"
+                onClick={() => setShowPortSettings(false)}
+                title="Close settings"
+              >
+                ✕
+              </button>
+            </div>
+
+            {!selectedServer ? (
+              <div style={{ padding: "36px", textAlign: "center", opacity: 0.75 }}>
+                Add or select a server first to configure its 30 method ports.
+              </div>
+            ) : (
+              <>
+                <div
+                  style={{
+                    padding: "14px 22px",
+                    borderBottom: "1px solid var(--border-color, #26334d)",
+                    display: "flex",
+                    flexWrap: "wrap",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "12px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "12px", fontWeight: 600, opacity: 0.8 }}>
+                      TARGET:
+                    </span>
+                    <select
+                      className="server-select"
+                      value={selectedServer.id}
+                      onChange={(e) => {
+                        const newID = e.target.value;
+                        handleSelectServer(newID);
+                        const srv = servers.find((s) => s.id === newID);
+                        if (srv) {
+                          const nextMap: PortDraftMap = {};
+                          for (const t of srv.tunnels) {
+                            nextMap[t.id] = {
+                              listen_port: t.listen_port,
+                              forward_ports: t.forward_ports,
+                            };
+                          }
+                          setPortDrafts(nextMap);
+                        }
+                      }}
+                    >
+                      {servers.map((srv) => (
+                        <option key={srv.id} value={srv.id}>
+                          {srv.name} ({srv.ip}) — v{srv.config_version}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {role === "master" && (
+                    <div
+                      style={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        alignItems: "center",
+                        gap: "10px",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                        <span style={{ fontSize: "12px", opacity: 0.8 }}>
+                          Engine 1 Start:
+                        </span>
+                        <input
+                          type="number"
+                          value={engine1BasePort}
+                          onChange={(e) =>
+                            setEngine1BasePort(Number(e.target.value) || 28001)
+                          }
+                          style={{
+                            width: "86px",
+                            padding: "6px 8px",
+                            borderRadius: "8px",
+                            border: "1px solid var(--border-color, #2c3a57)",
+                            background: "var(--input-bg, #0b1120)",
+                            color: "inherit",
+                            fontSize: "13px",
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="next-method-btn"
+                          onClick={() => applyEngine1BaseRange(engine1BasePort)}
+                        >
+                          Fill E1 ({engine1BasePort}–{engine1BasePort + 29})
+                        </button>
+                      </div>
+
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                        <span style={{ fontSize: "12px", opacity: 0.8 }}>
+                          Engine 2 Start:
+                        </span>
+                        <input
+                          type="number"
+                          value={engine2BasePort}
+                          onChange={(e) =>
+                            setEngine2BasePort(Number(e.target.value) || 32001)
+                          }
+                          style={{
+                            width: "86px",
+                            padding: "6px 8px",
+                            borderRadius: "8px",
+                            border: "1px solid var(--border-color, #2c3a57)",
+                            background: "var(--input-bg, #0b1120)",
+                            color: "inherit",
+                            fontSize: "13px",
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="next-method-btn"
+                          onClick={() => applyEngine2BaseRange(engine2BasePort)}
+                        >
+                          Fill E2 ({engine2BasePort}–{engine2BasePort + 29})
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div
+                  style={{
+                    padding: "16px 22px",
+                    overflowY: "auto",
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(245px, 1fr))",
+                    gap: "10px",
+                  }}
+                >
+                  {selectedServer.tunnels.map((t) => {
+                    const rowDraft = portDrafts[t.id] || {
+                      listen_port: t.listen_port,
+                      forward_ports: t.forward_ports,
+                    };
+                    return (
+                      <div
+                        key={t.id}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: "10px",
+                          border: "1px solid var(--border-color, #26334d)",
+                          background: "rgba(15, 23, 42, 0.45)",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "8px",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            fontSize: "13px",
+                            fontWeight: 600,
+                          }}
+                        >
+                          <span>
+                            #{String(t.id).padStart(2, "0")} {t.name}
+                          </span>
+                          <span className={`sec-badge ${securityTierClass(t.security)}`}>
+                            {t.security}%
+                          </span>
+                        </div>
+
+                        <div
+                          style={{
+                            display: "grid",
+                            gridTemplateColumns: "1fr 1fr",
+                            gap: "8px",
+                          }}
+                        >
+                          <div>
+                            <label
+                              style={{
+                                display: "block",
+                                fontSize: "10px",
+                                opacity: 0.7,
+                                marginBottom: "3px",
+                              }}
+                            >
+                              ENGINE 1 PORT
+                            </label>
+                            <input
+                              type="number"
+                              disabled={role === "agent"}
+                              value={rowDraft.listen_port}
+                              onChange={(e) =>
+                                setPortDrafts((prev) => ({
+                                  ...prev,
+                                  [t.id]: {
+                                    ...rowDraft,
+                                    listen_port: Number(e.target.value) || 0,
+                                  },
+                                }))
+                              }
+                              style={{
+                                width: "100%",
+                                padding: "6px 8px",
+                                borderRadius: "7px",
+                                border: "1px solid var(--border-color, #2c3a57)",
+                                background: "var(--input-bg, #0b1120)",
+                                color: "inherit",
+                                fontSize: "13px",
+                              }}
+                            />
+                          </div>
+
+                          <div>
+                            <label
+                              style={{
+                                display: "block",
+                                fontSize: "10px",
+                                opacity: 0.7,
+                                marginBottom: "3px",
+                              }}
+                            >
+                              ENGINE 2 PORTS
+                            </label>
+                            <input
+                              type="text"
+                              disabled={role === "agent"}
+                              value={rowDraft.forward_ports}
+                              onChange={(e) =>
+                                setPortDrafts((prev) => ({
+                                  ...prev,
+                                  [t.id]: {
+                                    ...rowDraft,
+                                    forward_ports: e.target.value,
+                                  },
+                                }))
+                              }
+                              style={{
+                                width: "100%",
+                                padding: "6px 8px",
+                                borderRadius: "7px",
+                                border: "1px solid var(--border-color, #2c3a57)",
+                                background: "var(--input-bg, #0b1120)",
+                                color: "inherit",
+                                fontSize: "13px",
+                              }}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div
+                  style={{
+                    padding: "14px 22px",
+                    borderTop: "1px solid var(--border-color, #26334d)",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "12px",
+                  }}
+                >
+                  <div style={{ fontSize: "13px", color: "#34d399", fontWeight: 600 }}>
+                    {batchPortNotice && `✓ ${batchPortNotice}`}
+                  </div>
+
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    {role === "master" && selectedServer && (
+                      <button
+                        type="button"
+                        className="next-method-btn"
+                        onClick={() => copyToken(selectedServer.id, selectedServer.token)}
+                      >
+                        {copiedID === selectedServer.id ? (
+                          <Check size={14} />
+                        ) : (
+                          <Copy size={14} />
+                        )}
+                        <span>
+                          {copiedID === selectedServer.id ? "Token Copied" : "Copy Token"}
+                        </span>
+                      </button>
+                    )}
+
+                    {role === "master" && (
+                      <button
+                        type="button"
+                        className="save-tunnel-btn"
+                        disabled={savingBatchPorts}
+                        onClick={handleSaveAllPorts}
+                      >
+                        <Save size={14} />
+                        <span>
+                          {savingBatchPorts
+                            ? "Saving..."
+                            : "Save Ports & Update Token"}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       <main className="main-content">
         <nav className="tab-bar">
@@ -557,7 +1030,7 @@ export default function App() {
                                   {" "}
                                   • Method {String(server.active_method_id).padStart(2, "0")} (
                                   {server.active_method} {server.active_security}%) • Port{" "}
-                                  {server.active_port || 11300 + server.active_method_id} •{" "}
+                                  {server.active_port || 28000 + server.active_method_id} •{" "}
                                   {server.active_latency_ms}ms
                                   {whoConnected ? ` • ${whoConnected}` : ""}
                                 </span>
@@ -712,7 +1185,7 @@ export default function App() {
                                   </div>
 
                                   <span className="history-meta">
-                                    Port {item.port || 11300 + item.method_id} •{" "}
+                                    Port {item.port || 28000 + item.method_id} •{" "}
                                     {item.latency_ms}ms • {itemWho || item.direction}
                                   </span>
 
@@ -893,7 +1366,7 @@ export default function App() {
                                 <input
                                   id={`fport-${tunnel.id}`}
                                   disabled={role === "agent"}
-                                  placeholder="2053, 2083"
+                                  placeholder="32001, 32002"
                                   value={draft.forward_ports}
                                   onChange={(e) =>
                                     updateDraftTunnel(selectedServer.id, {
