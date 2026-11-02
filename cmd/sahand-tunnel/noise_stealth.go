@@ -25,7 +25,6 @@ import (
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -210,16 +209,16 @@ func noiseHKDF3(chainingKey, ikm []byte) ([32]byte, [32]byte, [32]byte) {
 // Implements Noise Specification Section 5.2 & 5.3 SymmetricState + HandshakeState
 // for `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`.
 type noiseIKpsk2HandshakeState struct {
-	initiator   bool
-	s           noiseDHKey
-	e           noiseDHKey
-	rs          []byte // 32-byte remote static public key
-	re          []byte // 32-byte remote ephemeral public key
-	psk         [32]byte
-	ck          [32]byte
-	h           [32]byte
-	cs          *noiseCipherState
-	msgIdx      int
+	initiator bool
+	s         noiseDHKey
+	e         noiseDHKey
+	rs        []byte // 32-byte remote static public key
+	re        []byte // 32-byte remote ephemeral public key
+	psk       [32]byte
+	ck        [32]byte
+	h         [32]byte
+	cs        *noiseCipherState
+	msgIdx    int
 }
 
 type noiseIKpsk2Config struct {
@@ -251,7 +250,6 @@ func newNoiseIKpsk2HandshakeState(cfg noiseIKpsk2Config) (*noiseIKpsk2HandshakeS
 	}
 	copy(st.psk[:], cfg.PresharedKey)
 
-	// InitializeSymmetric("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s")
 	if len(noiseIKpsk2ProtocolName) <= 32 {
 		copy(st.h[:], noiseIKpsk2ProtocolName)
 	} else {
@@ -259,10 +257,8 @@ func newNoiseIKpsk2HandshakeState(cfg noiseIKpsk2Config) (*noiseIKpsk2HandshakeS
 	}
 	st.ck = st.h
 
-	// MixHash(Prologue)
 	st.mixHash(cfg.Prologue)
 
-	// Pre-message pattern `<- s`: MixHash(responder static public key)
 	if cfg.Initiator {
 		st.rs = append([]byte(nil), cfg.PeerStatic...)
 		st.mixHash(st.rs)
@@ -324,7 +320,6 @@ func performX25519DH(privBytes, pubBytes []byte) ([]byte, error) {
 	return priv.ECDH(pub)
 }
 
-// Returns the remote endpoint's 32-byte X25519 static public key.
 func (st *noiseIKpsk2HandshakeState) PeerStatic() []byte {
 	if len(st.rs) == 0 {
 		return nil
@@ -334,17 +329,21 @@ func (st *noiseIKpsk2HandshakeState) PeerStatic() []byte {
 	return cp
 }
 
-// Returns the 32-byte handshake transcript hash `h` for channel binding and rekey salt.
+func (st *noiseIKpsk2HandshakeState) PeerEphemeral() []byte {
+	if len(st.re) == 0 {
+		return nil
+	}
+	cp := make([]byte, len(st.re))
+	copy(cp, st.re)
+	return cp
+}
+
 func (st *noiseIKpsk2HandshakeState) ChannelBinding() [32]byte {
 	return st.h
 }
 
-// Executes the next outbound handshake message in `Noise_IKpsk2`:
-// - Message 1 (Initiator): `-> e, es, s, ss` + encrypted payload
-// - Message 2 (Responder): `<- e, ee, se, psk` + encrypted payload, then calls `Split()`
 func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *noiseCipherState, *noiseCipherState, error) {
 	if st.msgIdx == 0 && st.initiator {
-		// Message 1: -> e, es, s, ss
 		ephPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 		if err != nil {
 			return nil, nil, nil, err
@@ -355,12 +354,10 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 		}
 
 		var out bytes.Buffer
-		// Token `e` (PSK modifier rule Section 9.2: MixHash(e.Public) + MixKey(e.Public))
 		out.Write(st.e.Public)
 		st.mixHash(st.e.Public)
 		st.mixKey(st.e.Public)
 
-		// Token `es`: DH(e_i, rs)
 		esDH, err := performX25519DH(st.e.Private, st.rs)
 		if err != nil {
 			return nil, nil, nil, err
@@ -368,14 +365,12 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 		st.mixKey(esDH)
 		clear(esDH)
 
-		// Token `s`: EncryptAndHash(s_i.Public)
 		encS, err := st.encryptAndHash(st.s.Public)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		out.Write(encS)
 
-		// Token `ss`: DH(s_i, rs)
 		ssDH, err := performX25519DH(st.s.Private, st.rs)
 		if err != nil {
 			return nil, nil, nil, err
@@ -383,7 +378,6 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 		st.mixKey(ssDH)
 		clear(ssDH)
 
-		// Encrypted Payload 1
 		encPayload, err := st.encryptAndHash(payload)
 		if err != nil {
 			return nil, nil, nil, err
@@ -395,7 +389,6 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 	}
 
 	if st.msgIdx == 1 && !st.initiator {
-		// Message 2: <- e, ee, se, psk
 		ephPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
 		if err != nil {
 			return nil, nil, nil, err
@@ -406,12 +399,10 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 		}
 
 		var out bytes.Buffer
-		// Token `e` (PSK modifier rule Section 9.2)
 		out.Write(st.e.Public)
 		st.mixHash(st.e.Public)
 		st.mixKey(st.e.Public)
 
-		// Token `ee`: DH(e_r, re_i)
 		eeDH, err := performX25519DH(st.e.Private, st.re)
 		if err != nil {
 			return nil, nil, nil, err
@@ -419,7 +410,6 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 		st.mixKey(eeDH)
 		clear(eeDH)
 
-		// Token `se`: DH(e_r, rs_i)
 		seDH, err := performX25519DH(st.e.Private, st.rs)
 		if err != nil {
 			return nil, nil, nil, err
@@ -427,10 +417,8 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 		st.mixKey(seDH)
 		clear(seDH)
 
-		// Token `psk`: MixKeyAndHash(psk)
 		st.mixKeyAndHash(st.psk[:])
 
-		// Encrypted Payload 2
 		encPayload, err := st.encryptAndHash(payload)
 		if err != nil {
 			return nil, nil, nil, err
@@ -445,12 +433,8 @@ func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *nois
 	return nil, nil, nil, errors.New("invalid noise handshake WriteMessage state")
 }
 
-// Processes the next inbound handshake message in `Noise_IKpsk2`:
-// - Message 1 (Responder): reads `e, es, s, ss` + encrypted payload
-// - Message 2 (Initiator): reads `e, ee, se, psk` + encrypted payload, then calls `Split()`
 func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noiseCipherState, *noiseCipherState, error) {
 	if st.msgIdx == 0 && !st.initiator {
-		// Message 1 minimum length: 32B (e) + 48B (encrypted s + tag) + 16B (payload tag) = 96 bytes
 		if len(message) < 96 {
 			return nil, nil, nil, errors.New("noise handshake message 1 too short")
 		}
@@ -458,7 +442,6 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 		st.mixHash(st.re)
 		st.mixKey(st.re)
 
-		// Token `es`: DH(s_r, re_i)
 		esDH, err := performX25519DH(st.s.Private, st.re)
 		if err != nil {
 			return nil, nil, nil, err
@@ -466,14 +449,12 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 		st.mixKey(esDH)
 		clear(esDH)
 
-		// Token `s`: DecryptAndHash(48 bytes -> 32-byte initiator static public key)
 		rsPlain, err := st.decryptAndHash(message[32:80])
 		if err != nil || len(rsPlain) != 32 {
 			return nil, nil, nil, errors.New("noise handshake failed to authenticate initiator static key")
 		}
 		st.rs = rsPlain
 
-		// Token `ss`: DH(s_r, rs_i)
 		ssDH, err := performX25519DH(st.s.Private, st.rs)
 		if err != nil {
 			return nil, nil, nil, err
@@ -481,7 +462,6 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 		st.mixKey(ssDH)
 		clear(ssDH)
 
-		// Decrypt Payload 1
 		payload, err := st.decryptAndHash(message[80:])
 		if err != nil {
 			return nil, nil, nil, errors.New("noise handshake failed to authenticate message 1 payload")
@@ -492,7 +472,6 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 	}
 
 	if st.msgIdx == 1 && st.initiator {
-		// Message 2 minimum length: 32B (e) + 16B (payload tag) = 48 bytes
 		if len(message) < 48 {
 			return nil, nil, nil, errors.New("noise handshake message 2 too short")
 		}
@@ -500,7 +479,6 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 		st.mixHash(st.re)
 		st.mixKey(st.re)
 
-		// Token `ee`: DH(e_i, re_r)
 		eeDH, err := performX25519DH(st.e.Private, st.re)
 		if err != nil {
 			return nil, nil, nil, err
@@ -508,7 +486,6 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 		st.mixKey(eeDH)
 		clear(eeDH)
 
-		// Token `se`: DH(s_i, re_r)
 		seDH, err := performX25519DH(st.s.Private, st.re)
 		if err != nil {
 			return nil, nil, nil, err
@@ -516,10 +493,8 @@ func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noise
 		st.mixKey(seDH)
 		clear(seDH)
 
-		// Token `psk`: MixKeyAndHash(psk)
 		st.mixKeyAndHash(st.psk[:])
 
-		// Decrypt Payload 2
 		payload, err := st.decryptAndHash(message[32:])
 		if err != nil {
 			return nil, nil, nil, errors.New("noise handshake failed to authenticate message 2 payload")
@@ -537,7 +512,6 @@ func (st *noiseIKpsk2HandshakeState) splitTransportKeys() (*noiseCipherState, *n
 	k1, k2 := noiseHKDF2(st.ck[:], nil)
 	maskI2R, maskR2I := noiseHKDF2(st.ck[:], []byte("sahand-noise-len-masks-v2"))
 
-	// Clear temporary handshake secrets
 	clear(st.ck[:])
 	clear(st.psk[:])
 	clear(st.e.Private)
@@ -629,13 +603,11 @@ func resolveExpectedRemoteStaticPublicKey(cfg Config, peer ServerPeer) ([]byte, 
 		return decodeHexExact(pubHex, 32)
 	}
 
-	// Local role is Master: check if peer's AgentNoiseStaticPublicKey has been registered
 	pubHex := strings.TrimSpace(peer.AgentNoiseStaticPublicKey)
 	if pubHex != "" {
 		return decodeHexExact(pubHex, 32)
 	}
 
-	// Check live state in case a bootstrap or sync just registered it
 	stateMu.RLock()
 	for i := range appCfg.Servers {
 		if appCfg.Servers[i].ID == peer.ID && appCfg.Servers[i].AgentNoiseStaticPublicKey != "" {
@@ -643,8 +615,6 @@ func resolveExpectedRemoteStaticPublicKey(cfg Config, peer ServerPeer) ([]byte, 
 			break
 		}
 	}
-	// In single-process loopback test environments where AgentNoiseStaticPublicKey was generated on appCfg,
-	// we still only use peer.AgentNoiseStaticPublicKey after bootstrap exchange registers it.
 	stateMu.RUnlock()
 
 	if pubHex == "" {
@@ -681,8 +651,6 @@ func registerVerifiedAgentPublicKeys(peerID, agentNoisePubHex, agentSignPubHex s
 	}
 }
 
-// Executes an authenticated bootstrap request when the Master initiates a connection to an Agent
-// whose `AgentNoiseStaticPublicKey` has not yet been registered on the Master.
 func bootstrapFetchAgentStaticKey(peer ServerPeer, tc TunnelConfig, timeout time.Duration) ([]byte, error) {
 	stateMu.RLock()
 	cfgSnapshot := appCfg
@@ -831,7 +799,6 @@ func handleNoiseBootstrapRequest(conn net.Conn, peer ServerPeer, rawReq []byte) 
 		return
 	}
 
-	// Verify Master's Ed25519 signature using the pinned MasterSigningPublicKey
 	masterSignPubHex := strings.TrimSpace(peer.MasterSigningPublicKey)
 	if masterSignPubHex == "" {
 		masterSignPubHex = strings.TrimSpace(cfgSnapshot.TrustedMasterSigningPublicKey)
@@ -866,7 +833,6 @@ func handleNoiseBootstrapRequest(conn net.Conn, peer ServerPeer, rawReq []byte) 
 		return
 	}
 
-	// Sign and return the Agent's public keys
 	agentSignPrivHex := cfgSnapshot.AgentSigningPrivateKey
 	agentSignPubHex := cfgSnapshot.AgentSigningPublicKey
 	agentNoisePubHex := cfgSnapshot.AgentNoiseStaticPublicKey
@@ -907,7 +873,7 @@ func handleNoiseBootstrapRequest(conn net.Conn, peer ServerPeer, rawReq []byte) 
 }
 
 // ============================================================================
-// 3. TRANSPORT STREAM FRAMING & 3-BYTE AAD ENCRYPTION (noiseTransportConn)
+// 3. TRANSPORT STREAM FRAMING, 3-BYTE AAD & REKEY STATE (noiseTransportConn)
 // ============================================================================
 
 type noiseTransportConn struct {
@@ -916,12 +882,25 @@ type noiseTransportConn struct {
 	transcriptHash [32]byte
 	peerStatic     []byte
 
-	readMu   sync.Mutex
-	writeMu  sync.Mutex
-	csRx     *noiseCipherState
-	csTx     *noiseCipherState
-	readBuf  bytes.Buffer
-	closed   atomic.Bool
+	readMu          sync.Mutex
+	writeMu         sync.Mutex
+	csRx            *noiseCipherState
+	csTx            *noiseCipherState
+	txFramesInEpoch uint64
+	autoRekeyEvery  uint64
+	readBuf         bytes.Buffer
+	closed          atomic.Bool
+
+	rekeyMu             sync.Mutex
+	epoch               uint32
+	rekeyInProgress     bool
+	rekeyWaitCommit     bool
+	rekeyPendingEpoch   uint32
+	rekeyEphPriv        []byte
+	rekeyEphPub         []byte
+	rekeyNextRx         *noiseCipherState
+	rekeyNextTranscript [32]byte
+	rekeyDoneCh         chan error
 }
 
 func newNoiseTransportConn(raw net.Conn, initiator bool, csI2R, csR2I *noiseCipherState, h [32]byte, peerStatic []byte) *noiseTransportConn {
@@ -930,6 +909,7 @@ func newNoiseTransportConn(raw net.Conn, initiator bool, csI2R, csR2I *noiseCiph
 		initiator:      initiator,
 		transcriptHash: h,
 		peerStatic:     append([]byte(nil), peerStatic...),
+		autoRekeyEvery: noiseDefaultAutoRekeyCount,
 	}
 	if initiator {
 		tc.csTx = csI2R
@@ -947,20 +927,25 @@ func (ntc *noiseTransportConn) PeerStatic() []byte {
 	return cp
 }
 
-// Writes a single framed message with a 3-byte AAD header:
-// [FrameType:1][ObfuscatedPlaintextLen:2] || [Ciphertext:PlaintextLen] || [Poly1305Tag:16]
-func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) error {
+func (ntc *noiseTransportConn) CurrentEpoch() uint32 {
+	ntc.rekeyMu.Lock()
+	defer ntc.rekeyMu.Unlock()
+	return ntc.epoch
+}
+
+func (ntc *noiseTransportConn) SetAutoRekeyInterval(frames uint64) {
+	ntc.writeMu.Lock()
+	ntc.autoRekeyEvery = frames
+	ntc.writeMu.Unlock()
+}
+
+// Internal locked frame writer (caller must hold `ntc.writeMu`).
+func (ntc *noiseTransportConn) writeFrameLocked(frameType byte, plaintext []byte) error {
 	if ntc.closed.Load() {
 		return net.ErrClosed
 	}
 	if len(plaintext) > noiseMaxPlaintextLen {
 		return fmt.Errorf("noise frame plaintext length %d exceeds maximum %d", len(plaintext), noiseMaxPlaintextLen)
-	}
-
-	ntc.writeMu.Lock()
-	defer ntc.writeMu.Unlock()
-	if ntc.closed.Load() {
-		return net.ErrClosed
 	}
 
 	ntc.csTx.mu.Lock()
@@ -981,11 +966,44 @@ func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) erro
 	copy(wire[0:noiseFrameHeaderLen], hdr[:])
 	copy(wire[noiseFrameHeaderLen:], ciphertext)
 
-	_, err = ntc.raw.Write(wire)
+	if _, err := ntc.raw.Write(wire); err != nil {
+		return err
+	}
+	if frameType == noiseFrameTypeData {
+		ntc.txFramesInEpoch++
+	}
+	return nil
+}
+
+// Writes a single framed message with a 3-byte AAD header:
+// [FrameType:1][ObfuscatedPlaintextLen:2] || [Ciphertext:PlaintextLen] || [Poly1305Tag:16]
+func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) error {
+	if ntc.closed.Load() {
+		return net.ErrClosed
+	}
+	if len(plaintext) > noiseMaxPlaintextLen {
+		return fmt.Errorf("noise frame plaintext length %d exceeds maximum %d", len(plaintext), noiseMaxPlaintextLen)
+	}
+
+	ntc.writeMu.Lock()
+	err := ntc.writeFrameLocked(frameType, plaintext)
+	shouldAutoRekey := err == nil &&
+		frameType == noiseFrameTypeData &&
+		ntc.initiator &&
+		ntc.autoRekeyEvery > 0 &&
+		ntc.txFramesInEpoch >= ntc.autoRekeyEvery
+	ntc.writeMu.Unlock()
+
+	if shouldAutoRekey {
+		if _, payload, rErr := ntc.beginRekeyInit(); rErr == nil {
+			_ = ntc.WriteFrame(noiseFrameTypeRekeyInit, payload)
+		}
+	}
 	return err
 }
 
 // Reads, bounds-checks before allocation, and AAD-authenticates a single frame.
+// Transparently processes in-band `REKEY_INIT`, `REKEY_ACK`, and `REKEY_COMMIT` control frames.
 func (ntc *noiseTransportConn) ReadFrame() (byte, []byte, error) {
 	if ntc.closed.Load() {
 		return 0, nil, net.ErrClosed
@@ -993,50 +1011,77 @@ func (ntc *noiseTransportConn) ReadFrame() (byte, []byte, error) {
 
 	ntc.readMu.Lock()
 	defer ntc.readMu.Unlock()
-	if ntc.closed.Load() {
-		return 0, nil, net.ErrClosed
-	}
 
-	var hdr [noiseFrameHeaderLen]byte
-	if _, err := io.ReadFull(ntc.raw, hdr[:]); err != nil {
-		return 0, nil, err
-	}
-
-	frameType := hdr[0]
-	switch frameType {
-	case noiseFrameTypeData, noiseFrameTypeRekeyInit, noiseFrameTypeRekeyAck, noiseFrameTypeRekeyCommit, noiseFrameTypeClose:
-	default:
-		_ = ntc.Close()
-		return 0, nil, fmt.Errorf("invalid noise transport frame type 0x%02x", frameType)
-	}
-
-	ntc.csRx.mu.Lock()
-	mask := ntc.csRx.nextFrameMaskLocked()
-	ntc.csRx.mu.Unlock()
-
-	plaintextLen := int(binary.BigEndian.Uint16(hdr[1:3]) ^ mask)
-	if plaintextLen < 0 || plaintextLen > noiseMaxPlaintextLen {
-		_ = ntc.Close()
-		return 0, nil, fmt.Errorf("noise frame length %d exceeds maximum %d", plaintextLen, noiseMaxPlaintextLen)
-	}
-
-	ciphertextLen := plaintextLen + noiseAEADTagLen
-	cipherBuf := make([]byte, ciphertextLen)
-	if _, err := io.ReadFull(ntc.raw, cipherBuf); err != nil {
-		_ = ntc.Close()
-		if errors.Is(err, io.EOF) {
-			return 0, nil, io.ErrUnexpectedEOF
+	for {
+		if ntc.closed.Load() {
+			return 0, nil, net.ErrClosed
 		}
-		return 0, nil, err
-	}
 
-	plaintext, err := ntc.csRx.DecryptWithAd(hdr[:], cipherBuf)
-	if err != nil {
-		_ = ntc.Close()
-		return 0, nil, err
-	}
+		var hdr [noiseFrameHeaderLen]byte
+		if _, err := io.ReadFull(ntc.raw, hdr[:]); err != nil {
+			return 0, nil, err
+		}
 
-	return frameType, plaintext, nil
+		frameType := hdr[0]
+		switch frameType {
+		case noiseFrameTypeData, noiseFrameTypeRekeyInit, noiseFrameTypeRekeyAck, noiseFrameTypeRekeyCommit, noiseFrameTypeClose:
+		default:
+			_ = ntc.Close()
+			return 0, nil, fmt.Errorf("invalid noise transport frame type 0x%02x", frameType)
+		}
+
+		ntc.csRx.mu.Lock()
+		mask := ntc.csRx.nextFrameMaskLocked()
+		ntc.csRx.mu.Unlock()
+
+		plaintextLen := int(binary.BigEndian.Uint16(hdr[1:3]) ^ mask)
+		if plaintextLen < 0 || plaintextLen > noiseMaxPlaintextLen {
+			_ = ntc.Close()
+			return 0, nil, fmt.Errorf("noise frame length %d exceeds maximum %d", plaintextLen, noiseMaxPlaintextLen)
+		}
+
+		ciphertextLen := plaintextLen + noiseAEADTagLen
+		cipherBuf := make([]byte, ciphertextLen)
+		if _, err := io.ReadFull(ntc.raw, cipherBuf); err != nil {
+			_ = ntc.Close()
+			if errors.Is(err, io.EOF) {
+				return 0, nil, io.ErrUnexpectedEOF
+			}
+			return 0, nil, err
+		}
+
+		plaintext, err := ntc.csRx.DecryptWithAd(hdr[:], cipherBuf)
+		if err != nil {
+			_ = ntc.Close()
+			return 0, nil, err
+		}
+
+		switch frameType {
+		case noiseFrameTypeRekeyInit:
+			if err := ntc.handleIncomingRekeyInitLocked(plaintext); err != nil {
+				_ = ntc.Close()
+				return 0, nil, err
+			}
+			continue
+
+		case noiseFrameTypeRekeyAck:
+			if err := ntc.handleIncomingRekeyAckLocked(plaintext); err != nil {
+				_ = ntc.Close()
+				return 0, nil, err
+			}
+			continue
+
+		case noiseFrameTypeRekeyCommit:
+			if err := ntc.handleIncomingRekeyCommitLocked(plaintext); err != nil {
+				_ = ntc.Close()
+				return 0, nil, err
+			}
+			continue
+
+		default:
+			return frameType, plaintext, nil
+		}
+	}
 }
 
 func (ntc *noiseTransportConn) Write(p []byte) (int, error) {
@@ -1087,6 +1132,24 @@ func (ntc *noiseTransportConn) Close() error {
 	if ntc.closed.Swap(true) {
 		return nil
 	}
+	ntc.rekeyMu.Lock()
+	clear(ntc.rekeyEphPriv)
+	clear(ntc.rekeyEphPub)
+	if ntc.rekeyNextRx != nil {
+		ntc.rekeyNextRx.Zeroize()
+		ntc.rekeyNextRx = nil
+	}
+	if ntc.rekeyDoneCh != nil {
+		select {
+		case ntc.rekeyDoneCh <- net.ErrClosed:
+		default:
+		}
+		ntc.rekeyDoneCh = nil
+	}
+	ntc.rekeyInProgress = false
+	ntc.rekeyWaitCommit = false
+	ntc.rekeyMu.Unlock()
+
 	if ntc.csTx != nil {
 		ntc.csTx.Zeroize()
 	}
@@ -1100,8 +1163,6 @@ func (ntc *noiseTransportConn) Close() error {
 // 4. BIDIRECTIONAL HANDSHAKE ESTABLISHMENT & 1.5-RTT MESSAGE 3 GATE
 // ============================================================================
 
-// Message 3 Application Header (sent only after Message 2 completes and `Split()` succeeds):
-// [AppCmd:1][TargetPort:2][TimeHdrLen:1][TimeHdr...]
 func encodeNoiseMessage3Header(appCmd byte, targetPort uint16, timeHdr string) []byte {
 	if len(timeHdr) > 120 {
 		timeHdr = timeHdr[:120]
@@ -1149,7 +1210,6 @@ func dialNoiseStealthSession(
 		return nil, err
 	}
 	if len(remoteStaticPub) != 32 {
-		// Perform authenticated static-key bootstrap exchange so we never assume the remote static key is magically known
 		remoteStaticPub, err = bootstrapFetchAgentStaticKey(peer, tc, timeout)
 		if err != nil {
 			return nil, fmt.Errorf("failed to bootstrap remote static public key: %w", err)
@@ -1220,7 +1280,6 @@ func dialNoiseStealthSession(
 		return nil, err
 	}
 
-	// Read Handshake Message 2
 	if _, err := io.ReadFull(rawConn, wireHdr[:]); err != nil {
 		_ = rawConn.Close()
 		return nil, err
@@ -1256,7 +1315,6 @@ func dialNoiseStealthSession(
 		return nil, errors.New("noise handshake message 2 nonce echo mismatch")
 	}
 
-	// Verify PeerStatic() matches the expected remote static public key
 	if subtle.ConstantTimeCompare(hs.PeerStatic(), remoteStaticPub) != 1 {
 		_ = rawConn.Close()
 		return nil, errors.New("noise PeerStatic() mismatch on initiator")
@@ -1264,7 +1322,6 @@ func dialNoiseStealthSession(
 
 	ntc := newNoiseTransportConn(rawConn, true, csI2R, csR2I, hs.ChannelBinding(), hs.PeerStatic())
 
-	// Send Message 3 (the first post-split encrypted transport frame carrying the application command)
 	msg3Plain := encodeNoiseMessage3Header(appCmd, targetPort, buildMasterTimeHeader())
 	if err := ntc.WriteFrame(noiseFrameTypeData, msg3Plain); err != nil {
 		_ = ntc.Close()
@@ -1275,7 +1332,7 @@ func dialNoiseStealthSession(
 }
 
 // ============================================================================
-// 5. SERVER LISTENER, 1.5-RTT GATE & TCP/UDP FORWARDING (:28010)
+// 5. SERVER LISTENER, RATE LIMITERS, REPLAY GUARD & FORWARDING (:28010)
 // ============================================================================
 
 var (
@@ -1317,6 +1374,13 @@ func startNoiseStealthServerListener(peer ServerPeer, tc TunnelConfig) (net.List
 
 func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfig) {
 	defer conn.Close()
+
+	// Stage 4: Pre-authentication rate limiting based on source IP before any crypto work
+	remoteIP := extractRemoteHostIP(conn.RemoteAddr())
+	if !defaultNoisePreAuthIPLimiter.Allow(remoteIP, time.Now()) {
+		return
+	}
+
 	_ = conn.SetDeadline(time.Now().Add(noiseHandshakeTimeout))
 
 	var wireHdr [3]byte
@@ -1333,7 +1397,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		return
 	}
 
-	// Handle authenticated Static-Key Bootstrap Request
 	if pktType == noiseWireTypeBootstrapReq {
 		handleNoiseBootstrapRequest(conn, peer, pktBytes)
 		return
@@ -1369,7 +1432,7 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 	}
 
 	// Process Handshake Message 1 (`-> e, es, s, ss`).
-	// CRITICAL STAGE 4 RULE: Message 1 alone NEVER triggers destination connections or state mutations.
+	// Message 1 alone NEVER triggers destination connections or state mutations.
 	msg1Plain, _, _, err := hs.ReadMessage(pktBytes)
 	if err != nil {
 		return
@@ -1382,14 +1445,21 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 	if subtle.ConstantTimeCompare([]byte(strings.ToLower(msg1Payload.PeerID)), []byte(strings.ToLower(peer.ID))) != 1 {
 		return
 	}
-	if diff := time.Now().Unix() - msg1Payload.TimestampUnix; diff < -300 || diff > 300 {
+
+	// Stage 4: Check Handshake Replay Guard (rejects duplicate Message 1 nonces/ephemeral keys)
+	if err := defaultNoiseReplayGuard.CheckAndAccept(
+		peer.ID,
+		msg1Payload.ClientNonce,
+		hs.PeerEphemeral(),
+		msg1Payload.TimestampUnix,
+		time.Now(),
+	); err != nil {
 		return
 	}
 
 	// Verify `hs.PeerStatic()` against the expected remote static public key
 	peerStaticBytes := hs.PeerStatic()
 	if len(peerStaticBytes) != 32 || subtle.ConstantTimeCompare(peerStaticBytes, localStatic.Public) == 1 {
-		// Reject reflection attempts where initiator static key equals responder static key
 		return
 	}
 
@@ -1399,8 +1469,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 			return
 		}
 	} else {
-		// If Master is receiving an initial Agent-initiated connection before AgentNoiseStaticPublicKey was registered,
-		// verify the Agent's Ed25519 identity signature over `hs.PeerStatic()` (registration still waits for Message 3!).
 		agentSignPub, err1 := decodeHexExact(msg1Payload.SigningPubKey, ed25519.PublicKeySize)
 		agentIdSig, err2 := decodeHexExact(msg1Payload.IdentitySig, ed25519.SignatureSize)
 		if err1 != nil || err2 != nil {
@@ -1417,7 +1485,11 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		}
 	}
 
-	// Construct and send Handshake Message 2 (`<- e, ee, se, psk`)
+	// Stage 4: Post-authentication rate limiting based on verified peer identity
+	if !defaultNoisePostAuthPeerLimiter.Allow(peer.ID, time.Now()) {
+		return
+	}
+
 	msg2PayloadBytes, err := json.Marshal(noiseHandshakeMsg2Payload{
 		ServerUnix:  time.Now().Unix(),
 		ClientNonce: msg1Payload.ClientNonce,
@@ -1444,7 +1516,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 	defer ntc.Close()
 
 	// Wait for Message 3 (the first post-split frame encrypted under csI2R, proving ephemeral `ee` liveness).
-	// No destination dialing or state mutation occurs until this frame is decrypted and authenticated.
 	fType, msg3Plain, err := ntc.ReadFrame()
 	if err != nil || fType != noiseFrameTypeData {
 		return
@@ -1458,12 +1529,9 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		applyMasterTimeHeader(timeHdr)
 	}
 
-	// Message 3 succeeded! If this was an Agent introducing its static key to the Master, register it now.
 	if cfgSnapshot.Role == "master" && len(expectedRemoteStatic) == 0 {
 		registerVerifiedAgentPublicKeys(peer.ID, hex.EncodeToString(peerStaticBytes), msg1Payload.SigningPubKey)
 	}
-
-	remoteHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
 	switch appCmd {
 	case noiseAppCmdProbe:
@@ -1474,10 +1542,10 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		if _, err := ntc.Write(ping[:]); err != nil {
 			return
 		}
-		markPeerConnectedInbound(peer.ID, remoteHost, tc.ID, tc.ListenPort, 1)
+		markPeerConnectedInbound(peer.ID, remoteIP, tc.ID, tc.ListenPort, 1)
 
 	case noiseAppCmdParitySync:
-		handleWebTransportParitySyncStream(ntc, peer.ID, remoteHost)
+		handleWebTransportParitySyncStream(ntc, peer.ID, remoteIP)
 
 	case noiseAppCmdTCPForward:
 		if !tc.Enabled {
@@ -1495,7 +1563,7 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		enableKeepAlive(targetConn)
 
 		_ = conn.SetDeadline(time.Time{})
-		markPeerConnectedInbound(peer.ID, remoteHost, tc.ID, tc.ListenPort, 1)
+		markPeerConnectedInbound(peer.ID, remoteIP, tc.ID, tc.ListenPort, 1)
 		pipeNoiseTransportAndTCP(ntc, targetConn, tc.SpeedLimitMBps)
 
 	case noiseAppCmdUDPForward:
