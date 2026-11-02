@@ -238,12 +238,18 @@ func handleNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stateMu.RLock()
+	fp, _ := ComputeSigningKeyFingerprint(appCfg.MasterSigningPublicKey)
 	info := NodeInfo{
-		AppVersion: AppVersion,
-		Role:       appCfg.Role,
-		NodeID:     appCfg.NodeID,
-		Status:     "online",
-		PanelURL:   appCfg.PanelURL,
+		AppVersion:                  AppVersion,
+		Role:                        appCfg.Role,
+		NodeID:                      appCfg.NodeID,
+		Status:                      "online",
+		PanelURL:                    appCfg.PanelURL,
+		MasterSigningPublicKey:      appCfg.MasterSigningPublicKey,
+		MasterNoiseStaticPublicKey:  appCfg.MasterNoiseStaticPublicKey,
+		MasterSigningKeyFingerprint: fp,
+		AgentSigningPublicKey:       appCfg.AgentSigningPublicKey,
+		AgentNoiseStaticPublicKey:   appCfg.AgentNoiseStaticPublicKey,
 	}
 	stateMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -276,22 +282,42 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	role := appCfg.Role
 	nodeID := appCfg.NodeID
+	mSignPub := appCfg.MasterSigningPublicKey
+	mNoisePub := appCfg.MasterNoiseStaticPublicKey
+	aSignPub := appCfg.AgentSigningPublicKey
+	aNoisePub := appCfg.AgentNoiseStaticPublicKey
+	trustedMasterSignPub := appCfg.TrustedMasterSigningPublicKey
 	stateMu.RUnlock()
 
+	mFP, _ := ComputeSigningKeyFingerprint(mSignPub)
+	if mFP == "" && trustedMasterSignPub != "" {
+		mFP, _ = ComputeSigningKeyFingerprint(trustedMasterSignPub)
+	}
+
 	payload := struct {
-		AppVersion string                `json:"app_version"`
-		Role       string                `json:"role"`
-		NodeID     string                `json:"node_id"`
-		ServerTime string                `json:"server_time"`
-		Servers    []ServerPeer          `json:"servers"`
-		Catalogue  []MethodCatalogueItem `json:"catalogue"`
+		AppVersion                  string                `json:"app_version"`
+		Role                        string                `json:"role"`
+		NodeID                      string                `json:"node_id"`
+		ServerTime                  string                `json:"server_time"`
+		MasterSigningPublicKey      string                `json:"master_signing_public_key,omitempty"`
+		MasterNoiseStaticPublicKey  string                `json:"master_noise_static_public_key,omitempty"`
+		MasterSigningKeyFingerprint string                `json:"master_signing_key_fingerprint,omitempty"`
+		AgentSigningPublicKey       string                `json:"agent_signing_public_key,omitempty"`
+		AgentNoiseStaticPublicKey   string                `json:"agent_noise_static_public_key,omitempty"`
+		Servers                     []ServerPeer          `json:"servers"`
+		Catalogue                   []MethodCatalogueItem `json:"catalogue"`
 	}{
-		AppVersion: AppVersion,
-		Role:       role,
-		NodeID:     nodeID,
-		ServerTime: mTime,
-		Servers:    serversCopy,
-		Catalogue:  methodCatalogue,
+		AppVersion:                  AppVersion,
+		Role:                        role,
+		NodeID:                      nodeID,
+		ServerTime:                  mTime,
+		MasterSigningPublicKey:      mSignPub,
+		MasterNoiseStaticPublicKey:  mNoisePub,
+		MasterSigningKeyFingerprint: mFP,
+		AgentSigningPublicKey:       aSignPub,
+		AgentNoiseStaticPublicKey:   aNoisePub,
+		Servers:                     serversCopy,
+		Catalogue:                   methodCatalogue,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -304,9 +330,10 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name  string `json:"name"`
-		IP    string `json:"ip"`
-		Token string `json:"token"`
+		Name                 string `json:"name"`
+		IP                   string `json:"ip"`
+		Token                string `json:"token"`
+		MasterKeyFingerprint string `json:"master_key_fingerprint"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -324,6 +351,12 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		peerID, _ := randomHex(8)
+		peerSecret, err := randomHex(32)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, "could not generate peer secret", http.StatusInternalServerError)
+			return
+		}
 		tunnels := defaultTunnelsForServer()
 		cidr, mIP, aIP := deriveDefaultSlash30ForPeer(peerID)
 		for i := range tunnels {
@@ -338,15 +371,18 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		}
 
 		peer := ServerPeer{
-			ID:              peerID,
-			Name:            name,
-			IP:              ip,
-			ConfigVersion:   1,
-			SyncState:       "synced",
-			Status:          "WAITING",
-			Running:         false,
-			RecentLifelines: []LifelineEvent{},
-			Tunnels:         tunnels,
+			ID:                         peerID,
+			Name:                       name,
+			IP:                         ip,
+			PeerSecret:                 peerSecret,
+			MasterSigningPublicKey:     appCfg.MasterSigningPublicKey,
+			MasterNoiseStaticPublicKey: appCfg.MasterNoiseStaticPublicKey,
+			ConfigVersion:              1,
+			SyncState:                  "synced",
+			Status:                     "WAITING",
+			Running:                    false,
+			RecentLifelines:            []LifelineEvent{},
+			Tunnels:                    tunnels,
 		}
 		tok, err := generatePeerToken(appCfg, peer)
 		if err != nil {
@@ -365,6 +401,7 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Agent pairing: verify out-of-band Master signing-key fingerprint before establishing or persisting trust
 	ip := strings.TrimSpace(req.IP)
 	rawToken := strings.TrimSpace(req.Token)
 	if ip == "" || rawToken == "" {
@@ -372,60 +409,24 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "master IP and connection token are required", http.StatusBadRequest)
 		return
 	}
-	tp, err := parseAndValidateToken(rawToken)
+
+	var prevPeerID string
+	if len(appCfg.Servers) > 0 {
+		prevPeerID = appCfg.Servers[0].ID
+	}
+
+	peer, err := VerifyAndEstablishInitialTrust(&appCfg, ip, rawToken, req.MasterKeyFingerprint)
 	if err != nil {
 		stateMu.Unlock()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	if tp.TZName != "" || tp.TZOff != 0 {
-		appCfg.MasterTZName = tp.TZName
-		appCfg.MasterTZOffsetSec = tp.TZOff
-	}
-
-	tunnels := defaultTunnelsForServer()
-	cidr, mIP, aIP := deriveDefaultSlash30ForPeer(tp.AID)
-	for i := range tunnels {
-		if i < len(tp.Ports) && tp.Ports[i] >= 1024 && tp.Ports[i] <= 65535 {
-			tunnels[i].ListenPort = tp.Ports[i]
-		}
-		if tunnels[i].ID == 25 && tunnels[i].GREFRP != nil {
-			tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
-			tunnels[i].GREFRP.LocalPrivateIP = aIP
-			tunnels[i].GREFRP.RemotePrivateIP = mIP
-			tunnels[i].GREFRP.RemotePublicIP = ip
-			if len(tp.AID) >= 6 {
-				tunnels[i].GREFRP.GREInterfaceName = "gre-" + tp.AID[:6]
-			}
-			tunnels[i].GREFRP.FRPServerPort = tunnels[i].ListenPort
-		}
-	}
-
-	peer := ServerPeer{
-		ID:              tp.AID,
-		Name:            "Master (" + ip + ")",
-		IP:              ip,
-		Token:           rawToken,
-		ConfigVersion:   tp.V,
-		SyncState:       "synced",
-		Status:          "TESTING",
-		Running:         true,
-		RemoteCertPin:   tp.Pin,
-		RecentLifelines: []LifelineEvent{},
-		Tunnels:         tunnels,
-	}
-
-	if len(appCfg.Servers) > 0 {
-		stopDiscoveryLoop(appCfg.Servers[0].ID)
-		stopAllServerListeners(appCfg.Servers[0].ID)
-		appCfg.Servers = []ServerPeer{peer}
-	} else {
-		appCfg.Servers = append(appCfg.Servers, peer)
-	}
-	_ = saveConfig(configPath(), appCfg)
 	stateMu.Unlock()
 
+	if prevPeerID != "" && prevPeerID != peer.ID {
+		stopDiscoveryLoop(prevPeerID)
+		stopAllServerListeners(prevPeerID)
+	}
 	syncServerListeners(peer)
 	startDiscoveryLoop(peer.ID)
 
@@ -515,6 +516,13 @@ func handleServerAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "only master can generate tokens", http.StatusForbidden)
 			return
 		}
+		newSecret, sErr := randomHex(32)
+		if sErr != nil {
+			stateMu.Unlock()
+			http.Error(w, "failed to generate peer secret", http.StatusInternalServerError)
+			return
+		}
+		appCfg.Servers[idx].PeerSecret = newSecret
 		appCfg.Servers[idx].ConfigVersion++
 		tok, err := generatePeerToken(appCfg, appCfg.Servers[idx])
 		if err != nil {
