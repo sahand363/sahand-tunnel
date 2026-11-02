@@ -954,6 +954,10 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 	resp.OK = true
 	resp.NodeID = appCfg.NodeID
 	resp.CertPin = appCfg.CertPin
+	resp.MasterSigningPublicKey = appCfg.MasterSigningPublicKey
+	resp.MasterNoiseStaticPublicKey = appCfg.MasterNoiseStaticPublicKey
+	resp.AgentSigningPublicKey = appCfg.AgentSigningPublicKey
+	resp.AgentNoiseStaticPublicKey = appCfg.AgentNoiseStaticPublicKey
 	if appCfg.Role == "master" {
 		now := time.Now()
 		zName, zOff := now.Zone()
@@ -969,6 +973,15 @@ func processIncomingSync(localPeerID, remoteIP string, pkt SyncPacket) SyncRespo
 		if srv.ID == localPeerID || srv.ID == pkt.PeerID || srv.ID == pkt.SenderID || srv.IP == remoteIP || len(appCfg.Servers) == 1 {
 			if pkt.CertPin != "" {
 				srv.RemoteCertPin = pkt.CertPin
+			}
+			if _, err := decodeHexExact(pkt.AgentNoiseStaticPublicKey, 32); err == nil {
+				srv.AgentNoiseStaticPublicKey = strings.ToLower(strings.TrimSpace(pkt.AgentNoiseStaticPublicKey))
+			}
+			if _, err := decodeHexExact(pkt.AgentSigningPublicKey, 32); err == nil {
+				srv.AgentSigningPublicKey = strings.ToLower(strings.TrimSpace(pkt.AgentSigningPublicKey))
+			}
+			if _, err := decodeHexExact(pkt.MasterNoiseStaticPublicKey, 32); err == nil && srv.MasterNoiseStaticPublicKey == "" {
+				srv.MasterNoiseStaticPublicKey = strings.ToLower(strings.TrimSpace(pkt.MasterNoiseStaticPublicKey))
 			}
 			if appCfg.Role == "agent" && len(pkt.Tunnels) == 30 && pkt.ConfigVersion >= srv.ConfigVersion {
 				srv.Tunnels = normalizeTunnels(pkt.Tunnels)
@@ -1138,6 +1151,10 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 	senderID := appCfg.NodeID
 	role := appCfg.Role
 	certPin := appCfg.CertPin
+	mSignPub := appCfg.MasterSigningPublicKey
+	mNoisePub := appCfg.MasterNoiseStaticPublicKey
+	aSignPub := appCfg.AgentSigningPublicKey
+	aNoisePub := appCfg.AgentNoiseStaticPublicKey
 	stateMu.RUnlock()
 
 	targetAddr := fmt.Sprintf("%s:%d", peer.IP, tc.ListenPort)
@@ -1171,15 +1188,19 @@ func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64)
 	padHex, _ := randomHex(padLen)
 
 	pkt := SyncPacket{
-		Type:          "parity_sync",
-		SenderID:      senderID,
-		PeerID:        peer.ID,
-		MethodID:      tc.ID,
-		Port:          tc.ListenPort,
-		LatencyMS:     latencyMS,
-		ConfigVersion: peer.ConfigVersion,
-		CertPin:       certPin,
-		Padding:       padHex,
+		Type:                       "parity_sync",
+		SenderID:                   senderID,
+		PeerID:                     peer.ID,
+		MethodID:                   tc.ID,
+		Port:                       tc.ListenPort,
+		LatencyMS:                  latencyMS,
+		ConfigVersion:              peer.ConfigVersion,
+		CertPin:                    certPin,
+		MasterSigningPublicKey:     mSignPub,
+		MasterNoiseStaticPublicKey: mNoisePub,
+		AgentSigningPublicKey:      aSignPub,
+		AgentNoiseStaticPublicKey:  aNoisePub,
+		Padding:                    padHex,
 	}
 	if role == "master" {
 		now := time.Now()
@@ -1240,6 +1261,15 @@ func applySyncResponseToPeer(peerID string, resp SyncResponse) {
 			}
 			if resp.CertPin != "" {
 				appCfg.Servers[i].RemoteCertPin = resp.CertPin
+			}
+			if _, err := decodeHexExact(resp.AgentNoiseStaticPublicKey, 32); err == nil {
+				appCfg.Servers[i].AgentNoiseStaticPublicKey = strings.ToLower(strings.TrimSpace(resp.AgentNoiseStaticPublicKey))
+			}
+			if _, err := decodeHexExact(resp.AgentSigningPublicKey, 32); err == nil {
+				appCfg.Servers[i].AgentSigningPublicKey = strings.ToLower(strings.TrimSpace(resp.AgentSigningPublicKey))
+			}
+			if _, err := decodeHexExact(resp.MasterNoiseStaticPublicKey, 32); err == nil && appCfg.Servers[i].MasterNoiseStaticPublicKey == "" {
+				appCfg.Servers[i].MasterNoiseStaticPublicKey = strings.ToLower(strings.TrimSpace(resp.MasterNoiseStaticPublicKey))
 			}
 			appCfg.Servers[i].SyncState = "synced"
 			_ = saveConfig(configPath(), appCfg)
