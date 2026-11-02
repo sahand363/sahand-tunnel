@@ -44,6 +44,61 @@ type LifelineEvent = {
   connected_at: string;
 };
 
+type GREFRPForwardRule = {
+  name: string;
+  protocol: string;
+  local_addr: string;
+  local_port: string;
+  remote_port: string;
+  use_encryption: boolean;
+  use_compression: boolean;
+  proxy_proto_v2: boolean;
+};
+
+type GREFRPDiagnostics = {
+  engine_name: string;
+  gre_interface_status: string;
+  gre_private_ping_ok: boolean;
+  gre_packet_loss_pct: number;
+  gre_rtt_ms: number;
+  frps_service_status: string;
+  frpc_service_status: string;
+  active_path: string;
+  port_forward_status: string;
+  service_uptime: string;
+  reconnect_count: number;
+  last_failure_reason?: string;
+  last_recovery_at?: string;
+  recent_logs?: string[];
+};
+
+type GREFRPConfig = {
+  internal_engine: string;
+  local_public_ip: string;
+  remote_public_ip: string;
+  gre_interface_name: string;
+  private_subnet_cidr: string;
+  local_private_ip: string;
+  remote_private_ip: string;
+  mtu: number;
+  route_config: string;
+  health_check_sec: number;
+  failure_threshold: number;
+  recovery_threshold: number;
+  auto_public_fallback: boolean;
+  auto_restore_gre: boolean;
+  frp_version: string;
+  frp_transport: string;
+  frp_server_port: number;
+  frp_auth_token: string;
+  frp_encryption: boolean;
+  frp_compression: boolean;
+  frp_tcp_mux: boolean;
+  frp_proxy_proto_v2: boolean;
+  forwarding_rules: GREFRPForwardRule[];
+  diagnostics: GREFRPDiagnostics;
+};
+
 type TunnelConfig = {
   id: number;
   name: string;
@@ -56,6 +111,8 @@ type TunnelConfig = {
   sni?: string;
   ws_path?: string;
   cert_pin?: string;
+  raw_transport?: string;
+  gre_frp?: GREFRPConfig;
   heartbeat_sec?: number;
   stream_limit?: number;
   speed_limit_mbps: string;
@@ -121,6 +178,59 @@ function formatInitiatorFallback(role: Role, dir?: string, explicit?: string): s
   return dir === "outbound" ? "Agent → Master" : "Master → Agent";
 }
 
+function defaultClientGREFRP(listenPort: number, peerIP: string): GREFRPConfig {
+  return {
+    internal_engine: "gre-frp",
+    local_public_ip: "",
+    remote_public_ip: peerIP,
+    gre_interface_name: "sahand-gre0",
+    private_subnet_cidr: "10.77.25.0/30",
+    local_private_ip: "10.77.25.1",
+    remote_private_ip: "10.77.25.2",
+    mtu: 1400,
+    route_config: "10.77.25.0/30 via sahand-gre0",
+    health_check_sec: 5,
+    failure_threshold: 3,
+    recovery_threshold: 2,
+    auto_public_fallback: true,
+    auto_restore_gre: true,
+    frp_version: "0.61.1",
+    frp_transport: "tcp",
+    frp_server_port: listenPort || 28025,
+    frp_auth_token: "",
+    frp_encryption: true,
+    frp_compression: false,
+    frp_tcp_mux: true,
+    frp_proxy_proto_v2: false,
+    forwarding_rules: [
+      {
+        name: "rule-01",
+        protocol: "tcp+udp",
+        local_addr: "127.0.0.1",
+        local_port: "32025",
+        remote_port: "32025",
+        use_encryption: true,
+        use_compression: false,
+        proxy_proto_v2: false,
+      },
+    ],
+    diagnostics: {
+      engine_name: "gre-frp",
+      gre_interface_status: "READY",
+      gre_private_ping_ok: false,
+      gre_packet_loss_pct: 0,
+      gre_rtt_ms: 0,
+      frps_service_status: "READY",
+      frpc_service_status: "READY",
+      active_path: "GRE",
+      port_forward_status: "READY",
+      service_uptime: "0s",
+      reconnect_count: 0,
+      recent_logs: [],
+    },
+  };
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>(() => {
     const saved = localStorage.getItem("sahand_tab");
@@ -151,9 +261,11 @@ export default function App() {
   const [draftTunnels, setDraftTunnels] = useState<Record<string, TunnelConfig>>({});
   const [savingTunnelKey, setSavingTunnelKey] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<Record<string, string>>({});
+  const [tunnelError, setTunnelError] = useState<Record<string, string>>({});
   const [pingingKey, setPingingKey] = useState<string | null>(null);
+  const [greActionBusy, setGreActionBusy] = useState<string | null>(null);
+  const [greActionNotice, setGreActionNotice] = useState<string>("");
 
-  // Top-bar Nut Icon (Port & Theme Settings Modal) state
   const [showPortSettings, setShowPortSettings] = useState(false);
   const [portDrafts, setPortDrafts] = useState<PortDraftMap>({});
   const [engine1BasePort, setEngine1BasePort] = useState(28001);
@@ -335,6 +447,28 @@ export default function App() {
     }
   }
 
+  async function handleGREFRPServiceAction(serverID: string, action: string) {
+    if (greActionBusy) return;
+    setGreActionBusy(action);
+    setGreActionNotice("");
+    try {
+      const res = await fetch("/api/v1/tunnels/gre-frp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ server_id: serverID, action }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setGreActionNotice(data.message || "Operation completed");
+        await fetchState();
+      } else {
+        setGreActionNotice("Error: " + (await res.text()));
+      }
+    } finally {
+      setGreActionBusy(null);
+    }
+  }
+
   async function handleAddOrConnectServer(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setFormError("");
@@ -441,6 +575,11 @@ export default function App() {
     if (role !== "master") return;
     const key = `${serverID}:${updated.id}`;
     setSavingTunnelKey(key);
+    setTunnelError((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
 
     const safeSpeed =
       updated.speed_limit_mbps && updated.speed_limit_mbps.trim() !== ""
@@ -478,6 +617,9 @@ export default function App() {
           });
         }, 3200);
         await fetchState();
+      } else {
+        const errText = await res.text();
+        setTunnelError((prev) => ({ ...prev, [key]: errText }));
       }
     } finally {
       setSavingTunnelKey(null);
@@ -1455,6 +1597,26 @@ export default function App() {
                     const isSaving = savingTunnelKey === tunnelKey;
                     const isPinging = pingingKey === tunnelKey;
                     const noticeText = savedNotice[tunnelKey];
+                    const errBanner = tunnelError[tunnelKey];
+
+                    const gfDraft =
+                      tunnel.id === 25
+                        ? draft.gre_frp ||
+                          defaultClientGREFRP(draft.listen_port, selectedServer.ip)
+                        : null;
+
+                    const updateGFDraft = (patch: Partial<GREFRPConfig>) => {
+                      if (!gfDraft) return;
+                      const merged: GREFRPConfig = {
+                        ...gfDraft,
+                        ...patch,
+                      };
+                      updateDraftTunnel(selectedServer.id, {
+                        ...draft,
+                        listen_port: merged.frp_server_port || draft.listen_port,
+                        gre_frp: merged,
+                      });
+                    };
 
                     return (
                       <article
@@ -1535,6 +1697,12 @@ export default function App() {
                               {tunnel.security}%
                             </span>
 
+                            {tunnel.id === 25 && tunnel.gre_frp?.diagnostics?.active_path && (
+                              <span className="proto-badge">
+                                PATH: {tunnel.gre_frp.diagnostics.active_path}
+                              </span>
+                            )}
+
                             {disc?.tested_at && (
                               <span
                                 className={`disc-pill ${
@@ -1561,7 +1729,7 @@ export default function App() {
                           </button>
                         </div>
 
-                        {expanded && (
+                        {expanded && tunnel.id !== 25 && (
                           <div className="tunnel-settings">
                             <div className="settings-title">
                               <Settings2 size={15} />
@@ -1607,40 +1775,67 @@ export default function App() {
                                 />
                               </div>
 
-                              {draft.sni !== undefined && (
+                              {tunnel.id === 24 ? (
                                 <div className="form-field">
-                                  <label htmlFor={`sni-${tunnel.id}`}>TLS SNI</label>
-                                  <input
-                                    id={`sni-${tunnel.id}`}
+                                  <label htmlFor={`rawmode-${tunnel.id}`}>
+                                    RAW TRANSPORT MODE
+                                  </label>
+                                  <select
+                                    id={`rawmode-${tunnel.id}`}
+                                    className="server-select"
                                     disabled={role === "agent"}
-                                    placeholder="www.speedtest.net"
-                                    value={draft.sni}
+                                    value={draft.raw_transport || "auto"}
                                     onChange={(e) =>
                                       updateDraftTunnel(selectedServer.id, {
                                         ...draft,
-                                        sni: e.target.value,
+                                        raw_transport: e.target.value,
                                       })
                                     }
-                                  />
+                                    style={{ width: "100%", padding: "10px 12px" }}
+                                  >
+                                    <option value="auto">Auto (Prefer RAW_IP, Fallback UDP)</option>
+                                    <option value="raw_ip">Strict RAW_IP (Linux ip4:tcp Socket)</option>
+                                    <option value="udp">UDP_FALLBACK (Encrypted UDP Carrier)</option>
+                                  </select>
                                 </div>
-                              )}
+                              ) : (
+                                <>
+                                  {draft.sni !== undefined && (
+                                    <div className="form-field">
+                                      <label htmlFor={`sni-${tunnel.id}`}>TLS SNI</label>
+                                      <input
+                                        id={`sni-${tunnel.id}`}
+                                        disabled={role === "agent"}
+                                        placeholder="www.speedtest.net"
+                                        value={draft.sni}
+                                        onChange={(e) =>
+                                          updateDraftTunnel(selectedServer.id, {
+                                            ...draft,
+                                            sni: e.target.value,
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                  )}
 
-                              {draft.ws_path !== undefined && (
-                                <div className="form-field">
-                                  <label htmlFor={`path-${tunnel.id}`}>HTTP / WS PATH</label>
-                                  <input
-                                    id={`path-${tunnel.id}`}
-                                    disabled={role === "agent"}
-                                    placeholder="/ws"
-                                    value={draft.ws_path}
-                                    onChange={(e) =>
-                                      updateDraftTunnel(selectedServer.id, {
-                                        ...draft,
-                                        ws_path: e.target.value,
-                                      })
-                                    }
-                                  />
-                                </div>
+                                  {draft.ws_path !== undefined && (
+                                    <div className="form-field">
+                                      <label htmlFor={`path-${tunnel.id}`}>HTTP / WS PATH</label>
+                                      <input
+                                        id={`path-${tunnel.id}`}
+                                        disabled={role === "agent"}
+                                        placeholder="/ws"
+                                        value={draft.ws_path}
+                                        onChange={(e) =>
+                                          updateDraftTunnel(selectedServer.id, {
+                                            ...draft,
+                                            ws_path: e.target.value,
+                                          })
+                                        }
+                                      />
+                                    </div>
+                                  )}
+                                </>
                               )}
 
                               <div className="form-field">
@@ -1673,6 +1868,12 @@ export default function App() {
                               </div>
                             </div>
 
+                            {errBanner && (
+                              <div className="form-error-banner" style={{ marginTop: "10px" }}>
+                                {errBanner}
+                              </div>
+                            )}
+
                             {role === "master" && (
                               <div className="settings-actions-row">
                                 <button
@@ -1685,6 +1886,616 @@ export default function App() {
                                 >
                                   <Save size={14} />
                                   <span>{isSaving ? "Saving..." : "Save Settings"}</span>
+                                </button>
+
+                                {noticeText && (
+                                  <span className="save-feedback-text">
+                                    ✓ {noticeText}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {expanded && tunnel.id === 25 && gfDraft && (
+                          <div className="tunnel-settings">
+                            {/* SECTION A: GRE NETWORK TUNNEL SETTINGS */}
+                            <div className="settings-title">
+                              <Settings2 size={15} />
+                              <span>1. GRE Point-to-Point Network Tunnel Settings</span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label>GRE INTERFACE NAME</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.gre_interface_name}
+                                  onChange={(e) =>
+                                    updateGFDraft({ gre_interface_name: e.target.value })
+                                  }
+                                  placeholder="sahand-gre0"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>PRIVATE IPV4 SUBNET (/30)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.private_subnet_cidr}
+                                  onChange={(e) =>
+                                    updateGFDraft({ private_subnet_cidr: e.target.value })
+                                  }
+                                  placeholder="10.77.25.0/30"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>LOCAL GRE PRIVATE IP</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.local_private_ip}
+                                  onChange={(e) =>
+                                    updateGFDraft({ local_private_ip: e.target.value })
+                                  }
+                                  placeholder="10.77.25.1"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>REMOTE GRE PRIVATE IP</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.remote_private_ip}
+                                  onChange={(e) =>
+                                    updateGFDraft({ remote_private_ip: e.target.value })
+                                  }
+                                  placeholder="10.77.25.2"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>LOCAL PUBLIC IP (OPTIONAL=AUTO)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.local_public_ip}
+                                  onChange={(e) =>
+                                    updateGFDraft({ local_public_ip: e.target.value })
+                                  }
+                                  placeholder="Auto-detect outbound IP"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>REMOTE PUBLIC IP</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.remote_public_ip || selectedServer.ip}
+                                  onChange={(e) =>
+                                    updateGFDraft({ remote_public_ip: e.target.value })
+                                  }
+                                  placeholder={selectedServer.ip}
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>GRE MTU (576–9000)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={gfDraft.mtu}
+                                  onChange={(e) =>
+                                    updateGFDraft({ mtu: Number(e.target.value) || 1400 })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>ROUTE CONFIGURATION</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.route_config}
+                                  onChange={(e) =>
+                                    updateGFDraft({ route_config: e.target.value })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>HEALTH-CHECK INTERVAL (SEC)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={gfDraft.health_check_sec}
+                                  onChange={(e) =>
+                                    updateGFDraft({
+                                      health_check_sec: Number(e.target.value) || 5,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>FAILURE / RECOVERY THRESHOLD</label>
+                                <div style={{ display: "flex", gap: "6px" }}>
+                                  <input
+                                    type="number"
+                                    disabled={role === "agent"}
+                                    value={gfDraft.failure_threshold}
+                                    title="Failure threshold"
+                                    onChange={(e) =>
+                                      updateGFDraft({
+                                        failure_threshold: Number(e.target.value) || 3,
+                                      })
+                                    }
+                                  />
+                                  <input
+                                    type="number"
+                                    disabled={role === "agent"}
+                                    value={gfDraft.recovery_threshold}
+                                    title="Recovery threshold"
+                                    onChange={(e) =>
+                                      updateGFDraft({
+                                        recovery_threshold: Number(e.target.value) || 2,
+                                      })
+                                    }
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="form-field">
+                                <label>AUTO PUBLIC-IP FALLBACK & GRE RESTORE</label>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    gap: "14px",
+                                    alignItems: "center",
+                                    paddingTop: "8px",
+                                    fontSize: "13px",
+                                  }}
+                                >
+                                  <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={role === "agent"}
+                                      checked={gfDraft.auto_public_fallback}
+                                      onChange={(e) =>
+                                        updateGFDraft({
+                                          auto_public_fallback: e.target.checked,
+                                        })
+                                      }
+                                    />
+                                    <span>Public Fallback</span>
+                                  </label>
+
+                                  <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={role === "agent"}
+                                      checked={gfDraft.auto_restore_gre}
+                                      onChange={(e) =>
+                                        updateGFDraft({
+                                          auto_restore_gre: e.target.checked,
+                                        })
+                                      }
+                                    />
+                                    <span>Auto-Restore GRE</span>
+                                  </label>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* SECTION B: FRP PORT FORWARDING SETTINGS */}
+                            <div className="settings-title" style={{ marginTop: "18px" }}>
+                              <Shield size={15} />
+                              <span>
+                                2. FRP Port-Forwarding Engine Settings (Official v{gfDraft.frp_version || "0.61.1"})
+                              </span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label>FRP TRANSPORT PROTOCOL</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={gfDraft.frp_transport || "tcp"}
+                                  onChange={(e) =>
+                                    updateGFDraft({ frp_transport: e.target.value })
+                                  }
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="tcp">TCP</option>
+                                  <option value="kcp">KCP (UDP ARQ)</option>
+                                  <option value="quic">QUIC (RFC 9000)</option>
+                                  <option value="websocket">WebSocket</option>
+                                  <option value="wss">WSS (WebSocket over TLS)</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>FRP SERVER BIND PORT</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={gfDraft.frp_server_port || draft.listen_port}
+                                  onChange={(e) => {
+                                    const p = Number(e.target.value) || 28025;
+                                    updateGFDraft({ frp_server_port: p });
+                                  }}
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>FRP AUTH TOKEN (EMPTY=PAIR TOKEN DERIVED)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={gfDraft.frp_auth_token || ""}
+                                  onChange={(e) =>
+                                    updateGFDraft({ frp_auth_token: e.target.value })
+                                  }
+                                  placeholder="Derived automatically from server pairing token"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>SPEED LIMIT (MB/S, 0=UNLIMITED)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={draft.speed_limit_mbps ?? "0"}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      speed_limit_mbps: e.target.value,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field" style={{ gridColumn: "1 / -1" }}>
+                                <label>FRP SECURITY & MULTIPLEXING FEATURES (GRE IS UNENCRYPTED; KEEP FRP ENCRYPTION ON)</label>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    flexWrap: "wrap",
+                                    gap: "16px",
+                                    paddingTop: "8px",
+                                    fontSize: "13px",
+                                  }}
+                                >
+                                  <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={role === "agent"}
+                                      checked={gfDraft.frp_encryption}
+                                      onChange={(e) =>
+                                        updateGFDraft({ frp_encryption: e.target.checked })
+                                      }
+                                    />
+                                    <span>Transport Encryption (AEAD)</span>
+                                  </label>
+
+                                  <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={role === "agent"}
+                                      checked={gfDraft.frp_compression}
+                                      onChange={(e) =>
+                                        updateGFDraft({ frp_compression: e.target.checked })
+                                      }
+                                    />
+                                    <span>Compression (DEFLATE)</span>
+                                  </label>
+
+                                  <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={role === "agent"}
+                                      checked={gfDraft.frp_tcp_mux}
+                                      onChange={(e) =>
+                                        updateGFDraft({ frp_tcp_mux: e.target.checked })
+                                      }
+                                    />
+                                    <span>TCP Stream Multiplexing (tcpMux)</span>
+                                  </label>
+
+                                  <label style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                                    <input
+                                      type="checkbox"
+                                      disabled={role === "agent"}
+                                      checked={gfDraft.frp_proxy_proto_v2}
+                                      onChange={(e) =>
+                                        updateGFDraft({ frp_proxy_proto_v2: e.target.checked })
+                                      }
+                                    />
+                                    <span>PROXY Protocol v2</span>
+                                  </label>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* SECTION C: PORT FORWARDING RULES */}
+                            <div
+                              className="settings-title"
+                              style={{
+                                marginTop: "18px",
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "center",
+                              }}
+                            >
+                              <span>3. Port Forwarding Rules (Single Ports & Ranges e.g. 45001-45005)</span>
+                              {role === "master" && (
+                                <button
+                                  type="button"
+                                  className="next-method-btn"
+                                  onClick={() => {
+                                    const nextIdx = (gfDraft.forwarding_rules?.length || 0) + 1;
+                                    const newRule: GREFRPForwardRule = {
+                                      name: `rule-${String(nextIdx).padStart(2, "0")}`,
+                                      protocol: "tcp+udp",
+                                      local_addr: "127.0.0.1",
+                                      local_port: String(32024 + nextIdx),
+                                      remote_port: String(32024 + nextIdx),
+                                      use_encryption: gfDraft.frp_encryption,
+                                      use_compression: gfDraft.frp_compression,
+                                      proxy_proto_v2: gfDraft.frp_proxy_proto_v2,
+                                    };
+                                    updateGFDraft({
+                                      forwarding_rules: [
+                                        ...(gfDraft.forwarding_rules || []),
+                                        newRule,
+                                      ],
+                                    });
+                                  }}
+                                >
+                                  <Plus size={13} />
+                                  <span>Add Forwarding Rule</span>
+                                </button>
+                              )}
+                            </div>
+
+                            <div style={{ display: "flex", flexDirection: "column", gap: "8px", marginTop: "8px" }}>
+                              {(gfDraft.forwarding_rules || []).map((rule, rIdx) => (
+                                <div
+                                  key={rIdx}
+                                  style={{
+                                    display: "grid",
+                                    gridTemplateColumns: "1.1fr 0.9fr 1.1fr 1fr 1fr auto",
+                                    gap: "8px",
+                                    alignItems: "center",
+                                    padding: "8px 10px",
+                                    borderRadius: "9px",
+                                    border: "1px solid rgba(148, 163, 184, 0.2)",
+                                  }}
+                                >
+                                  <input
+                                    disabled={role === "agent"}
+                                    value={rule.name}
+                                    placeholder="rule-01"
+                                    title="Rule Name"
+                                    onChange={(e) => {
+                                      const next = [...gfDraft.forwarding_rules];
+                                      next[rIdx] = { ...rule, name: e.target.value };
+                                      updateGFDraft({ forwarding_rules: next });
+                                    }}
+                                  />
+                                  <select
+                                    className="server-select"
+                                    disabled={role === "agent"}
+                                    value={rule.protocol}
+                                    title="Protocol"
+                                    onChange={(e) => {
+                                      const next = [...gfDraft.forwarding_rules];
+                                      next[rIdx] = { ...rule, protocol: e.target.value };
+                                      updateGFDraft({ forwarding_rules: next });
+                                    }}
+                                  >
+                                    <option value="tcp+udp">TCP+UDP</option>
+                                    <option value="tcp">TCP</option>
+                                    <option value="udp">UDP</option>
+                                  </select>
+                                  <input
+                                    disabled={role === "agent"}
+                                    value={rule.local_addr}
+                                    placeholder="127.0.0.1"
+                                    title="Local Target Address on Agent"
+                                    onChange={(e) => {
+                                      const next = [...gfDraft.forwarding_rules];
+                                      next[rIdx] = { ...rule, local_addr: e.target.value };
+                                      updateGFDraft({ forwarding_rules: next });
+                                    }}
+                                  />
+                                  <input
+                                    disabled={role === "agent"}
+                                    value={rule.remote_port}
+                                    placeholder="Entry Port (45001)"
+                                    title="Master Entry Port or Range (e.g. 45001-45005)"
+                                    onChange={(e) => {
+                                      const next = [...gfDraft.forwarding_rules];
+                                      next[rIdx] = { ...rule, remote_port: e.target.value };
+                                      updateGFDraft({ forwarding_rules: next });
+                                    }}
+                                  />
+                                  <input
+                                    disabled={role === "agent"}
+                                    value={rule.local_port}
+                                    placeholder="Dest Port (45001)"
+                                    title="Agent Destination Port or Range (e.g. 45001-45005)"
+                                    onChange={(e) => {
+                                      const next = [...gfDraft.forwarding_rules];
+                                      next[rIdx] = { ...rule, local_port: e.target.value };
+                                      updateGFDraft({ forwarding_rules: next });
+                                    }}
+                                  />
+                                  {role === "master" && (
+                                    <button
+                                      type="button"
+                                      className="icon-button delete-button"
+                                      disabled={gfDraft.forwarding_rules.length <= 1}
+                                      onClick={() => {
+                                        const next = gfDraft.forwarding_rules.filter(
+                                          (_, idx) => idx !== rIdx
+                                        );
+                                        updateGFDraft({ forwarding_rules: next });
+                                      }}
+                                      title="Delete rule"
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+
+                            {/* SECTION D: LIVE DIAGNOSTICS & SERVICE CONTROLS */}
+                            {tunnel.gre_frp?.diagnostics && (
+                              <div
+                                style={{
+                                  marginTop: "18px",
+                                  padding: "12px 14px",
+                                  borderRadius: "10px",
+                                  border: "1px solid rgba(56, 189, 248, 0.25)",
+                                  background: "rgba(15, 23, 42, 0.35)",
+                                }}
+                              >
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                    flexWrap: "wrap",
+                                    gap: "8px",
+                                    marginBottom: "10px",
+                                  }}
+                                >
+                                  <span style={{ fontWeight: 700, fontSize: "13px" }}>
+                                    4. Live GRE + FRP Diagnostics & Service Management
+                                  </span>
+                                  <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                    <button
+                                      type="button"
+                                      className="next-method-btn"
+                                      disabled={greActionBusy !== null}
+                                      onClick={() =>
+                                        handleGREFRPServiceAction(
+                                          selectedServer.id,
+                                          "reapply_gre"
+                                        )
+                                      }
+                                    >
+                                      <span>Re-Apply GRE</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="next-method-btn"
+                                      disabled={greActionBusy !== null}
+                                      onClick={() =>
+                                        handleGREFRPServiceAction(
+                                          selectedServer.id,
+                                          "install_frp"
+                                        )
+                                      }
+                                    >
+                                      <span>Install FRP v0.61.1</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="next-method-btn"
+                                      disabled={greActionBusy !== null}
+                                      onClick={() =>
+                                        handleGREFRPServiceAction(
+                                          selectedServer.id,
+                                          "restart"
+                                        )
+                                      }
+                                    >
+                                      <span>Restart Engine</span>
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {greActionNotice && (
+                                  <div
+                                    style={{
+                                      fontSize: "12px",
+                                      color: "#38bdf8",
+                                      marginBottom: "8px",
+                                    }}
+                                  >
+                                    {greActionNotice}
+                                  </div>
+                                )}
+
+                                <div
+                                  style={{
+                                    display: "grid",
+                                    gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))",
+                                    gap: "8px",
+                                    fontSize: "12px",
+                                  }}
+                                >
+                                  <div>
+                                    <span style={{ opacity: 0.7 }}>ACTIVE PATH: </span>
+                                    <strong>{tunnel.gre_frp.diagnostics.active_path}</strong>
+                                  </div>
+                                  <div>
+                                    <span style={{ opacity: 0.7 }}>GRE INTERFACE: </span>
+                                    <strong>
+                                      {tunnel.gre_frp.diagnostics.gre_interface_status}
+                                    </strong>
+                                  </div>
+                                  <div>
+                                    <span style={{ opacity: 0.7 }}>GRE RTT / LOSS: </span>
+                                    <strong>
+                                      {tunnel.gre_frp.diagnostics.gre_rtt_ms}ms /{" "}
+                                      {tunnel.gre_frp.diagnostics.gre_packet_loss_pct}%
+                                    </strong>
+                                  </div>
+                                  <div>
+                                    <span style={{ opacity: 0.7 }}>FRPS STATUS: </span>
+                                    <strong>
+                                      {tunnel.gre_frp.diagnostics.frps_service_status}
+                                    </strong>
+                                  </div>
+                                  <div>
+                                    <span style={{ opacity: 0.7 }}>FRPC STATUS: </span>
+                                    <strong>
+                                      {tunnel.gre_frp.diagnostics.frpc_service_status}
+                                    </strong>
+                                  </div>
+                                  <div>
+                                    <span style={{ opacity: 0.7 }}>UPTIME / FAILOVERS: </span>
+                                    <strong>
+                                      {tunnel.gre_frp.diagnostics.service_uptime} (
+                                      {tunnel.gre_frp.diagnostics.reconnect_count})
+                                    </strong>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+
+                            {errBanner && (
+                              <div className="form-error-banner" style={{ marginTop: "10px" }}>
+                                {errBanner}
+                              </div>
+                            )}
+
+                            {role === "master" && (
+                              <div className="settings-actions-row">
+                                <button
+                                  type="button"
+                                  className="save-tunnel-btn"
+                                  disabled={isSaving}
+                                  onClick={() =>
+                                    commitTunnelConfig(selectedServer.id, draft)
+                                  }
+                                >
+                                  <Save size={14} />
+                                  <span>
+                                    {isSaving ? "Saving..." : "Save GRE + FRP Settings"}
+                                  </span>
                                 </button>
 
                                 {noticeText && (
