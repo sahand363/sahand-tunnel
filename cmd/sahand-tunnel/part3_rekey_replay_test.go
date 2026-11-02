@@ -25,7 +25,26 @@ func createNoiseConnectedPair(t *testing.T) (*noiseTransportConn, *noiseTranspor
 	_, _ = io.ReadFull(rand.Reader, m2[:])
 	_, _ = io.ReadFull(rand.Reader, h[:])
 
-	c1, c2 := net.Pipe()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	acceptCh := make(chan net.Conn, 1)
+	go func() {
+		c, aErr := ln.Accept()
+		if aErr == nil {
+			acceptCh <- c
+		}
+	}()
+
+	c1, err := net.DialTimeout("tcp", ln.Addr().String(), 3*time.Second)
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("net.DialTimeout failed: %v", err)
+	}
+	c2 := <-acceptCh
+	_ = ln.Close()
+
 	clientTC := newNoiseTransportConn(
 		c1,
 		true,
