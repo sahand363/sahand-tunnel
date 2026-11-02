@@ -46,6 +46,8 @@ func readPhysicalNetCounters() (uint64, uint64) {
 			strings.HasPrefix(iface, "tun") ||
 			strings.HasPrefix(iface, "tap") ||
 			strings.HasPrefix(iface, "wg") ||
+			strings.HasPrefix(iface, "sahand-gre") ||
+			strings.HasPrefix(iface, "gre") ||
 			strings.HasPrefix(iface, "docker") ||
 			strings.HasPrefix(iface, "veth") ||
 			strings.HasPrefix(iface, "br-") {
@@ -198,6 +200,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/tunnels", requireAuth(handleTunnelsUpdate))
 	mux.HandleFunc("/api/v1/tunnels/ports", requireAuth(handleBatchPortsUpdate))
 	mux.HandleFunc("/api/v1/tunnels/ping", requireAuth(handleTunnelPing))
+	mux.HandleFunc("/api/v1/tunnels/gre-frp", requireAuth(handleGREFRPAction))
 	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
 
 	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -254,6 +257,27 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	mTime := formatMasterClock(masterNow())
 	stateMu.RLock()
+	serversCopy := make([]ServerPeer, len(appCfg.Servers))
+	for i, srv := range appCfg.Servers {
+		srvCopy := srv
+		tunnelsCopy := make([]TunnelConfig, len(srv.Tunnels))
+		copy(tunnelsCopy, srv.Tunnels)
+		for j := range tunnelsCopy {
+			if tunnelsCopy[j].ID == 25 {
+				gf := normalizeGREFRPConfig(tunnelsCopy[j].GREFRP, tunnelsCopy[j].ListenPort, tunnelsCopy[j].ForwardPorts)
+				if diag, ok := GetGREFRPDiagnostics(srv.ID); ok {
+					gf.Diagnostics = diag
+				}
+				tunnelsCopy[j].GREFRP = gf
+			}
+		}
+		srvCopy.Tunnels = tunnelsCopy
+		serversCopy[i] = srvCopy
+	}
+	role := appCfg.Role
+	nodeID := appCfg.NodeID
+	stateMu.RUnlock()
+
 	payload := struct {
 		AppVersion string                `json:"app_version"`
 		Role       string                `json:"role"`
@@ -263,17 +287,13 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 		Catalogue  []MethodCatalogueItem `json:"catalogue"`
 	}{
 		AppVersion: AppVersion,
-		Role:       appCfg.Role,
-		NodeID:     appCfg.NodeID,
+		Role:       role,
+		NodeID:     nodeID,
 		ServerTime: mTime,
-		Servers:    appCfg.Servers,
+		Servers:    serversCopy,
 		Catalogue:  methodCatalogue,
 	}
-	stateMu.RUnlock()
 
-	if payload.Servers == nil {
-		payload.Servers = []ServerPeer{}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
 }
@@ -304,6 +324,19 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		peerID, _ := randomHex(8)
+		tunnels := defaultTunnelsForServer()
+		cidr, mIP, aIP := deriveDefaultSlash30ForPeer(peerID)
+		for i := range tunnels {
+			if tunnels[i].ID == 25 && tunnels[i].GREFRP != nil {
+				tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
+				tunnels[i].GREFRP.LocalPrivateIP = mIP
+				tunnels[i].GREFRP.RemotePrivateIP = aIP
+				tunnels[i].GREFRP.RemotePublicIP = ip
+				tunnels[i].GREFRP.GREInterfaceName = "gre-" + peerID[:6]
+				tunnels[i].GREFRP.RouteConfig = fmt.Sprintf("%s via %s", cidr, tunnels[i].GREFRP.GREInterfaceName)
+			}
+		}
+
 		peer := ServerPeer{
 			ID:              peerID,
 			Name:            name,
@@ -313,7 +346,7 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 			Status:          "WAITING",
 			Running:         false,
 			RecentLifelines: []LifelineEvent{},
-			Tunnels:         defaultTunnelsForServer(),
+			Tunnels:         tunnels,
 		}
 		tok, err := generatePeerToken(appCfg, peer)
 		if err != nil {
@@ -352,9 +385,20 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tunnels := defaultTunnelsForServer()
+	cidr, mIP, aIP := deriveDefaultSlash30ForPeer(tp.AID)
 	for i := range tunnels {
 		if i < len(tp.Ports) && tp.Ports[i] >= 1024 && tp.Ports[i] <= 65535 {
 			tunnels[i].ListenPort = tp.Ports[i]
+		}
+		if tunnels[i].ID == 25 && tunnels[i].GREFRP != nil {
+			tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
+			tunnels[i].GREFRP.LocalPrivateIP = aIP
+			tunnels[i].GREFRP.RemotePrivateIP = mIP
+			tunnels[i].GREFRP.RemotePublicIP = ip
+			if len(tp.AID) >= 6 {
+				tunnels[i].GREFRP.GREInterfaceName = "gre-" + tp.AID[:6]
+			}
+			tunnels[i].GREFRP.FRPServerPort = tunnels[i].ListenPort
 		}
 	}
 
@@ -568,6 +612,39 @@ func handleTunnelPing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleGREFRPAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string `json:"server_id"`
+		Action   string `json:"action"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	msg, err := ExecuteGREFRPServiceAction(req.ServerID, req.Action)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	diag, _ := GetGREFRPDiagnostics(req.ServerID)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK          bool              `json:"ok"`
+		Message     string            `json:"message"`
+		Diagnostics GREFRPDiagnostics `json:"diagnostics"`
+	}{
+		OK:          true,
+		Message:     msg,
+		Diagnostics: diag,
+	})
+}
+
 func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -577,7 +654,7 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 		ServerID string       `json:"server_id"`
 		Tunnel   TunnelConfig `json:"tunnel"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
@@ -609,6 +686,20 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 			updated := req.Tunnel
 			if updated.ListenPort < 1024 || updated.ListenPort > 65535 {
 				updated.ListenPort = srv.Tunnels[i].ListenPort
+			}
+			if updated.ID == 25 && updated.GREFRP != nil {
+				if updated.GREFRP.FRPServerPort >= 1024 && updated.GREFRP.FRPServerPort <= 65535 {
+					updated.ListenPort = updated.GREFRP.FRPServerPort
+				} else {
+					updated.GREFRP.FRPServerPort = updated.ListenPort
+				}
+				if err := validateGREFRPConfiguration(updated.GREFRP, updated.ListenPort); err != nil {
+					stateMu.Unlock()
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				updated.ForwardPorts = syncForwardPortsCSVFromRules(updated.GREFRP)
+				updated.GREFRP = normalizeGREFRPConfig(updated.GREFRP, updated.ListenPort, updated.ForwardPorts)
 			}
 			if strings.TrimSpace(updated.SpeedLimitMBps) == "" {
 				updated.SpeedLimitMBps = "0"
@@ -711,6 +802,9 @@ func handleBatchPortsUpdate(w http.ResponseWriter, r *http.Request) {
 		if upd, ok := byID[tid]; ok {
 			if upd.ListenPort >= 1024 && upd.ListenPort <= 65535 {
 				srv.Tunnels[i].ListenPort = upd.ListenPort
+				if srv.Tunnels[i].ID == 25 && srv.Tunnels[i].GREFRP != nil {
+					srv.Tunnels[i].GREFRP.FRPServerPort = upd.ListenPort
+				}
 				if srv.ActiveMethodID == tid {
 					srv.ActivePort = upd.ListenPort
 				}
