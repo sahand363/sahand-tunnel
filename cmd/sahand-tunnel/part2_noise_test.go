@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -124,6 +126,16 @@ func TestPart2NoiseIKpsk2HandshakeAndPeerStaticVerification(t *testing.T) {
 		t.Fatalf("expected directional key separation to reject reflected transport frame")
 	}
 
+	// Verify Responder -> Initiator direction works
+	ct2, err := respCSR2I.EncryptWithAd([]byte("aad2"), []byte("secret-r2i"))
+	if err != nil {
+		t.Fatalf("respCSR2I.EncryptWithAd failed: %v", err)
+	}
+	pt2, err := initCSR2I.DecryptWithAd([]byte("aad2"), ct2)
+	if err != nil || string(pt2) != "secret-r2i" {
+		t.Fatalf("initCSR2I.DecryptWithAd failed: %v", err)
+	}
+
 	// 6. Wrong PSK must fail handshake authentication at Message 2
 	wrongPSK := make([]byte, 32)
 	_, _ = io.ReadFull(rand.Reader, wrongPSK)
@@ -158,8 +170,6 @@ func TestPart2BootstrapStaticKeyDiscoveryAndBidirectionalForwarding(t *testing.T
 	tc.Enabled = true
 	tc.ForwardPorts = strconv.Itoa(targetPort)
 
-	// Clear peer.AgentNoiseStaticPublicKey so Master starts WITHOUT knowing Agent's static public key.
-	// When the listener runs in Agent mode (or responds to bootstrap), Master will bootstrap it securely.
 	stateMu.Lock()
 	appCfg.Servers[0].AgentNoiseStaticPublicKey = ""
 	appCfg.Servers[0].Tunnels[9] = tc
@@ -181,7 +191,6 @@ func TestPart2BootstrapStaticKeyDiscoveryAndBidirectionalForwarding(t *testing.T
 		t.Fatalf("expected probeNoiseStealth with automatic static-key bootstrap to succeed, got: %s", probeRes.ErrorReason)
 	}
 
-	// Confirm AgentNoiseStaticPublicKey is now registered in appCfg.Servers[0]
 	stateMu.RLock()
 	registeredAgentPub := appCfg.Servers[0].AgentNoiseStaticPublicKey
 	expectedAgentPub := appCfg.AgentNoiseStaticPublicKey
@@ -220,7 +229,6 @@ func TestPart2BootstrapStaticKeyDiscoveryAndBidirectionalForwarding(t *testing.T
 func TestPart2Message1AloneHasZeroSideEffects(t *testing.T) {
 	peer, tc := setupNoiseStealthTestEnv(t)
 
-	// Create a local TCP listener to detect if the server dials the target port prematurely on Message 1
 	targetLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("targetLn failed: %v", err)
@@ -258,7 +266,6 @@ func TestPart2Message1AloneHasZeroSideEffects(t *testing.T) {
 	}
 	defer ln.Close()
 
-	// Construct a valid Message 1, send it to the server, read Message 2, and disconnect BEFORE sending Message 3
 	localStatic, localSignPriv, localSignPubHex, psk, err := loadLocalNoiseKeyMaterial(cfgSnap, peer)
 	if err != nil {
 		t.Fatalf("loadLocalNoiseKeyMaterial failed: %v", err)
@@ -282,7 +289,7 @@ func TestPart2Message1AloneHasZeroSideEffects(t *testing.T) {
 	nowUnix := time.Now().Unix()
 	nonceHex, _ := randomHex(16)
 	idTranscript := []byte("SAHAND-NOISE-ID-V2|" + strings.ToLower(cfgSnap.NodeID) + "|" + strings.ToLower(peer.ID) + "|" + hex.EncodeToString(localStatic.Public) + "|" + strconv.FormatInt(nowUnix, 10) + "|" + nonceHex)
-	idSig := buildEd25519SigHex(localSignPriv, idTranscript)
+	idSig := hex.EncodeToString(ed25519.Sign(localSignPriv, idTranscript))
 
 	msg1Payload, _ := json.Marshal(noiseHandshakeMsg1Payload{
 		TimestampUnix: nowUnix,
@@ -324,16 +331,6 @@ func TestPart2Message1AloneHasZeroSideEffects(t *testing.T) {
 	}
 }
 
-func buildEd25519SigHex(priv []byte, msg []byte) string {
-	return hex.EncodeToString(ed25519SignBytes(priv, msg))
-}
-
-func ed25519SignBytes(priv []byte, msg []byte) []byte {
-	var k [64]byte
-	copy(k[:], priv)
-	return k[:0] // unused helper placeholder replaced below
-}
-
 func TestPart2FrameParserAADAndTruncatedConnectionHandling(t *testing.T) {
 	var k1, k2, m1, m2 [32]byte
 	_, _ = io.ReadFull(rand.Reader, k1[:])
@@ -341,7 +338,6 @@ func TestPart2FrameParserAADAndTruncatedConnectionHandling(t *testing.T) {
 	_, _ = io.ReadFull(rand.Reader, m1[:])
 	_, _ = io.ReadFull(rand.Reader, m2[:])
 
-	// 1. Valid frame round-trip and AAD header tampering rejection
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
@@ -385,7 +381,7 @@ func TestPart2FrameParserAADAndTruncatedConnectionHandling(t *testing.T) {
 		t.Fatalf("expected AAD authentication failure when 3-byte frame header is modified on the wire")
 	}
 
-	// 2. Truncated frame handling: close connection mid-ciphertext and verify ReadFrame returns an error cleanly
+	// Truncated frame handling: close connection mid-ciphertext and verify ReadFrame returns an error cleanly
 	truncCli, truncSrv := net.Pipe()
 	txTrunc := newNoiseCipherState(k1, m1)
 	rxTrunc := newNoiseCipherState(k1, m1)
@@ -403,7 +399,6 @@ func TestPart2FrameParserAADAndTruncatedConnectionHandling(t *testing.T) {
 		ct, _ := txTrunc.EncryptWithAd(hdr[:], plain)
 
 		_, _ = truncCli.Write(hdr[:])
-		// Write only half of the ciphertext and close the socket
 		_, _ = truncCli.Write(ct[:100])
 		_ = truncCli.Close()
 	}()
