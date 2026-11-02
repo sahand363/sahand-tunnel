@@ -206,14 +206,12 @@ func noiseHKDF3(chainingKey, ikm []byte) ([32]byte, [32]byte, [32]byte) {
 	return out1, out2, out3
 }
 
-// Implements Noise Specification Section 5.2 & 5.3 SymmetricState + HandshakeState
-// for `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`.
 type noiseIKpsk2HandshakeState struct {
 	initiator bool
 	s         noiseDHKey
 	e         noiseDHKey
-	rs        []byte // 32-byte remote static public key
-	re        []byte // 32-byte remote ephemeral public key
+	rs        []byte
+	re        []byte
 	psk       [32]byte
 	ck        [32]byte
 	h         [32]byte
@@ -884,6 +882,7 @@ type noiseTransportConn struct {
 
 	readMu          sync.Mutex
 	writeMu         sync.Mutex
+	bufMu           sync.Mutex
 	csRx            *noiseCipherState
 	csTx            *noiseCipherState
 	txFramesInEpoch uint64
@@ -939,7 +938,6 @@ func (ntc *noiseTransportConn) SetAutoRekeyInterval(frames uint64) {
 	ntc.writeMu.Unlock()
 }
 
-// Internal locked frame writer (caller must hold `ntc.writeMu`).
 func (ntc *noiseTransportConn) writeFrameLocked(frameType byte, plaintext []byte) error {
 	if ntc.closed.Load() {
 		return net.ErrClosed
@@ -975,8 +973,6 @@ func (ntc *noiseTransportConn) writeFrameLocked(frameType byte, plaintext []byte
 	return nil
 }
 
-// Writes a single framed message with a 3-byte AAD header:
-// [FrameType:1][ObfuscatedPlaintextLen:2] || [Ciphertext:PlaintextLen] || [Poly1305Tag:16]
 func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) error {
 	if ntc.closed.Load() {
 		return net.ErrClosed
@@ -1002,8 +998,6 @@ func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) erro
 	return err
 }
 
-// Reads, bounds-checks before allocation, and AAD-authenticates a single frame.
-// Transparently processes in-band `REKEY_INIT`, `REKEY_ACK`, and `REKEY_COMMIT` control frames.
 func (ntc *noiseTransportConn) ReadFrame() (byte, []byte, error) {
 	if ntc.closed.Load() {
 		return 0, nil, net.ErrClosed
@@ -1101,9 +1095,14 @@ func (ntc *noiseTransportConn) Write(p []byte) (int, error) {
 }
 
 func (ntc *noiseTransportConn) Read(p []byte) (int, error) {
+	ntc.bufMu.Lock()
 	if ntc.readBuf.Len() > 0 {
-		return ntc.readBuf.Read(p)
+		n, err := ntc.readBuf.Read(p)
+		ntc.bufMu.Unlock()
+		return n, err
 	}
+	ntc.bufMu.Unlock()
+
 	for {
 		fType, plain, err := ntc.ReadFrame()
 		if err != nil {
@@ -1116,8 +1115,11 @@ func (ntc *noiseTransportConn) Read(p []byte) (int, error) {
 			if len(plain) == 0 {
 				continue
 			}
+			ntc.bufMu.Lock()
 			ntc.readBuf.Write(plain)
-			return ntc.readBuf.Read(p)
+			n, rErr := ntc.readBuf.Read(p)
+			ntc.bufMu.Unlock()
+			return n, rErr
 		}
 	}
 }
@@ -1375,7 +1377,6 @@ func startNoiseStealthServerListener(peer ServerPeer, tc TunnelConfig) (net.List
 func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfig) {
 	defer conn.Close()
 
-	// Stage 4: Pre-authentication rate limiting based on source IP before any crypto work
 	remoteIP := extractRemoteHostIP(conn.RemoteAddr())
 	if !defaultNoisePreAuthIPLimiter.Allow(remoteIP, time.Now()) {
 		return
@@ -1431,8 +1432,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		return
 	}
 
-	// Process Handshake Message 1 (`-> e, es, s, ss`).
-	// Message 1 alone NEVER triggers destination connections or state mutations.
 	msg1Plain, _, _, err := hs.ReadMessage(pktBytes)
 	if err != nil {
 		return
@@ -1446,7 +1445,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		return
 	}
 
-	// Stage 4: Check Handshake Replay Guard (rejects duplicate Message 1 nonces/ephemeral keys)
 	if err := defaultNoiseReplayGuard.CheckAndAccept(
 		peer.ID,
 		msg1Payload.ClientNonce,
@@ -1457,7 +1455,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		return
 	}
 
-	// Verify `hs.PeerStatic()` against the expected remote static public key
 	peerStaticBytes := hs.PeerStatic()
 	if len(peerStaticBytes) != 32 || subtle.ConstantTimeCompare(peerStaticBytes, localStatic.Public) == 1 {
 		return
@@ -1485,7 +1482,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		}
 	}
 
-	// Stage 4: Post-authentication rate limiting based on verified peer identity
 	if !defaultNoisePostAuthPeerLimiter.Allow(peer.ID, time.Now()) {
 		return
 	}
@@ -1515,7 +1511,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 	ntc := newNoiseTransportConn(conn, false, csI2R, csR2I, hs.ChannelBinding(), peerStaticBytes)
 	defer ntc.Close()
 
-	// Wait for Message 3 (the first post-split frame encrypted under csI2R, proving ephemeral `ee` liveness).
 	fType, msg3Plain, err := ntc.ReadFrame()
 	if err != nil || fType != noiseFrameTypeData {
 		return
