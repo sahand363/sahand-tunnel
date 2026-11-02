@@ -195,6 +195,7 @@ func stopAllServerListeners(peerID string) {
 	stopTCPMultiplexPeerResources(peerID)
 	stopWSMultiplexPeerResources(peerID)
 	stopSahandRawPeerResources(peerID)
+	stopGREFRPPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -223,6 +224,19 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 25 (GRE + FRP): Point-to-Point GRE Tunnel + FRP v0.61.1 Port Forwarding Engine
+		if tc.ID == 25 {
+			cLn, eLns, uConns, err := startGREFRPServer(peer, tc)
+			if err == nil {
+				if cLn != nil {
+					bound = append(bound, cLn)
+				}
+				bound = append(bound, eLns...)
+				boundUDP = append(boundUDP, uConns...)
+			}
 			continue
 		}
 
@@ -838,6 +852,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardHTTPUpgradeTraffic(client, peer, tc, targetPort)
 	case 24:
 		forwardSahandRawTraffic(client, peer, tc, targetPort)
+	case 25:
+		forwardGREFRPTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -1064,6 +1080,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeHTTPUpgrade(peer, tc, localNodeID)
 	case 24:
 		res = probeSahandRaw(peer, tc, localNodeID)
+	case 25:
+		res = probeGREFRP(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -1074,6 +1092,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 25:
+		return pushGREFRPParitySync(peer, tc, latencyMS)
 	case 24:
 		return pushSahandRawParitySync(peer, tc, latencyMS)
 	case 1:
