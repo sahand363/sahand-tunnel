@@ -991,9 +991,7 @@ func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) erro
 	ntc.writeMu.Unlock()
 
 	if shouldAutoRekey {
-		if _, payload, rErr := ntc.beginRekeyInit(); rErr == nil {
-			_ = ntc.WriteFrame(noiseFrameTypeRekeyInit, payload)
-		}
+		_ = ntc.Rekey(noiseDefaultRekeyWait)
 	}
 	return err
 }
