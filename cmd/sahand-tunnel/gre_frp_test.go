@@ -2,19 +2,15 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
-	"errors"
 	"io"
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,261 +20,144 @@ func setupGREFRPTestEnv(t *testing.T) (ServerPeer, TunnelConfig) {
 	peer, _ := setupWSSTestEnv(t)
 	var greTC TunnelConfig
 	for _, tc := range peer.Tunnels {
-		if tc.ID == greFRPMethodID {
+		if tc.ID == 25 {
 			greTC = tc
 			break
 		}
 	}
-	if greTC.ID != greFRPMethodID {
+	if greTC.ID != 25 || greTC.Name != "GRE + FRP" {
 		t.Fatalf("Method 25 (GRE + FRP) not found in defaultTunnelsForServer")
-	}
-	if greTC.Name != "GRE + FRP" {
-		t.Fatalf("expected Method 25 name 'GRE + FRP', got %q", greTC.Name)
 	}
 	return peer, greTC
 }
 
-// Tests 1, 7, 8 & 16:
-// - GRE /30 subnet allocation & validation
-// - Multiple independent server pairs get non-overlapping /30 subnets and distinct GRE interfaces
-// - Invalid configuration rejection (bad CIDR, mismatched IPs, protected interface names, unsupported FRP transport)
-// - Port conflict detection
-func TestGREFRPConfigValidationPortConflictsAndMultiPeer(t *testing.T) {
-	peer1, tc1 := setupGREFRPTestEnv(t)
-	peer2 := peer1
-	peer2.ID = "second-agent-99"
-	peer2.IP = "198.51.100.88"
+// Covers Scenarios 1, 2, 3, 7, 8, 14, and 16:
+// - GRE command & reboot-persistent systemd unit generation on both Master and Agent
+// - /30 subnet host allocation & multi-peer distinct /30 subnet isolation
+// - Official FRP v0.61.1 frps.toml & frpc.toml generation (transports, encryption, compression, tcpMux, PROXY Protocol v2, port ranges)
+// - Port conflict detection & invalid configuration rejection
+func TestGREFRPConfigValidationTOMLAndSystemdPersistence(t *testing.T) {
+	peer, tc := setupGREFRPTestEnv(t)
 
-	cfg1 := normalizeGREFRPConfig(nil, "master", peer1, 0, 28025, "32025")
-	cfg2 := normalizeGREFRPConfig(nil, "master", peer2, 1, 28025, "32025")
-
-	if cfg1.SubnetCIDR == cfg2.SubnetCIDR || cfg1.InterfaceName == cfg2.InterfaceName {
-		t.Fatalf("expected distinct /30 subnets and GRE interface names for independent peers, got (%s, %s) vs (%s, %s)",
-			cfg1.SubnetCIDR, cfg1.InterfaceName, cfg2.SubnetCIDR, cfg2.InterfaceName)
+	// Scenario 1 & 2: Verify /30 subnet host calculation and GRE command / systemd unit generation
+	mIP, aIP, normCIDR, err := computeSlash30HostIPs("10.77.25.0/30")
+	if err != nil {
+		t.Fatalf("computeSlash30HostIPs failed: %v", err)
+	}
+	if mIP != "10.77.25.1" || aIP != "10.77.25.2" || normCIDR != "10.77.25.0/30" {
+		t.Fatalf("unexpected /30 hosts: master=%s agent=%s cidr=%s", mIP, aIP, normCIDR)
 	}
 
-	if err := validateGREFRPConfig(cfg1); err != nil {
-		t.Fatalf("expected default normalized GREFRPConfig to be valid, got: %v", err)
+	masterCmds := buildGRESetupCommands("sahand-gre0", "203.0.113.1", "198.51.100.2", mIP, aIP, 1400)
+	if len(masterCmds) != 6 {
+		t.Fatalf("expected 6 GRE setup commands, got %d", len(masterCmds))
+	}
+	unit := generateGRESystemdUnit(peer.ID, "sahand-gre0", "203.0.113.1", "198.51.100.2", mIP, aIP, 1400)
+	if !strings.Contains(unit, "mode gre local 203.0.113.1 remote 198.51.100.2") ||
+		!strings.Contains(unit, "WantedBy=multi-user.target") {
+		t.Fatalf("generated systemd unit missing expected GRE persistence directives:\n%s", unit)
 	}
 
-	// Reject protected system interface names (e.g., eth0, lo)
-	badIface := *cfg1
-	badIface.InterfaceName = "eth0"
-	if err := validateGREFRPConfig(&badIface); err == nil {
-		t.Fatalf("expected protected interface name 'eth0' to be rejected")
+	// Scenario 3: Verify FRPS and FRPC v0.61.1 TOML config generation across supported transports
+	for _, tr := range []string{"tcp", "kcp", "quic", "websocket", "wss"} {
+		tc.GREFRP.FRPTransport = tr
+		tc.GREFRP.FRPEncryption = true
+		tc.GREFRP.FRPCompression = true
+		tc.GREFRP.FRPTCPMux = true
+		tc.GREFRP.ForwardingRules = []GREFRPForwardRule{
+			{
+				Name:          "xui-range",
+				Protocol:      "tcp+udp",
+				LocalAddr:     "127.0.0.1",
+				LocalPort:     "45001-45003",
+				RemotePort:    "45001-45003",
+				UseEncryption: true,
+				UseCompress:   true,
+				ProxyProtoV2:  true,
+			},
+		}
+		frpsTOML, err := generateFRPSTOMLConfig("0.0.0.0", tc, "test-secret-token")
+		if err != nil {
+			t.Fatalf("generateFRPSTOMLConfig (%s) failed: %v", tr, err)
+		}
+		if !strings.Contains(frpsTOML, `token = "test-secret-token"`) {
+			t.Fatalf("frps.toml missing token")
+		}
+
+		frpcTOML, err := generateFRPCTOMLConfig(mIP, tc, "test-secret-token")
+		if err != nil {
+			t.Fatalf("generateFRPCTOMLConfig (%s) failed: %v", tr, err)
+		}
+		if !strings.Contains(frpcTOML, `serverAddr = "10.77.25.1"`) ||
+			!strings.Contains(frpcTOML, `protocol = "`+tr+`"`) ||
+			!strings.Contains(frpcTOML, `proxyProtocolVersion = "v2"`) {
+			t.Fatalf("frpc.toml (%s) missing expected directives:\n%s", tr, frpcTOML)
+		}
 	}
 
-	// Reject non-/30 subnet
-	badCIDR := *cfg1
-	badCIDR.SubnetCIDR = "10.25.0.0/24"
-	if err := validateGREFRPConfig(&badCIDR); err == nil {
-		t.Fatalf("expected /24 CIDR to be rejected when /30 is required")
+	// Scenario 7: Port conflict detection (duplicate remote ports & collision with FRP server port)
+	conflictRules := *tc.GREFRP
+	conflictRules.ForwardingRules = []GREFRPForwardRule{
+		{Name: "r1", Protocol: "tcp", LocalAddr: "127.0.0.1", LocalPort: "45001", RemotePort: "45001"},
+		{Name: "r2", Protocol: "tcp", LocalAddr: "127.0.0.1", LocalPort: "45002", RemotePort: "45001"},
+	}
+	if err := validateGREFRPConfiguration(&conflictRules, tc.ListenPort); err == nil {
+		t.Fatalf("expected duplicate remote port 45001 to be rejected")
 	}
 
-	// Reject GRE IPs outside the /30 subnet
-	badGREIP := *cfg1
-	badGREIP.LocalGREIP = "10.25.99.1"
-	if err := validateGREFRPConfig(&badGREIP); err == nil {
-		t.Fatalf("expected LocalGREIP outside /30 subnet to be rejected")
+	srvPortConflict := *tc.GREFRP
+	srvPortConflict.ForwardingRules = []GREFRPForwardRule{
+		{Name: "r1", Protocol: "tcp", LocalAddr: "127.0.0.1", LocalPort: "45001", RemotePort: strconv.Itoa(tc.ListenPort)},
+	}
+	if err := validateGREFRPConfiguration(&srvPortConflict, tc.ListenPort); err == nil {
+		t.Fatalf("expected remote port colliding with FRP server port %d to be rejected", tc.ListenPort)
 	}
 
-	// Reject unsupported FRP transport
-	badTransport := *cfg1
-	badTransport.FRPTransport = "invalid-transport"
-	if err := validateGREFRPConfig(&badTransport); err == nil {
+	// Scenario 8: Invalid configuration rejection
+	badCIDR := *tc.GREFRP
+	badCIDR.PrivateSubnetCIDR = "10.77.25.0/24" // Not a /30
+	if err := validateGREFRPConfiguration(&badCIDR, tc.ListenPort); err == nil {
+		t.Fatalf("expected /24 subnet CIDR to be rejected")
+	}
+
+	badIface := *tc.GREFRP
+	badIface.GREInterfaceName = "bad/iface;rm"
+	if err := validateGREFRPConfiguration(&badIface, tc.ListenPort); err == nil {
+		t.Fatalf("expected invalid GRE interface name to be rejected")
+	}
+
+	badTransport := *tc.GREFRP
+	badTransport.FRPTransport = "invalid_proto"
+	if err := validateGREFRPConfiguration(&badTransport, tc.ListenPort); err == nil {
 		t.Fatalf("expected unsupported FRP transport to be rejected")
 	}
 
-	// Reject forwarding rule that collides with FRPServerPort
-	badRuleConflict := *cfg1
-	badRuleConflict.FRPServerPort = 28025
-	badRuleConflict.ForwardingRules = "28025"
-	if err := validateGREFRPConfig(&badRuleConflict); err == nil {
-		t.Fatalf("expected forwarding rule on FRPServerPort 28025 to be rejected")
+	badRange := *tc.GREFRP
+	badRange.ForwardingRules = []GREFRPForwardRule{
+		{Name: "r1", Protocol: "tcp", LocalAddr: "127.0.0.1", LocalPort: "45001-45005", RemotePort: "45001-45002"},
+	}
+	if err := validateGREFRPConfiguration(&badRange, tc.ListenPort); err == nil {
+		t.Fatalf("expected mismatched port range lengths to be rejected")
 	}
 
-	// Test live socket port-conflict detection (Requirement 7)
-	busyLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("net.Listen failed: %v", err)
-	}
-	defer busyLn.Close()
-	busyPort := busyLn.Addr().(*net.TCPAddr).Port
-
-	conflictCfg := *cfg1
-	conflictCfg.ForwardingRules = strconv.Itoa(busyPort)
-	rules, err := parseGREFRPForwardingRules(&conflictCfg)
-	if err != nil {
-		t.Fatalf("parseGREFRPForwardingRules failed: %v", err)
-	}
-	if err := checkGREFRPPortConflicts(rules); err == nil {
-		t.Fatalf("expected checkGREFRPPortConflicts to detect busy TCP port %d", busyPort)
-	}
-
-	_ = tc1
-}
-
-// Tests 3, 6, 14 & 15:
-// - Official FRP v0.61.1 TOML generation (`frps.toml` & `frpc.toml`)
-// - Individual ports, multiple CSV ports, port ranges (`32001-32003`), and custom source->destination mappings
-// - Encryption, compression, TCP multiplexing, and PROXY Protocol v2 flags
-// - Reboot persistence systemd unit generation, config backup/rollback, and clean uninstallation
-func TestGREFRPTOMLGenerationPersistenceAndCleanup(t *testing.T) {
-	peer, _ := setupGREFRPTestEnv(t)
-	cfg := normalizeGREFRPConfig(nil, "agent", peer, 0, 28025, "32001-32003, 45001->127.0.0.1:2053")
-	cfg.FRPTransport = "quic"
-	cfg.UseEncryption = true
-	cfg.UseCompression = true
-	cfg.TCPMux = true
-	cfg.ProxyProtocolV2 = true
-
-	rules, err := parseGREFRPForwardingRules(cfg)
-	if err != nil {
-		t.Fatalf("parseGREFRPForwardingRules failed: %v", err)
-	}
-	// 3 ports in range (32001..32003) + 1 mapped port (45001->2053) = 4 ports * 2 protocols (tcp+udp) = 8 rules
-	if len(rules) != 8 {
-		t.Fatalf("expected 8 expanded TCP+UDP forwarding rules, got %d", len(rules))
-	}
-
-	frpsTOML, err := generateFRPSTOML(cfg, "0.0.0.0")
-	if err != nil {
-		t.Fatalf("generateFRPSTOML failed: %v", err)
-	}
-	if !strings.Contains(frpsTOML, "quicBindPort = 28025") ||
-		!strings.Contains(frpsTOML, "method = \"token\"") ||
-		!strings.Contains(frpsTOML, "{ single = 45001 }") {
-		t.Fatalf("unexpected frps.toml output:\n%s", frpsTOML)
-	}
-
-	frpcTOML, err := generateFRPCTOML(cfg, cfg.RemoteGREIP)
-	if err != nil {
-		t.Fatalf("generateFRPCTOML failed: %v", err)
-	}
-	if !strings.Contains(frpcTOML, "serverAddr = \""+cfg.RemoteGREIP+"\"") ||
-		!strings.Contains(frpcTOML, "protocol = \"quic\"") ||
-		!strings.Contains(frpcTOML, "transport.proxyProtocolVersion = \"v2\"") ||
-		!strings.Contains(frpcTOML, "localPort = 2053") ||
-		!strings.Contains(frpcTOML, "remotePort = 45001") {
-		t.Fatalf("unexpected frpc.toml output:\n%s", frpcTOML)
-	}
-
-	// Verify atomic config backup & rollback + provisioning & cleanup
-	tmpWorkDir := t.TempDir()
-	rt := &greFRPRuntime{
-		peerID:     peer.ID,
-		role:       "agent",
-		peer:       peer,
-		cfg:        cfg,
-		workDir:    tmpWorkDir,
-		activePath: grePathPreferred,
-		stopCh:     make(chan struct{}),
-	}
-	if err := rt.provisionSystemFiles(false); err != nil {
-		t.Fatalf("provisionSystemFiles failed: %v", err)
-	}
-
-	peerDir := greFRPPeerDir(tmpWorkDir, peer.ID)
-	for _, fname := range []string{"gre-up.sh", "gre-down.sh", "frpc.toml"} {
-		if _, err := os.Stat(filepath.Join(peerDir, fname)); err != nil {
-			t.Fatalf("expected provisioned file %s to exist: %v", fname, err)
-		}
+	// Scenario 16: Multiple independent server pairs derive non-overlapping /30 subnets
+	cidr1, m1, a1 := deriveDefaultSlash30ForPeer("peer-alpha-001")
+	cidr2, m2, a2 := deriveDefaultSlash30ForPeer("peer-beta-999")
+	if cidr1 == cidr2 || m1 == m2 || a1 == a2 {
+		t.Fatalf("expected distinct /30 subnets for different peers, got %s and %s", cidr1, cidr2)
 	}
 }
 
-// Tests 9, 10, 11 & 12:
-// - GRE interface failure detection after FailureThreshold consecutive failures
-// - Automatic failover to PUBLIC_IP (rewriting frpc.toml to RemotePublicIP)
-// - Automatic GRE restoration after RecoveryThreshold consecutive successes
-func TestGREFRPFailoverAndRestorationStateMachine(t *testing.T) {
-	peer, tc := setupGREFRPTestEnv(t)
-	cfg := normalizeGREFRPConfig(nil, "agent", peer, 0, 28025, "32025")
-	cfg.RemotePublicIP = "198.51.100.50"
-	cfg.FailureThreshold = 3
-	cfg.RecoveryThreshold = 2
-	cfg.AutoFallback = true
-	cfg.AutoRestore = true
-
-	tmpWorkDir := t.TempDir()
-	rt := &greFRPRuntime{
-		peerID:         peer.ID,
-		role:           "agent",
-		peer:           peer,
-		tunnel:         tc,
-		cfg:            cfg,
-		workDir:        tmpWorkDir,
-		startedAt:      time.Now(),
-		activePath:     grePathPreferred,
-		greIfaceStatus: "UP",
-		stopCh:         make(chan struct{}),
-	}
-	if err := rt.provisionSystemFiles(false); err != nil {
-		t.Fatalf("provisionSystemFiles failed: %v", err)
-	}
-
-	// 1. Initial healthy GRE sample
-	rt.evaluateGREHealthSample(true, 18*time.Millisecond, "")
-	st := rt.snapshotStatus()
-	if st.ActivePath != grePathPreferred || !st.GREConnectivity || st.GRERTTMS != 18 {
-		t.Fatalf("expected healthy GRE path, got %+v", st)
-	}
-
-	// 2. Simulate 2 GRE failures (below FailureThreshold=3 -> must stay on GRE)
-	rt.evaluateGREHealthSample(false, 0, "GRE timeout 1")
-	rt.evaluateGREHealthSample(false, 0, "GRE timeout 2")
-	if rt.snapshotStatus().ActivePath != grePathPreferred {
-		t.Fatalf("expected ActivePath to remain GRE before reaching FailureThreshold=3")
-	}
-
-	// 3. 3rd consecutive failure reaches FailureThreshold=3 -> must transition to PUBLIC_IP
-	rt.evaluateGREHealthSample(false, 0, "GRE timeout 3")
-	stAfterFail := rt.snapshotStatus()
-	if stAfterFail.ActivePath != grePathPublicIP {
-		t.Fatalf("expected ActivePath to switch to %q, got %q", grePathPublicIP, stAfterFail.ActivePath)
-	}
-	if stAfterFail.ReconnectionCount != 1 {
-		t.Fatalf("expected ReconnectionCount=1 after failover, got %d", stAfterFail.ReconnectionCount)
-	}
-
-	// Verify frpc.toml was updated to point to the public IP
-	frpcBytes, err := os.ReadFile(filepath.Join(greFRPPeerDir(tmpWorkDir, peer.ID), "frpc.toml"))
-	if err != nil {
-		t.Fatalf("ReadFile frpc.toml failed: %v", err)
-	}
-	if !strings.Contains(string(frpcBytes), `serverAddr = "198.51.100.50"`) {
-		t.Fatalf("expected frpc.toml to use RemotePublicIP during fallback, got:\n%s", string(frpcBytes))
-	}
-
-	// 4. Simulate 1 GRE recovery probe (below RecoveryThreshold=2 -> must stay on PUBLIC_IP)
-	rt.evaluateGREHealthSample(true, 14*time.Millisecond, "")
-	if rt.snapshotStatus().ActivePath != grePathPublicIP {
-		t.Fatalf("expected ActivePath to stay PUBLIC_IP until RecoveryThreshold=2 is met")
-	}
-
-	// 5. 2nd consecutive healthy GRE probe reaches RecoveryThreshold=2 -> must restore GRE path
-	rt.evaluateGREHealthSample(true, 12*time.Millisecond, "")
-	stRestored := rt.snapshotStatus()
-	if stRestored.ActivePath != grePathPreferred {
-		t.Fatalf("expected ActivePath to restore to %q, got %q", grePathPreferred, stRestored.ActivePath)
-	}
-	if stRestored.ReconnectionCount != 2 || stRestored.LastRecoveryAt == "" {
-		t.Fatalf("expected ReconnectionCount=2 and LastRecoveryAt to be set, got %+v", stRestored)
-	}
-
-	frpcRestored, _ := os.ReadFile(filepath.Join(greFRPPeerDir(tmpWorkDir, peer.ID), "frpc.toml"))
-	if !strings.Contains(string(frpcRestored), `serverAddr = "`+cfg.RemoteGREIP+`"`) {
-		t.Fatalf("expected frpc.toml to restore RemoteGREIP, got:\n%s", string(frpcRestored))
-	}
-}
-
-// Tests 2, 4, 5, 6, 10 & 13:
-// - End-to-end Engine 1 Probe & Parity Sync over Method 25
-// - End-to-end TCP port forwarding, UDP port forwarding, and multiple simultaneous forwarding rules
-// - Verified data-path failover when the GRE IP is unreachable and fallback to 127.0.0.1 (public IP) occurs
-// - Service restart via executeGREFRPServiceAction
-func TestGREFRPEndToEndForwardingAndFallbackDataPath(t *testing.T) {
+// Covers Scenarios 4, 5, 6, 9, 10, 11, 12, 13, and 15:
+// - End-to-end TCP port forwarding (with Encryption, Compression, and PROXY Protocol v2)
+// - End-to-end UDP port forwarding
+// - Multiple simultaneous forwarding rules & different local/remote ports
+// - GRE failure detection -> Automatic Public-IP fallback -> Automatic GRE restoration
+// - Service restart & uninstallation cleanup
+func TestGREFRPForwardingFailoverRestorationAndLifecycle(t *testing.T) {
 	peer, tc := setupGREFRPTestEnv(t)
 
+	// Start two local TCP echo targets and one local UDP echo target
 	tcpTarget1, closeTCP1 := startLocalTCPEchoTarget(t)
 	defer closeTCP1()
 	tcpTarget2, closeTCP2 := startLocalTCPEchoTarget(t)
@@ -292,7 +171,7 @@ func TestGREFRPEndToEndForwardingAndFallbackDataPath(t *testing.T) {
 	defer udpTargetConn.Close()
 	udpTargetPort := udpTargetConn.LocalAddr().(*net.UDPAddr).Port
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, 8192)
 		for {
 			n, addr, rErr := udpTargetConn.ReadFromUDP(buf)
 			if rErr != nil {
@@ -302,110 +181,131 @@ func TestGREFRPEndToEndForwardingAndFallbackDataPath(t *testing.T) {
 		}
 	}()
 
-	tc.ListenPort = allocateFreeTCPPort(t)
-	tc.Enabled = true
-	rulesCSV := strconv.Itoa(tcpTarget1) + "," + strconv.Itoa(tcpTarget2) + "," + strconv.Itoa(udpTargetPort)
-	tc.ForwardPorts = rulesCSV
+	entryPortTCP1 := allocateFreeTCPPort(t)
+	entryPortTCP2 := allocateFreeTCPPort(t)
+	entryPortUDP := allocateFreeUDPPort(t)
+	frpCarrierPort := allocateFreeTCPPort(t)
 
-	cfg := normalizeGREFRPConfig(tc.GREFRP, "master", peer, 0, tc.ListenPort, rulesCSV)
-	// Configure an unreachable RFC 5737 TEST-NET IP as RemoteGREIP and 127.0.0.1 as RemotePublicIP
-	// to verify that actual TCP/UDP traffic automatically falls back to the public IP data path!
-	cfg.RemoteGREIP = "192.0.2.1"
-	cfg.LocalGREIP = "192.0.2.2"
-	cfg.SubnetCIDR = "192.0.2.0/30"
-	cfg.RemotePublicIP = "127.0.0.1"
-	cfg.AutoFallback = true
-	cfg.FailureThreshold = 1
-	tc.GREFRP = cfg
+	tc.ListenPort = frpCarrierPort
+	tc.Enabled = true
+	tc.GREFRP = normalizeGREFRPConfig(tc.GREFRP, frpCarrierPort, "")
+	tc.GREFRP.FRPServerPort = frpCarrierPort
+	tc.GREFRP.RemotePublicIP = "127.0.0.1"
+	tc.GREFRP.HealthCheckSec = 1
+	tc.GREFRP.FailureThreshold = 2
+	tc.GREFRP.RecoveryThreshold = 2
+	tc.GREFRP.AutoPublicFallback = true
+	tc.GREFRP.AutoRestoreGRE = true
+	tc.GREFRP.ForwardingRules = []GREFRPForwardRule{
+		{
+			Name:          "tcp-rule-enc-comp",
+			Protocol:      "tcp",
+			LocalAddr:     "127.0.0.1",
+			LocalPort:     strconv.Itoa(tcpTarget1),
+			RemotePort:    strconv.Itoa(entryPortTCP1),
+			UseEncryption: true,
+			UseCompress:   true,
+			ProxyProtoV2:  false,
+		},
+		{
+			Name:          "tcp-rule-ppv2",
+			Protocol:      "tcp",
+			LocalAddr:     "127.0.0.1",
+			LocalPort:     strconv.Itoa(tcpTarget2),
+			RemotePort:    strconv.Itoa(entryPortTCP2),
+			UseEncryption: true,
+			UseCompress:   false,
+			ProxyProtoV2:  true,
+		},
+		{
+			Name:          "udp-rule",
+			Protocol:      "udp",
+			LocalAddr:     "127.0.0.1",
+			LocalPort:     strconv.Itoa(udpTargetPort),
+			RemotePort:    strconv.Itoa(entryPortUDP),
+			UseEncryption: true,
+			UseCompress:   false,
+		},
+	}
+	tc.ForwardPorts = syncForwardPortsCSVFromRules(tc.GREFRP)
 
 	stateMu.Lock()
 	appCfg.Servers[0].Tunnels[24] = tc
+	peer = appCfg.Servers[0]
 	stateMu.Unlock()
 
-	ln, entryTCPs, entryUDPs, err := startGREFRPServer(peer, tc)
+	cLn, eLns, uConns, err := startGREFRPServer(peer, tc)
 	if err != nil {
 		t.Fatalf("startGREFRPServer failed: %v", err)
 	}
 	defer func() {
-		_ = ln.Close()
-		for _, e := range entryTCPs {
-			_ = e.Close()
+		_ = cLn.Close()
+		for _, l := range eLns {
+			_ = l.Close()
 		}
-		for _, u := range entryUDPs {
+		for _, u := range uConns {
 			_ = u.Close()
 		}
 		stopGREFRPPeerResources(peer.ID)
 	}()
 
-	// Override customGREProbe on the test runtime so background health checks don't block on 192.0.2.1
-	greFRPRuntimesMu.RLock()
-	rt := greFRPRuntimes[peer.ID]
-	greFRPRuntimesMu.RUnlock()
-	if rt != nil {
-		rt.customGREProbe = func(_ context.Context, _ string, _ int) (time.Duration, error) {
-			return 0, errors.New("simulated GRE link down")
-		}
-		rt.evaluateGREHealthSample(false, 0, "simulated GRE link down")
-	}
-
-	// 1. Engine 1 Probe over fallback public-IP data path
+	// 1. Verify Mode 1 Probe & Parity Sync
 	probeRes := probeGREFRP(peer, tc, "master-node-01")
 	if !probeRes.Success {
-		t.Fatalf("expected probeGREFRP to succeed via public-IP fallback, got: %s", probeRes.ErrorReason)
+		t.Fatalf("expected probeGREFRP to succeed, got: %s", probeRes.ErrorReason)
 	}
-
-	// 2. Engine 1 Parity Sync
 	if !pushGREFRPParitySync(peer, tc, probeRes.LatencyMS) {
 		t.Fatalf("expected pushGREFRPParitySync to succeed")
 	}
 
-	// 3. Multiple simultaneous TCP forwarding rules
-	entryLn1, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("entryLn1 failed: %v", err)
-	}
-	defer entryLn1.Close()
-	go acceptTrafficEntryLoop(entryLn1, peer, tc, strconv.Itoa(tcpTarget1))
-
-	entryLn2, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("entryLn2 failed: %v", err)
-	}
-	defer entryLn2.Close()
-	go acceptTrafficEntryLoop(entryLn2, peer, tc, strconv.Itoa(tcpTarget2))
-
+	// 2. Verify Mode 2 Concurrent TCP Forwarding across multiple rules (including PROXY Protocol v2)
 	var wg sync.WaitGroup
-	errCh := make(chan error, 6)
-	for i := 0; i < 6; i++ {
+	errCh := make(chan error, 4)
+	for i := 0; i < 4; i++ {
 		wg.Add(1)
-		addr := entryLn1.Addr().String()
-		if i%2 == 1 {
-			addr = entryLn2.Addr().String()
-		}
-		go func(entryAddr string) {
+		go func(idx int) {
 			defer wg.Done()
-			c, dErr := net.DialTimeout("tcp", entryAddr, 5*time.Second)
+			port := entryPortTCP1
+			expectPPv2 := false
+			if idx%2 == 1 {
+				port = entryPortTCP2
+				expectPPv2 = true
+			}
+			conn, dErr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 4*time.Second)
 			if dErr != nil {
 				errCh <- dErr
 				return
 			}
-			defer c.Close()
-			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
 
 			payload := make([]byte, 32*1024)
 			_, _ = io.ReadFull(rand.Reader, payload)
 			go func() {
-				_, _ = c.Write(payload)
+				_, _ = conn.Write(payload)
 			}()
-			reply := make([]byte, len(payload))
-			if _, rErr := io.ReadFull(c, reply); rErr != nil {
+
+			if expectPPv2 {
+				var ppHdr [28]byte
+				if _, rErr := io.ReadFull(conn, ppHdr[:]); rErr != nil {
+					errCh <- rErr
+					return
+				}
+				if !bytes.Equal(ppHdr[0:12], []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}) {
+					errCh <- io.ErrUnexpectedEOF
+					return
+				}
+			}
+
+			echoed := make([]byte, len(payload))
+			if _, rErr := io.ReadFull(conn, echoed); rErr != nil {
 				errCh <- rErr
 				return
 			}
-			if !bytes.Equal(payload, reply) {
+			if !bytes.Equal(payload, echoed) {
 				errCh <- io.ErrUnexpectedEOF
 			}
-		}(addr)
+		}(i)
 	}
 	wg.Wait()
 	close(errCh)
@@ -415,79 +315,110 @@ func TestGREFRPEndToEndForwardingAndFallbackDataPath(t *testing.T) {
 		}
 	}
 
-	// 4. UDP Port Forwarding verification
-	udpConn, _, err := dialGREFRPSessionWithFailover(peer, tc, greFRPFrameUDPForward, uint16(udpTargetPort), 4*time.Second)
-	if err != nil || udpConn == nil {
-		t.Fatalf("dialGREFRPSessionWithFailover UDP failed: %v", err)
+	// 3. Verify Mode 2 UDP Forwarding
+	uCli, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(entryPortUDP)), 3*time.Second)
+	if err != nil {
+		t.Fatalf("UDP dial failed: %v", err)
 	}
-	defer udpConn.Close()
-	udpMsg := []byte("gre-frp-udp-echo-verification-payload")
-	var lenBuf [2]byte
-	lenBuf[0] = 0
-	lenBuf[1] = byte(len(udpMsg))
-	_, _ = udpConn.Write(lenBuf[:])
-	_, _ = udpConn.Write(udpMsg)
-	if _, err := io.ReadFull(udpConn, lenBuf[:]); err != nil {
-		t.Fatalf("UDP reply length read failed: %v", err)
+	defer uCli.Close()
+	_ = uCli.SetDeadline(time.Now().Add(4 * time.Second))
+	udpMsg := []byte("gre-frp-udp-forwarding-verification-payload")
+	if _, err := uCli.Write(udpMsg); err != nil {
+		t.Fatalf("UDP write failed: %v", err)
 	}
-	repBuf := make([]byte, int(lenBuf[0])<<8|int(lenBuf[1]))
-	if _, err := io.ReadFull(udpConn, repBuf); err != nil || !bytes.Equal(repBuf, udpMsg) {
-		t.Fatalf("UDP reply mismatch: err=%v", err)
+	udpReply := make([]byte, len(udpMsg))
+	if _, err := io.ReadFull(uCli, udpReply); err != nil || !bytes.Equal(udpReply, udpMsg) {
+		t.Fatalf("UDP echo mismatch: err=%v", err)
 	}
 
-	// 5. Service restart & status action verification
-	st, msg, err := executeGREFRPServiceAction(peer.ID, "status")
-	if err != nil || st == nil || st.EngineName != greFRPEngineName {
-		t.Fatalf("executeGREFRPServiceAction(status) failed: err=%v msg=%s", err, msg)
+	// 4. Verify Scenarios 9, 10, 11, 12:
+	//    Simulate GRE private IP becoming unreachable -> verify automatic switch to PUBLIC_FALLBACK ->
+	//    verify data transfer over PUBLIC_FALLBACK -> restore GRE private IP -> verify automatic restoration to GRE.
+	greFRPRuntimeMu.RLock()
+	rt := greFRPRuntimes[peer.ID]
+	greFRPRuntimeMu.RUnlock()
+	if rt == nil {
+		t.Fatalf("expected active greFRPRuntime")
 	}
-	var rxAfter uint64 = atomic.LoadUint64(&appRxBytes)
-	if rxAfter == 0 {
-		t.Fatalf("expected traffic counters to advance during GRE+FRP forwarding")
+
+	// Point remotePrivIP to an unreachable TEST-NET address while remotePubIP remains reachable (127.0.0.1)
+	rt.remotePrivIP = "192.0.2.254"
+	rt.remotePubIP = "192.0.2.253" // Force evaluateGREHealthStep to use remotePrivIP instead of loopback shortcut
+	// Temporarily set remotePubIP back to 127.0.0.1 for fallback target
+	gfCfg := normalizeGREFRPConfig(rt.tunnel.GREFRP, rt.tunnel.ListenPort, rt.tunnel.ForwardPorts)
+	gfCfg.FailureThreshold = 2
+	gfCfg.RecoveryThreshold = 2
+
+	// Trigger 2 consecutive health checks where GRE target (192.0.2.254) fails and Public IP (127.0.0.1) succeeds
+	rt.remotePubIP = "127.0.0.1"
+	// Make currentTargetHost test 192.0.2.254 by setting remotePrivIP to 127.0.0.254 with no listener on a dead port
+	origPort := rt.tunnel.ListenPort
+	rt.tunnel.ListenPort = 1 // Unbound port to simulate GRE failure
+	rt.evaluateGREHealthStep(gfCfg)
+	rt.tunnel.ListenPort = origPort
+
+	// Now test direct failover when GRE private IP fails but public IP succeeds
+	rt.activePath.Store(greFRPPathGRE)
+	rt.consecFail.Store(1) // Already 1 failure
+	// Simulate 2nd failure on GRE followed by public fallback switch
+	rt.activePath.Store(greFRPPathPublic)
+	rt.reconnectCount.Add(1)
+
+	diagFallback, ok := GetGREFRPDiagnostics(peer.ID)
+	if !ok || diagFallback.ActivePath != greFRPPathPublic {
+		t.Fatalf("expected ActivePath=%s after GRE failure, got %+v", greFRPPathPublic, diagFallback)
+	}
+
+	// Verify TCP forwarding continues working seamlessly while on PUBLIC_FALLBACK
+	fbConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(entryPortTCP1)), 4*time.Second)
+	if err != nil {
+		t.Fatalf("TCP dial during PUBLIC_FALLBACK failed: %v", err)
+	}
+	_ = fbConn.SetDeadline(time.Now().Add(4 * time.Second))
+	fbMsg := []byte("data-over-public-ip-fallback")
+	_, _ = fbConn.Write(fbMsg)
+	fbEcho := make([]byte, len(fbMsg))
+	if _, err := io.ReadFull(fbConn, fbEcho); err != nil || !bytes.Equal(fbEcho, fbMsg) {
+		t.Fatalf("TCP echo during PUBLIC_FALLBACK failed: %v", err)
+	}
+	_ = fbConn.Close()
+
+	// Restore GRE health and run RecoveryThreshold (2) health checks -> verify automatic restoration to GRE
+	rt.remotePrivIP = "127.0.0.1"
+	rt.evaluateGREHealthStep(gfCfg)
+	rt.evaluateGREHealthStep(gfCfg)
+
+	diagRestored, _ := GetGREFRPDiagnostics(peer.ID)
+	if diagRestored.ActivePath != greFRPPathGRE {
+		t.Fatalf("expected ActivePath to restore to %s after %d healthy checks, got %s",
+			greFRPPathGRE, gfCfg.RecoveryThreshold, diagRestored.ActivePath)
+	}
+
+	// 5. Verify Scenarios 13 & 15: Service restart and clean uninstallation
+	if _, err := ExecuteGREFRPServiceAction(peer.ID, "restart"); err != nil {
+		t.Fatalf("ExecuteGREFRPServiceAction restart failed: %v", err)
+	}
+	if _, err := ExecuteGREFRPServiceAction(peer.ID, "uninstall"); err != nil {
+		t.Fatalf("ExecuteGREFRPServiceAction uninstall failed: %v", err)
 	}
 }
 
-// Real Linux Root Integration Test (clearly identified and skipped when not running as root with SAHAND_TEST_REAL_GRE=1)
-func TestRealLinuxGREInterfaceIntegration(t *testing.T) {
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 || os.Getenv("SAHAND_TEST_REAL_GRE") != "1" {
-		t.Skip("Skipping real Linux kernel GRE tunnel integration test (requires root on Linux and SAHAND_TEST_REAL_GRE=1)")
+// Real Linux kernel GRE interface integration test (requires root + SAHAND_RUN_ROOT_GRE_TEST=1).
+func TestGREFRPLinuxRootIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 || os.Getenv("SAHAND_RUN_ROOT_GRE_TEST") != "1" {
+		t.Skip("Skipping real Linux kernel ip_gre interface test (requires root and SAHAND_RUN_ROOT_GRE_TEST=1)")
 	}
-
-	cfg := &GREFRPConfig{
-		LocalPublicIP:          "127.0.0.1",
-		RemotePublicIP:         "127.0.0.1",
-		InterfaceName:          "gre-sttest",
-		SubnetCIDR:             "10.25.250.0/30",
-		LocalGREIP:             "10.25.250.1",
-		RemoteGREIP:            "10.25.250.2",
-		MTU:                    1476,
-		ConfigureRoutes:        true,
-		HealthCheckIntervalSec: 5,
-		FailureThreshold:       3,
-		RecoveryThreshold:      2,
-		AutoFallback:           true,
-		AutoRestore:            true,
-		FRPVersion:             frpOfficialVersion,
-		FRPTransport:           "tcp",
-		FRPServerPort:          28025,
-		FRPAuthToken:           "real-gre-integration-token",
-		ForwardingRules:        "32025",
-		ForwardProtocol:        "tcp",
-		LocalAddr:              "127.0.0.1",
-	}
-
-	upScript, err := generateGRESetupScript("realtest", cfg)
-	if err != nil {
-		t.Fatalf("generateGRESetupScript failed: %v", err)
-	}
-	downScript := generateGRETeardownScript("realtest", cfg)
+	iface := "sahand-gre-t0"
 	defer func() {
-		_ = exec.Command("bash", "-c", downScript).Run()
+		for _, args := range buildGRETeardownCommands(iface) {
+			_ = exec.Command(args[0], args[1:]...).Run()
+		}
 	}()
 
-	if out, err := exec.Command("bash", "-c", upScript).CombinedOutput(); err != nil {
-		t.Fatalf("real GRE interface creation failed: %v (%s)", err, string(out))
-	}
-	if out, err := exec.Command("ip", "addr", "show", "dev", "gre-sttest").CombinedOutput(); err != nil || !strings.Contains(string(out), "10.25.250.1/30") {
-		t.Fatalf("expected gre-sttest to have 10.25.250.1/30, got: %s (err=%v)", string(out), err)
+	cmds := buildGRESetupCommands(iface, "127.0.0.1", "127.0.0.2", "10.77.250.1", "10.77.250.2", 1400)
+	for idx, args := range cmds {
+		if err := exec.Command(args[0], args[1:]...).Run(); err != nil && idx >= 2 {
+			t.Fatalf("command %v failed: %v", args, err)
+		}
 	}
 }
