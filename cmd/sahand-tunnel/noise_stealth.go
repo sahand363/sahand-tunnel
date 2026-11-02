@@ -586,6 +586,54 @@ func loadLocalNoiseKeyMaterial(cfg Config, peer ServerPeer) (localStatic noiseDH
 	return localStatic, ed25519.PrivateKey(edPriv), strings.ToLower(strings.TrimSpace(signPubHex)), psk, nil
 }
 
+// Loads the Responder's static keypair and expected remote Initiator static public key.
+// - On an Agent node (or a local 127.0.0.1 listener in single-process Master->Agent tests),
+//   the responder uses AgentNoiseStaticPrivateKey and expects MasterNoiseStaticPublicKey.
+// - On a Master node receiving an inbound reverse connection from a remote Agent IP,
+//   the responder uses MasterNoiseStaticPrivateKey and expects peer.AgentNoiseStaticPublicKey.
+func loadResponderNoiseKeyMaterial(cfg Config, peer ServerPeer) (localStatic noiseDHKey, expectedRemoteStatic []byte, psk [32]byte, err error) {
+	pskSlice, err := derivePeerSubKey(cfg, peer, "noise-ikpsk2-key-v2")
+	if err != nil {
+		return localStatic, nil, psk, err
+	}
+	copy(psk[:], pskSlice)
+
+	useAgentResponder := cfg.Role == "agent" ||
+		(strings.TrimSpace(peer.IP) == "127.0.0.1" && cfg.AgentNoiseStaticPrivateKey != "" && cfg.AgentNoiseStaticPublicKey != "")
+
+	if useAgentResponder {
+		sPriv, err1 := decodeHexExact(cfg.AgentNoiseStaticPrivateKey, 32)
+		sPub, err2 := decodeHexExact(cfg.AgentNoiseStaticPublicKey, 32)
+		if err1 != nil || err2 != nil {
+			return localStatic, nil, psk, errors.New("agent X25519 static keypair is not initialized")
+		}
+		localStatic = noiseDHKey{Private: sPriv, Public: sPub}
+
+		mPubHex := strings.TrimSpace(peer.MasterNoiseStaticPublicKey)
+		if mPubHex == "" {
+			mPubHex = strings.TrimSpace(cfg.MasterNoiseStaticPublicKey)
+		}
+		if mPubHex == "" {
+			if tp, tErr := parseAndValidateToken(peer.Token); tErr == nil {
+				mPubHex = tp.MasterNoiseStaticPublicKey
+			}
+		}
+		if mPubHex != "" {
+			expectedRemoteStatic, _ = decodeHexExact(mPubHex, 32)
+		}
+		return localStatic, expectedRemoteStatic, psk, nil
+	}
+
+	sPriv, err1 := decodeHexExact(cfg.MasterNoiseStaticPrivateKey, 32)
+	sPub, err2 := decodeHexExact(cfg.MasterNoiseStaticPublicKey, 32)
+	if err1 != nil || err2 != nil {
+		return localStatic, nil, psk, errors.New("master X25519 static keypair is not initialized")
+	}
+	localStatic = noiseDHKey{Private: sPriv, Public: sPub}
+	expectedRemoteStatic, _ = resolveExpectedRemoteStaticPublicKey(cfg, peer)
+	return localStatic, expectedRemoteStatic, psk, nil
+}
+
 func resolveExpectedRemoteStaticPublicKey(cfg Config, peer ServerPeer) ([]byte, error) {
 	if cfg.Role == "agent" {
 		pubHex := strings.TrimSpace(peer.MasterNoiseStaticPublicKey)
@@ -1428,7 +1476,7 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 	}
 	stateMu.RUnlock()
 
-	localStatic, _, _, psk, err := loadLocalNoiseKeyMaterial(cfgSnapshot, peer)
+	localStatic, expectedRemoteStatic, psk, err := loadResponderNoiseKeyMaterial(cfgSnapshot, peer)
 	if err != nil {
 		return
 	}
@@ -1472,7 +1520,6 @@ func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfi
 		return
 	}
 
-	expectedRemoteStatic, _ := resolveExpectedRemoteStaticPublicKey(cfgSnapshot, peer)
 	if len(expectedRemoteStatic) == 32 {
 		if subtle.ConstantTimeCompare(peerStaticBytes, expectedRemoteStatic) != 1 {
 			return
