@@ -284,21 +284,23 @@ func (ntc *noiseTransportConn) Rekey(timeout time.Duration) error {
 		return err
 	}
 
-	deadline := time.Now().Add(timeout)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	go func() {
-		for time.Now().Before(deadline) {
+	// If no other goroutine is currently holding readMu, drive readFrameLocked directly
+	// until REKEY_ACK is processed or the timeout expires.
+	if ntc.readMu.TryLock() {
+		_ = ntc.raw.SetReadDeadline(time.Now().Add(timeout))
+		for {
 			ntc.rekeyMu.Lock()
 			inProg := ntc.rekeyInProgress
 			ntc.rekeyMu.Unlock()
 			if !inProg {
-				return
+				break
 			}
-			fType, plain, rErr := ntc.ReadFrame()
+			fType, plain, rErr := ntc.readFrameLocked()
 			if rErr != nil {
-				return
+				_ = ntc.raw.SetReadDeadline(time.Time{})
+				ntc.readMu.Unlock()
+				_ = ntc.Close()
+				return rErr
 			}
 			if fType == noiseFrameTypeData && len(plain) > 0 {
 				ntc.bufMu.Lock()
@@ -306,7 +308,12 @@ func (ntc *noiseTransportConn) Rekey(timeout time.Duration) error {
 				ntc.bufMu.Unlock()
 			}
 		}
-	}()
+		_ = ntc.raw.SetReadDeadline(time.Time{})
+		ntc.readMu.Unlock()
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	select {
 	case rErr := <-doneCh:
@@ -413,8 +420,7 @@ func (ntc *noiseTransportConn) handleIncomingRekeyInitLocked(plain []byte) error
 		ntc.rekeyMu.Unlock()
 		return wErr
 	}
-	oldTx := ntc.csTx
-	ntc.csTx = newTx
+	oldTx := ntc.csTx.Swap(newTx)
 	ntc.txFramesInEpoch = 0
 	ntc.writeMu.Unlock()
 	if oldTx != nil {
@@ -485,8 +491,7 @@ func (ntc *noiseTransportConn) handleIncomingRekeyAckLocked(plain []byte) error 
 		newRx = csI2R
 	}
 
-	oldRx := ntc.csRx
-	ntc.csRx = newRx
+	oldRx := ntc.csRx.Swap(newRx)
 	if oldRx != nil {
 		oldRx.Zeroize()
 	}
@@ -497,8 +502,7 @@ func (ntc *noiseTransportConn) handleIncomingRekeyAckLocked(plain []byte) error 
 	ntc.writeMu.Lock()
 	wErr := ntc.writeFrameLocked(noiseFrameTypeRekeyCommit, commitPayload)
 	if wErr == nil {
-		oldTx := ntc.csTx
-		ntc.csTx = newTx
+		oldTx := ntc.csTx.Swap(newTx)
 		ntc.txFramesInEpoch = 0
 		if oldTx != nil {
 			oldTx.Zeroize()
@@ -534,8 +538,7 @@ func (ntc *noiseTransportConn) handleIncomingRekeyCommitLocked(plain []byte) err
 		return fmt.Errorf("unexpected REKEY_COMMIT for epoch %d", nextEpoch)
 	}
 
-	oldRx := ntc.csRx
-	ntc.csRx = ntc.rekeyNextRx
+	oldRx := ntc.csRx.Swap(ntc.rekeyNextRx)
 	ntc.rekeyNextRx = nil
 	ntc.rekeyWaitCommit = false
 	ntc.epoch = nextEpoch
