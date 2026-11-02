@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/tar"
-	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
@@ -34,23 +33,23 @@ import (
 )
 
 const (
-	greFRPEngineID        = "gre-frp"
-	officialFRPVersion    = "0.61.1"
-	greFRPDefaultMTU      = 1400
-	greFRPProtocolMagic   = "GFRP1"
-	greFRPPathGRE         = "GRE"
-	greFRPPathPublic      = "PUBLIC_FALLBACK"
+	greFRPEngineID      = "gre-frp"
+	officialFRPVersion  = "0.61.1"
+	greFRPDefaultMTU    = 1400
+	greFRPProtocolMagic = "GFRP1"
+	greFRPPathGRE       = "GRE"
+	greFRPPathPublic    = "PUBLIC_FALLBACK"
 
 	// Wire commands for the built-in FRP-compatible carrier & reverse-tunnel multiplexer
-	greFRPCmdProbe       byte = 0x01
-	greFRPCmdProbeAck    byte = 0x02
-	greFRPCmdParitySync  byte = 0x03
-	greFRPCmdParityAck   byte = 0x04
-	greFRPCmdTCPForward  byte = 0x05
-	greFRPCmdUDPForward  byte = 0x06
-	greFRPCmdWorkerReg   byte = 0x07
-	greFRPCmdWorkerPing  byte = 0x08
-	greFRPCmdWorkerPong  byte = 0x09
+	greFRPCmdProbe      byte = 0x01
+	greFRPCmdProbeAck   byte = 0x02
+	greFRPCmdParitySync byte = 0x03
+	greFRPCmdParityAck  byte = 0x04
+	greFRPCmdTCPForward byte = 0x05
+	greFRPCmdUDPForward byte = 0x06
+	greFRPCmdWorkerReg  byte = 0x07
+	greFRPCmdWorkerPing byte = 0x08
+	greFRPCmdWorkerPong byte = 0x09
 )
 
 var validGREIfaceRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]{2,15}$`)
@@ -763,33 +762,34 @@ func installOfficialFRPBinaries() (string, string, error) {
 // ============================================================================
 
 type greFRPRuntime struct {
-	peerID             string
-	peer               ServerPeer
-	tunnel             TunnelConfig
-	role               string
-	localPrivIP        string
-	remotePrivIP       string
-	remotePubIP        string
-	activePath         atomic.Value // "GRE" or "PUBLIC_FALLBACK"
-	greStatus          atomic.Value // string
-	grePingOK          atomic.Bool
-	greLossPct         atomic.Int32
-	greRTTMS           atomic.Int64
-	reconnectCount     atomic.Int32
-	consecFail         atomic.Int32
-	consecSuccess      atomic.Int32
-	lastFailureReason  atomic.Value
-	lastRecoveryAt     atomic.Value
-	startedAt          time.Time
+	cfgMu             sync.RWMutex
+	peerID            string
+	peer              ServerPeer
+	tunnel            TunnelConfig
+	role              string
+	localPrivIP       string
+	remotePrivIP      string
+	remotePubIP       string
+	activePath        atomic.Value // "GRE" or "PUBLIC_FALLBACK"
+	greStatus         atomic.Value // string
+	grePingOK         atomic.Bool
+	greLossPct        atomic.Int32
+	greRTTMS          atomic.Int64
+	reconnectCount    atomic.Int32
+	consecFail        atomic.Int32
+	consecSuccess     atomic.Int32
+	lastFailureReason atomic.Value
+	lastRecoveryAt    atomic.Value
+	startedAt         time.Time
 
-	logsMu             sync.Mutex
-	recentLogs         []string
+	logsMu     sync.Mutex
+	recentLogs []string
 
-	carrierLn          net.Listener
-	entryListeners     []net.Listener
-	entryUDPConns      []net.PacketConn
-	stopCh             chan struct{}
-	closed             atomic.Bool
+	carrierLn      net.Listener
+	entryListeners []net.Listener
+	entryUDPConns  []net.PacketConn
+	stopCh         chan struct{}
+	closed         atomic.Bool
 }
 
 var (
@@ -809,6 +809,12 @@ func (rt *greFRPRuntime) appendLog(msg string) {
 }
 
 func (rt *greFRPRuntime) snapshotDiagnostics() GREFRPDiagnostics {
+	rt.cfgMu.RLock()
+	role := rt.role
+	listenPort := rt.tunnel.ListenPort
+	enabled := rt.tunnel.Enabled
+	rt.cfgMu.RUnlock()
+
 	actPath, _ := rt.activePath.Load().(string)
 	if actPath == "" {
 		actPath = greFRPPathGRE
@@ -828,13 +834,13 @@ func (rt *greFRPRuntime) snapshotDiagnostics() GREFRPDiagnostics {
 	uptime := time.Since(rt.startedAt).Round(time.Second).String()
 	frpsStat := "STANDBY (AGENT ROLE)"
 	frpcStat := "ACTIVE (" + actPath + ")"
-	if rt.role == "master" {
-		frpsStat = "ACTIVE (LISTENING :" + strconv.Itoa(rt.tunnel.ListenPort) + ")"
+	if role == "master" {
+		frpsStat = "ACTIVE (LISTENING :" + strconv.Itoa(listenPort) + ")"
 		frpcStat = "CONNECTED PEER"
 	}
 
 	pfStatus := "DISABLED (CARRIER ONLY)"
-	if rt.tunnel.Enabled {
+	if enabled {
 		pfStatus = "FORWARDING ACTIVE (" + actPath + ")"
 	}
 
@@ -895,19 +901,41 @@ func (rt *greFRPRuntime) closeAll() {
 	}
 }
 
+func (rt *greFRPRuntime) setTestEndpoints(remotePrivIP, remotePubIP string, listenPort int) {
+	rt.cfgMu.Lock()
+	if remotePrivIP != "" {
+		rt.remotePrivIP = remotePrivIP
+	}
+	if remotePubIP != "" {
+		rt.remotePubIP = remotePubIP
+	}
+	if listenPort > 0 {
+		rt.tunnel.ListenPort = listenPort
+		if rt.tunnel.GREFRP != nil {
+			rt.tunnel.GREFRP.FRPServerPort = listenPort
+		}
+	}
+	rt.cfgMu.Unlock()
+}
+
 // Target endpoint selector: returns the remote GRE private IP when ActivePath == "GRE",
 // or the remote Public IP when ActivePath == "PUBLIC_FALLBACK".
 func (rt *greFRPRuntime) currentTargetHost() string {
+	rt.cfgMu.RLock()
+	remPriv := rt.remotePrivIP
+	remPub := rt.remotePubIP
+	rt.cfgMu.RUnlock()
+
 	act, _ := rt.activePath.Load().(string)
-	if act == greFRPPathGRE && rt.remotePrivIP != "" {
+	if act == greFRPPathGRE && remPriv != "" {
 		// In local single-host loopback tests where remotePubIP is 127.0.0.1 and no kernel GRE interface exists,
 		// route loopback probes to 127.0.0.1 unless the private IP is locally bound.
-		if rt.remotePubIP == "127.0.0.1" && !isLocalIPAddressBound(rt.remotePrivIP) {
+		if remPub == "127.0.0.1" && !isLocalIPAddressBound(remPriv) {
 			return "127.0.0.1"
 		}
-		return rt.remotePrivIP
+		return remPriv
 	}
-	return rt.remotePubIP
+	return remPub
 }
 
 func isLocalIPAddressBound(ipStr string) bool {
@@ -990,7 +1018,6 @@ func startGREFRPServer(peer ServerPeer, tc TunnelConfig) (net.Listener, []net.Li
 	if tc.Enabled && peer.IP != "" && shouldBindEntryPorts() {
 		expanded, err := validateAndExpandGREFRPRules(gf, tc.ListenPort)
 		if err != nil {
-			// Fall back to ForwardPorts CSV if custom rules were not yet populated
 			gf.ForwardingRules = buildGREFRPRulesFromCSV(tc.ForwardPorts, gf.FRPEncryption, gf.FRPCompression, gf.FRPProxyProtoV2)
 			expanded, _ = validateAndExpandGREFRPRules(gf, tc.ListenPort)
 		}
@@ -1032,7 +1059,10 @@ func startGREFRPServer(peer ServerPeer, tc TunnelConfig) (net.Listener, []net.Li
 // ============================================================================
 
 func (rt *greFRPRuntime) healthAndFailoverMonitorLoop() {
+	rt.cfgMu.RLock()
 	gf := normalizeGREFRPConfig(rt.tunnel.GREFRP, rt.tunnel.ListenPort, rt.tunnel.ForwardPorts)
+	rt.cfgMu.RUnlock()
+
 	interval := time.Duration(gf.HealthCheckSec) * time.Second
 	if interval < time.Second {
 		interval = 5 * time.Second
@@ -1052,16 +1082,26 @@ func (rt *greFRPRuntime) healthAndFailoverMonitorLoop() {
 }
 
 func (rt *greFRPRuntime) evaluateGREHealthStep(gf *GREFRPConfig) {
-	if rt.closed.Load() || rt.remotePubIP == "" {
+	if rt.closed.Load() {
+		return
+	}
+	rt.cfgMu.RLock()
+	remPriv := rt.remotePrivIP
+	remPub := rt.remotePubIP
+	peerSnap := rt.peer
+	tunSnap := rt.tunnel
+	rt.cfgMu.RUnlock()
+
+	if remPub == "" {
 		return
 	}
 
-	greTarget := rt.remotePrivIP
-	if rt.remotePubIP == "127.0.0.1" && !isLocalIPAddressBound(rt.remotePrivIP) {
+	greTarget := remPriv
+	if remPub == "127.0.0.1" && !isLocalIPAddressBound(remPriv) {
 		greTarget = "127.0.0.1"
 	}
 
-	rtt, err := probeGREFRPTargetHost(rt.peer, rt.tunnel, greTarget, 2*time.Second)
+	rtt, err := probeGREFRPTargetHost(peerSnap, tunSnap, greTarget, 2*time.Second)
 	curPath, _ := rt.activePath.Load().(string)
 
 	if err == nil {
@@ -1076,8 +1116,8 @@ func (rt *greFRPRuntime) evaluateGREHealthStep(gf *GREFRPConfig) {
 			nowStr := formatMasterTimestamp(masterNow())
 			rt.lastRecoveryAt.Store(nowStr)
 			rt.reconnectCount.Add(1)
-			_, _, _ = writeFRPConfigFiles(rt.peer, rt.tunnel, rt.remotePrivIP)
-			rt.appendLog(fmt.Sprintf("GRE path recovered (%dms RTT); restored preferred GRE path (%s)", rtt, rt.remotePrivIP))
+			_, _, _ = writeFRPConfigFiles(peerSnap, tunSnap, remPriv)
+			rt.appendLog(fmt.Sprintf("GRE path recovered (%dms RTT); restored preferred GRE path (%s)", rtt, remPriv))
 		}
 		return
 	}
@@ -1091,15 +1131,15 @@ func (rt *greFRPRuntime) evaluateGREHealthStep(gf *GREFRPConfig) {
 
 	if curPath == greFRPPathGRE && gf.AutoPublicFallback && int(fails) >= gf.FailureThreshold {
 		// Verify Public IP fallback path is reachable before switching
-		if pubRTT, pubErr := probeGREFRPTargetHost(rt.peer, rt.tunnel, rt.remotePubIP, 2500*time.Millisecond); pubErr == nil {
+		if pubRTT, pubErr := probeGREFRPTargetHost(peerSnap, tunSnap, remPub, 2500*time.Millisecond); pubErr == nil {
 			rt.activePath.Store(greFRPPathPublic)
 			rt.greRTTMS.Store(pubRTT)
 			rt.reconnectCount.Add(1)
-			_, _, _ = writeFRPConfigFiles(rt.peer, rt.tunnel, rt.remotePubIP)
+			_, _, _ = writeFRPConfigFiles(peerSnap, tunSnap, remPub)
 			rt.appendLog(fmt.Sprintf("GRE path unreachable (%d consecutive failures); switched FRP to Public IP fallback (%s, %dms)",
-				fails, rt.remotePubIP, pubRTT))
+				fails, remPub, pubRTT))
 		} else {
-			rt.appendLog(fmt.Sprintf("GRE path failed and Public IP fallback (%s) is also unreachable: %v", rt.remotePubIP, pubErr))
+			rt.appendLog(fmt.Sprintf("GRE path failed and Public IP fallback (%s) is also unreachable: %v", remPub, pubErr))
 		}
 	}
 }
@@ -1410,7 +1450,12 @@ func (rt *greFRPRuntime) handleIncomingCarrierConn(conn net.Conn) {
 	cfgSnapshot := appCfg
 	stateMu.RUnlock()
 
-	authKey, err := derivePeerAuthKey(cfgSnapshot, rt.peer)
+	rt.cfgMu.RLock()
+	peerSnap := rt.peer
+	tunSnap := rt.tunnel
+	rt.cfgMu.RUnlock()
+
+	authKey, err := derivePeerAuthKey(cfgSnapshot, peerSnap)
 	if err != nil {
 		return
 	}
@@ -1455,16 +1500,16 @@ func (rt *greFRPRuntime) handleIncomingCarrierConn(conn net.Conn) {
 			return
 		}
 		_, _ = prot.Write(ping[:])
-		markPeerConnectedInbound(rt.peer.ID, remoteHost, rt.tunnel.ID, rt.tunnel.ListenPort, 1)
+		markPeerConnectedInbound(peerSnap.ID, remoteHost, tunSnap.ID, tunSnap.ListenPort, 1)
 
 	case greFRPCmdParitySync:
 		if _, err := conn.Write([]byte{0x00}); err != nil {
 			return
 		}
-		handleWebTransportParitySyncStream(prot, rt.peer.ID, remoteHost)
+		handleWebTransportParitySyncStream(prot, peerSnap.ID, remoteHost)
 
 	case greFRPCmdTCPForward:
-		if !rt.tunnel.Enabled {
+		if !tunSnap.Enabled {
 			_, _ = conn.Write([]byte{0x02})
 			return
 		}
@@ -1502,7 +1547,7 @@ func (rt *greFRPRuntime) handleIncomingCarrierConn(conn net.Conn) {
 		rt.pipeProtectedStreamAndTCP(prot, target)
 
 	case greFRPCmdUDPForward:
-		if !rt.tunnel.Enabled || !rt.isTargetPortAllowed(hs.TargetPort) {
+		if !tunSnap.Enabled || !rt.isTargetPortAllowed(hs.TargetPort) {
 			_, _ = conn.Write([]byte{0x03})
 			return
 		}
@@ -1551,8 +1596,12 @@ func (rt *greFRPRuntime) isTargetPortAllowed(port int) bool {
 	if port < 1 || port > 65535 {
 		return false
 	}
-	gf := normalizeGREFRPConfig(rt.tunnel.GREFRP, rt.tunnel.ListenPort, rt.tunnel.ForwardPorts)
-	expanded, err := validateAndExpandGREFRPRules(gf, rt.tunnel.ListenPort)
+	rt.cfgMu.RLock()
+	tunSnap := rt.tunnel
+	rt.cfgMu.RUnlock()
+
+	gf := normalizeGREFRPConfig(tunSnap.GREFRP, tunSnap.ListenPort, tunSnap.ForwardPorts)
+	expanded, err := validateAndExpandGREFRPRules(gf, tunSnap.ListenPort)
 	if err == nil {
 		for _, r := range expanded {
 			if r.LocalPort == port || r.RemotePort == port {
@@ -1560,12 +1609,16 @@ func (rt *greFRPRuntime) isTargetPortAllowed(port int) bool {
 			}
 		}
 	}
-	_, aErr := authorizeWSSTargetPort(rt.tunnel, strconv.Itoa(port))
+	_, aErr := authorizeWSSTargetPort(tunSnap, strconv.Itoa(port))
 	return aErr == nil
 }
 
 func (rt *greFRPRuntime) pipeProtectedStreamAndTCP(prot *greFRPProtectedStream, tcpConn net.Conn) {
-	mbLimit := parseSpeedLimit(rt.tunnel.SpeedLimitMBps)
+	rt.cfgMu.RLock()
+	speedLimit := rt.tunnel.SpeedLimitMBps
+	rt.cfgMu.RUnlock()
+
+	mbLimit := parseSpeedLimit(speedLimit)
 	toProt := newThrottledWriter(prot, &appTxBytes, mbLimit)
 	toTCP := newThrottledWriter(tcpConn, &appRxBytes, mbLimit)
 
@@ -1603,10 +1656,16 @@ func (rt *greFRPRuntime) acceptRuleTCPLoop(ln net.Listener, rule ExpandedPortMap
 func (rt *greFRPRuntime) forwardRuleTCPClient(client net.Conn, rule ExpandedPortMapping) {
 	defer client.Close()
 
+	rt.cfgMu.RLock()
+	peerSnap := rt.peer
+	tunSnap := rt.tunnel
+	remPub := rt.remotePubIP
+	rt.cfgMu.RUnlock()
+
 	targetHost := rt.currentTargetHost()
 	rawConn, prot, err := dialGREFRPCarrier(
-		rt.peer,
-		rt.tunnel,
+		peerSnap,
+		tunSnap,
 		targetHost,
 		greFRPCmdTCPForward,
 		rule.LocalAddr,
@@ -1616,12 +1675,12 @@ func (rt *greFRPRuntime) forwardRuleTCPClient(client net.Conn, rule ExpandedPort
 		rule.ProxyProtoV2,
 		4*time.Second,
 	)
-	if err != nil && targetHost != rt.remotePubIP && rt.remotePubIP != "" {
+	if err != nil && targetHost != remPub && remPub != "" {
 		// Immediate failover to Public IP if the GRE private IP failed mid-connection
 		rawConn, prot, err = dialGREFRPCarrier(
-			rt.peer,
-			rt.tunnel,
-			rt.remotePubIP,
+			peerSnap,
+			tunSnap,
+			remPub,
 			greFRPCmdTCPForward,
 			rule.LocalAddr,
 			rule.LocalPort,
@@ -1666,10 +1725,16 @@ func (rt *greFRPRuntime) acceptRuleUDPLoop(uConn *net.UDPConn, rule ExpandedPort
 		cliCopy := cloneUDPAddr(cliAddr)
 
 		go func(dgram []byte, cAddr *net.UDPAddr) {
+			rt.cfgMu.RLock()
+			peerSnap := rt.peer
+			tunSnap := rt.tunnel
+			remPub := rt.remotePubIP
+			rt.cfgMu.RUnlock()
+
 			targetHost := rt.currentTargetHost()
 			rawConn, prot, err := dialGREFRPCarrier(
-				rt.peer,
-				rt.tunnel,
+				peerSnap,
+				tunSnap,
 				targetHost,
 				greFRPCmdUDPForward,
 				rule.LocalAddr,
@@ -1679,11 +1744,11 @@ func (rt *greFRPRuntime) acceptRuleUDPLoop(uConn *net.UDPConn, rule ExpandedPort
 				false,
 				3*time.Second,
 			)
-			if err != nil && targetHost != rt.remotePubIP && rt.remotePubIP != "" {
+			if err != nil && targetHost != remPub && remPub != "" {
 				rawConn, prot, err = dialGREFRPCarrier(
-					rt.peer,
-					rt.tunnel,
-					rt.remotePubIP,
+					peerSnap,
+					tunSnap,
+					remPub,
 					greFRPCmdUDPForward,
 					rule.LocalAddr,
 					rule.LocalPort,
@@ -1809,8 +1874,13 @@ func probeGREFRP(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	}
 
 	if rt != nil {
+		rt.cfgMu.RLock()
+		remPriv := rt.remotePrivIP
+		remPub := rt.remotePubIP
+		rt.cfgMu.RUnlock()
+
 		rt.greRTTMS.Store(rtt)
-		if targetHost == rt.remotePrivIP || rt.remotePubIP == "127.0.0.1" {
+		if targetHost == remPriv || remPub == "127.0.0.1" {
 			rt.grePingOK.Store(true)
 			rt.greLossPct.Store(0)
 		}
