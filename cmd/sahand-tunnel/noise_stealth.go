@@ -2,16 +2,20 @@ package main
 
 import (
 	"bytes"
-	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -21,262 +25,1028 @@ import (
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
-	noiseStealthProtocolName = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
-	noiseStealthProtoVersion = 0x01
+	// Official Noise Protocol Framework (Revision 34) pattern name
+	noiseIKpsk2ProtocolName = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s"
 
-	noiseStealthModeProbe      byte = 0x01
-	noiseStealthModeParitySync byte = 0x02
-	noiseStealthModeTCPForward byte = 0x03
-	noiseStealthModeUDPForward byte = 0x04
+	// Wire packet types prior to transport split
+	noiseWireTypeBootstrapReq  byte = 0xB1
+	noiseWireTypeBootstrapResp byte = 0xB2
+	noiseWireTypeHandshakeMsg1 byte = 0x10
+	noiseWireTypeHandshakeMsg2 byte = 0x20
 
-	noiseStealthStatusOK          byte = 0x00
-	noiseStealthStatusForbidden   byte = 0x01
-	noiseStealthStatusUnreachable byte = 0x02
+	// Post-handshake transport frame types (authenticated inside 3-byte AAD header)
+	noiseFrameTypeData        byte = 0x01
+	noiseFrameTypeRekeyInit   byte = 0x02
+	noiseFrameTypeRekeyAck    byte = 0x03
+	noiseFrameTypeRekeyCommit byte = 0x04
+	noiseFrameTypeClose       byte = 0x05
 
-	noiseStealthMaxPayload = 32 * 1024
-	noiseStealthUDPIdleTTL = 60 * time.Second
+	// Application commands carried inside Message 3 (first post-split transport frame)
+	noiseAppCmdProbe      byte = 0x01
+	noiseAppCmdParitySync byte = 0x02
+	noiseAppCmdTCPForward byte = 0x03
+	noiseAppCmdUDPForward byte = 0x04
+
+	// Frame sizing constants (Plaintext, AEAD Tag, Ciphertext, and Header)
+	noiseFrameHeaderLen   = 3
+	noiseMaxPlaintextLen  = 32 * 1024
+	noiseAEADTagLen       = chacha20poly1305.Overhead // 16 bytes
+	noiseMaxCiphertextLen = noiseMaxPlaintextLen + noiseAEADTagLen
+	noiseMaxHandshakeLen  = 2048
+
+	noiseHandshakeTimeout = 6 * time.Second
 )
 
 // ============================================================================
-// 1. NOISE_IK_25519_CHACHAPOLY_BLAKE2S WITH OBFUSCATED LENGTH HEADERS
+// 1. NOISE REVISION 34 STATE MACHINE (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s)
 // ============================================================================
 
-type noiseStealthCipher struct {
-	mu      sync.Mutex
-	aead    cipher.AEAD
-	n       uint64
-	lenSalt [32]byte
+type noiseDHKey struct {
+	Private []byte
+	Public  []byte
 }
 
-func newNoiseStealthCipher(key [32]byte) (*noiseStealthCipher, error) {
-	aead, err := chacha20poly1305.New(key[:])
+// Implements Noise Specification Section 5.1 CipherState for ChaChaPoly.
+type noiseCipherState struct {
+	mu      sync.Mutex
+	key     [32]byte
+	maskKey [32]byte
+	hasKey  bool
+	n       uint64
+}
+
+func newNoiseCipherState(key [32]byte, maskKey [32]byte) *noiseCipherState {
+	return &noiseCipherState{
+		key:     key,
+		maskKey: maskKey,
+		hasKey:  true,
+		n:       0,
+	}
+}
+
+// Encodes the 64-bit sequence number `n` into the 96-bit ChaChaPoly nonce per
+// Noise Specification Revision 34 Section 7.3: 32 bits of zeros followed by
+// little-endian encoding of `n`.
+func encodeNoiseChaChaPolyNonce(n uint64) [12]byte {
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:12], n)
+	return nonce
+}
+
+func (cs *noiseCipherState) nextFrameMaskLocked() uint16 {
+	var seqBuf [8]byte
+	binary.BigEndian.PutUint64(seqBuf[:], cs.n)
+	mac := hmac.New(newUnkeyedBLAKE2s, cs.maskKey[:])
+	_, _ = mac.Write([]byte("sahand-noise-len-mask-v2:"))
+	_, _ = mac.Write(seqBuf[:])
+	sum := mac.Sum(nil)
+	return binary.BigEndian.Uint16(sum[0:2])
+}
+
+func (cs *noiseCipherState) EncryptWithAd(ad, plaintext []byte) ([]byte, error) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if !cs.hasKey {
+		out := make([]byte, len(plaintext))
+		copy(out, plaintext)
+		return out, nil
+	}
+	if cs.n == math.MaxUint64 {
+		return nil, errors.New("noise cipherstate nonce exhausted")
+	}
+	aead, err := chacha20poly1305.New(cs.key[:])
 	if err != nil {
 		return nil, err
 	}
-	salt := blake2s.Sum256(append([]byte("sahand-stealth-len-mask:"), key[:]...))
-	return &noiseStealthCipher{
-		aead:    aead,
-		n:       0,
-		lenSalt: salt,
-	}, nil
+	nonce := encodeNoiseChaChaPolyNonce(cs.n)
+	cs.n++
+	return aead.Seal(nil, nonce[:], plaintext, ad), nil
 }
 
-func (sc *noiseStealthCipher) nextLenMask(seq uint64) [2]byte {
-	var buf [40]byte
-	copy(buf[0:32], sc.lenSalt[:])
-	binary.LittleEndian.PutUint64(buf[32:40], seq)
-	sum := blake2s.Sum256(buf[:])
-	return [2]byte{sum[0], sum[1]}
-}
+func (cs *noiseCipherState) DecryptWithAd(ad, ciphertext []byte) ([]byte, error) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 
-func (sc *noiseStealthCipher) encrypt(ad, plaintext []byte) ([]byte, [2]byte, error) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	if sc.n == ^uint64(0) {
-		return nil, [2]byte{}, errors.New("noise stealth nonce exhausted")
+	if !cs.hasKey {
+		out := make([]byte, len(ciphertext))
+		copy(out, ciphertext)
+		return out, nil
 	}
-	seq := sc.n
-	var nonce [12]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], seq)
-	sc.n++
-
-	mask := sc.nextLenMask(seq)
-	ct := sc.aead.Seal(nil, nonce[:], plaintext, ad)
-	return ct, mask, nil
-}
-
-func (sc *noiseStealthCipher) decrypt(ad, ciphertext []byte) ([]byte, error) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	if sc.n == ^uint64(0) {
-		return nil, errors.New("noise stealth nonce exhausted")
+	if cs.n == math.MaxUint64 {
+		return nil, errors.New("noise cipherstate nonce exhausted")
 	}
-	var nonce [12]byte
-	binary.LittleEndian.PutUint64(nonce[4:12], sc.n)
-	sc.n++
-
-	return sc.aead.Open(nil, nonce[:], ciphertext, ad)
-}
-
-func (sc *noiseStealthCipher) peekNextLenMask() [2]byte {
-	sc.mu.Lock()
-	seq := sc.n
-	sc.mu.Unlock()
-	return sc.nextLenMask(seq)
-}
-
-type noiseStealthSymmetricState struct {
-	ck [32]byte
-	h  [32]byte
-	cs *noiseStealthCipher
-}
-
-func newNoiseStealthSymmetricState() *noiseStealthSymmetricState {
-	ss := &noiseStealthSymmetricState{}
-	nameBytes := []byte(noiseStealthProtocolName)
-	if len(nameBytes) <= 32 {
-		copy(ss.h[:], nameBytes)
-	} else {
-		ss.h = blake2s.Sum256(nameBytes)
+	if len(ciphertext) < noiseAEADTagLen {
+		return nil, errors.New("noise ciphertext shorter than 16-byte Poly1305 tag")
 	}
-	ss.ck = ss.h
-	ss.mixHash([]byte("sahand-noise-ik-stealth-v1"))
-	return ss
+	aead, err := chacha20poly1305.New(cs.key[:])
+	if err != nil {
+		return nil, err
+	}
+	nonce := encodeNoiseChaChaPolyNonce(cs.n)
+	plain, err := aead.Open(nil, nonce[:], ciphertext, ad)
+	if err != nil {
+		return nil, errors.New("noise AEAD authentication failed")
+	}
+	cs.n++
+	return plain, nil
 }
 
-func (ss *noiseStealthSymmetricState) mixHash(data []byte) {
-	h, _ := blake2s.New256(nil)
-	_, _ = h.Write(ss.h[:])
-	_, _ = h.Write(data)
-	copy(ss.h[:], h.Sum(nil))
+func (cs *noiseCipherState) Zeroize() {
+	cs.mu.Lock()
+	clear(cs.key[:])
+	clear(cs.maskKey[:])
+	cs.hasKey = false
+	cs.n = math.MaxUint64
+	cs.mu.Unlock()
 }
 
-func noiseStealthHMAC(key, data []byte) [32]byte {
-	mac := hmac.New(func() hash.Hash {
-		h, _ := blake2s.New256(nil)
-		return h
-	}, key)
+func newUnkeyedBLAKE2s() hash.Hash {
+	h, err := blake2s.New256(nil)
+	if err != nil {
+		panic(err)
+	}
+	return h
+}
+
+func noiseHMACBLAKE2s(key, data []byte) [32]byte {
+	mac := hmac.New(newUnkeyedBLAKE2s, key)
 	_, _ = mac.Write(data)
 	var out [32]byte
 	copy(out[:], mac.Sum(nil))
 	return out
 }
 
-func noiseStealthHKDF2(ck [32]byte, ikm []byte) ([32]byte, [32]byte) {
-	tempKey := noiseStealthHMAC(ck[:], ikm)
-	out1 := noiseStealthHMAC(tempKey[:], []byte{0x01})
-	in2 := append(out1[:], 0x02)
-	out2 := noiseStealthHMAC(tempKey[:], in2)
+func noiseHKDF2(chainingKey, ikm []byte) ([32]byte, [32]byte) {
+	tempKey := noiseHMACBLAKE2s(chainingKey, ikm)
+	out1 := noiseHMACBLAKE2s(tempKey[:], []byte{0x01})
+	buf2 := make([]byte, 33)
+	copy(buf2[0:32], out1[:])
+	buf2[32] = 0x02
+	out2 := noiseHMACBLAKE2s(tempKey[:], buf2)
+	clear(tempKey[:])
 	return out1, out2
 }
 
-func (ss *noiseStealthSymmetricState) mixKey(ikm []byte) error {
-	var k [32]byte
-	ss.ck, k = noiseStealthHKDF2(ss.ck, ikm)
-	cs, err := newNoiseStealthCipher(k)
+func noiseHKDF3(chainingKey, ikm []byte) ([32]byte, [32]byte, [32]byte) {
+	tempKey := noiseHMACBLAKE2s(chainingKey, ikm)
+	out1 := noiseHMACBLAKE2s(tempKey[:], []byte{0x01})
+	buf2 := make([]byte, 33)
+	copy(buf2[0:32], out1[:])
+	buf2[32] = 0x02
+	out2 := noiseHMACBLAKE2s(tempKey[:], buf2)
+	buf3 := make([]byte, 33)
+	copy(buf3[0:32], out2[:])
+	buf3[32] = 0x03
+	out3 := noiseHMACBLAKE2s(tempKey[:], buf3)
+	clear(tempKey[:])
+	return out1, out2, out3
+}
+
+// Implements Noise Specification Section 5.2 & 5.3 SymmetricState + HandshakeState
+// for `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`.
+type noiseIKpsk2HandshakeState struct {
+	initiator   bool
+	s           noiseDHKey
+	e           noiseDHKey
+	rs          []byte // 32-byte remote static public key
+	re          []byte // 32-byte remote ephemeral public key
+	psk         [32]byte
+	ck          [32]byte
+	h           [32]byte
+	cs          *noiseCipherState
+	msgIdx      int
+}
+
+type noiseIKpsk2Config struct {
+	Initiator     bool
+	Prologue      []byte
+	StaticKeypair noiseDHKey
+	PeerStatic    []byte
+	PresharedKey  []byte
+}
+
+func newNoiseIKpsk2HandshakeState(cfg noiseIKpsk2Config) (*noiseIKpsk2HandshakeState, error) {
+	if len(cfg.StaticKeypair.Private) != 32 || len(cfg.StaticKeypair.Public) != 32 {
+		return nil, errors.New("noise static keypair must be 32 bytes")
+	}
+	if len(cfg.PresharedKey) != 32 {
+		return nil, errors.New("noise PSK must be 32 bytes")
+	}
+	if cfg.Initiator && len(cfg.PeerStatic) != 32 {
+		return nil, errors.New("noise IK initiator requires 32-byte PeerStatic public key")
+	}
+
+	st := &noiseIKpsk2HandshakeState{
+		initiator: cfg.Initiator,
+		s: noiseDHKey{
+			Private: append([]byte(nil), cfg.StaticKeypair.Private...),
+			Public:  append([]byte(nil), cfg.StaticKeypair.Public...),
+		},
+		cs: &noiseCipherState{},
+	}
+	copy(st.psk[:], cfg.PresharedKey)
+
+	// InitializeSymmetric("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s")
+	if len(noiseIKpsk2ProtocolName) <= 32 {
+		copy(st.h[:], noiseIKpsk2ProtocolName)
+	} else {
+		st.h = blake2s.Sum256([]byte(noiseIKpsk2ProtocolName))
+	}
+	st.ck = st.h
+
+	// MixHash(Prologue)
+	st.mixHash(cfg.Prologue)
+
+	// Pre-message pattern `<- s`: MixHash(responder static public key)
+	if cfg.Initiator {
+		st.rs = append([]byte(nil), cfg.PeerStatic...)
+		st.mixHash(st.rs)
+	} else {
+		st.mixHash(st.s.Public)
+	}
+
+	return st, nil
+}
+
+func (st *noiseIKpsk2HandshakeState) mixHash(data []byte) {
+	h := newUnkeyedBLAKE2s()
+	_, _ = h.Write(st.h[:])
+	_, _ = h.Write(data)
+	copy(st.h[:], h.Sum(nil))
+}
+
+func (st *noiseIKpsk2HandshakeState) mixKey(ikm []byte) {
+	ck, k := noiseHKDF2(st.ck[:], ikm)
+	st.ck = ck
+	st.cs = newNoiseCipherState(k, [32]byte{})
+}
+
+func (st *noiseIKpsk2HandshakeState) mixKeyAndHash(ikm []byte) {
+	ck, tempH, k := noiseHKDF3(st.ck[:], ikm)
+	st.ck = ck
+	st.mixHash(tempH[:])
+	st.cs = newNoiseCipherState(k, [32]byte{})
+}
+
+func (st *noiseIKpsk2HandshakeState) encryptAndHash(plaintext []byte) ([]byte, error) {
+	ciphertext, err := st.cs.EncryptWithAd(st.h[:], plaintext)
+	if err != nil {
+		return nil, err
+	}
+	st.mixHash(ciphertext)
+	return ciphertext, nil
+}
+
+func (st *noiseIKpsk2HandshakeState) decryptAndHash(ciphertext []byte) ([]byte, error) {
+	plaintext, err := st.cs.DecryptWithAd(st.h[:], ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	st.mixHash(ciphertext)
+	return plaintext, nil
+}
+
+func performX25519DH(privBytes, pubBytes []byte) ([]byte, error) {
+	curve := ecdh.X25519()
+	priv, err := curve.NewPrivateKey(privBytes)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := curve.NewPublicKey(pubBytes)
+	if err != nil {
+		return nil, err
+	}
+	return priv.ECDH(pub)
+}
+
+// Returns the remote endpoint's 32-byte X25519 static public key.
+func (st *noiseIKpsk2HandshakeState) PeerStatic() []byte {
+	if len(st.rs) == 0 {
+		return nil
+	}
+	cp := make([]byte, len(st.rs))
+	copy(cp, st.rs)
+	return cp
+}
+
+// Returns the 32-byte handshake transcript hash `h` for channel binding and rekey salt.
+func (st *noiseIKpsk2HandshakeState) ChannelBinding() [32]byte {
+	return st.h
+}
+
+// Executes the next outbound handshake message in `Noise_IKpsk2`:
+// - Message 1 (Initiator): `-> e, es, s, ss` + encrypted payload
+// - Message 2 (Responder): `<- e, ee, se, psk` + encrypted payload, then calls `Split()`
+func (st *noiseIKpsk2HandshakeState) WriteMessage(payload []byte) ([]byte, *noiseCipherState, *noiseCipherState, error) {
+	if st.msgIdx == 0 && st.initiator {
+		// Message 1: -> e, es, s, ss
+		ephPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.e = noiseDHKey{
+			Private: ephPriv.Bytes(),
+			Public:  ephPriv.PublicKey().Bytes(),
+		}
+
+		var out bytes.Buffer
+		// Token `e` (PSK modifier rule Section 9.2: MixHash(e.Public) + MixKey(e.Public))
+		out.Write(st.e.Public)
+		st.mixHash(st.e.Public)
+		st.mixKey(st.e.Public)
+
+		// Token `es`: DH(e_i, rs)
+		esDH, err := performX25519DH(st.e.Private, st.rs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(esDH)
+		clear(esDH)
+
+		// Token `s`: EncryptAndHash(s_i.Public)
+		encS, err := st.encryptAndHash(st.s.Public)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		out.Write(encS)
+
+		// Token `ss`: DH(s_i, rs)
+		ssDH, err := performX25519DH(st.s.Private, st.rs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(ssDH)
+		clear(ssDH)
+
+		// Encrypted Payload 1
+		encPayload, err := st.encryptAndHash(payload)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		out.Write(encPayload)
+
+		st.msgIdx = 1
+		return out.Bytes(), nil, nil, nil
+	}
+
+	if st.msgIdx == 1 && !st.initiator {
+		// Message 2: <- e, ee, se, psk
+		ephPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.e = noiseDHKey{
+			Private: ephPriv.Bytes(),
+			Public:  ephPriv.PublicKey().Bytes(),
+		}
+
+		var out bytes.Buffer
+		// Token `e` (PSK modifier rule Section 9.2)
+		out.Write(st.e.Public)
+		st.mixHash(st.e.Public)
+		st.mixKey(st.e.Public)
+
+		// Token `ee`: DH(e_r, re_i)
+		eeDH, err := performX25519DH(st.e.Private, st.re)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(eeDH)
+		clear(eeDH)
+
+		// Token `se`: DH(e_r, rs_i)
+		seDH, err := performX25519DH(st.e.Private, st.rs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(seDH)
+		clear(seDH)
+
+		// Token `psk`: MixKeyAndHash(psk)
+		st.mixKeyAndHash(st.psk[:])
+
+		// Encrypted Payload 2
+		encPayload, err := st.encryptAndHash(payload)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		out.Write(encPayload)
+
+		st.msgIdx = 2
+		csI2R, csR2I := st.splitTransportKeys()
+		return out.Bytes(), csI2R, csR2I, nil
+	}
+
+	return nil, nil, nil, errors.New("invalid noise handshake WriteMessage state")
+}
+
+// Processes the next inbound handshake message in `Noise_IKpsk2`:
+// - Message 1 (Responder): reads `e, es, s, ss` + encrypted payload
+// - Message 2 (Initiator): reads `e, ee, se, psk` + encrypted payload, then calls `Split()`
+func (st *noiseIKpsk2HandshakeState) ReadMessage(message []byte) ([]byte, *noiseCipherState, *noiseCipherState, error) {
+	if st.msgIdx == 0 && !st.initiator {
+		// Message 1 minimum length: 32B (e) + 48B (encrypted s + tag) + 16B (payload tag) = 96 bytes
+		if len(message) < 96 {
+			return nil, nil, nil, errors.New("noise handshake message 1 too short")
+		}
+		st.re = append([]byte(nil), message[0:32]...)
+		st.mixHash(st.re)
+		st.mixKey(st.re)
+
+		// Token `es`: DH(s_r, re_i)
+		esDH, err := performX25519DH(st.s.Private, st.re)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(esDH)
+		clear(esDH)
+
+		// Token `s`: DecryptAndHash(48 bytes -> 32-byte initiator static public key)
+		rsPlain, err := st.decryptAndHash(message[32:80])
+		if err != nil || len(rsPlain) != 32 {
+			return nil, nil, nil, errors.New("noise handshake failed to authenticate initiator static key")
+		}
+		st.rs = rsPlain
+
+		// Token `ss`: DH(s_r, rs_i)
+		ssDH, err := performX25519DH(st.s.Private, st.rs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(ssDH)
+		clear(ssDH)
+
+		// Decrypt Payload 1
+		payload, err := st.decryptAndHash(message[80:])
+		if err != nil {
+			return nil, nil, nil, errors.New("noise handshake failed to authenticate message 1 payload")
+		}
+
+		st.msgIdx = 1
+		return payload, nil, nil, nil
+	}
+
+	if st.msgIdx == 1 && st.initiator {
+		// Message 2 minimum length: 32B (e) + 16B (payload tag) = 48 bytes
+		if len(message) < 48 {
+			return nil, nil, nil, errors.New("noise handshake message 2 too short")
+		}
+		st.re = append([]byte(nil), message[0:32]...)
+		st.mixHash(st.re)
+		st.mixKey(st.re)
+
+		// Token `ee`: DH(e_i, re_r)
+		eeDH, err := performX25519DH(st.e.Private, st.re)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(eeDH)
+		clear(eeDH)
+
+		// Token `se`: DH(s_i, re_r)
+		seDH, err := performX25519DH(st.s.Private, st.re)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		st.mixKey(seDH)
+		clear(seDH)
+
+		// Token `psk`: MixKeyAndHash(psk)
+		st.mixKeyAndHash(st.psk[:])
+
+		// Decrypt Payload 2
+		payload, err := st.decryptAndHash(message[32:])
+		if err != nil {
+			return nil, nil, nil, errors.New("noise handshake failed to authenticate message 2 payload")
+		}
+
+		st.msgIdx = 2
+		csI2R, csR2I := st.splitTransportKeys()
+		return payload, csI2R, csR2I, nil
+	}
+
+	return nil, nil, nil, errors.New("invalid noise handshake ReadMessage state")
+}
+
+func (st *noiseIKpsk2HandshakeState) splitTransportKeys() (*noiseCipherState, *noiseCipherState) {
+	k1, k2 := noiseHKDF2(st.ck[:], nil)
+	maskI2R, maskR2I := noiseHKDF2(st.ck[:], []byte("sahand-noise-len-masks-v2"))
+
+	// Clear temporary handshake secrets
+	clear(st.ck[:])
+	clear(st.psk[:])
+	clear(st.e.Private)
+	clear(st.s.Private)
+	if st.cs != nil {
+		st.cs.Zeroize()
+	}
+
+	return newNoiseCipherState(k1, maskI2R), newNoiseCipherState(k2, maskR2I)
+}
+
+// ============================================================================
+// 2. STATIC KEY MANAGEMENT & AUTHENTICATED BOOTSTRAP EXCHANGE
+// ============================================================================
+
+type noiseHandshakeMsg1Payload struct {
+	TimestampUnix int64  `json:"ts"`
+	ClientNonce   string `json:"n"`
+	SenderNodeID  string `json:"nid"`
+	PeerID        string `json:"pid"`
+	SigningPubKey string `json:"spk,omitempty"`
+	IdentitySig   string `json:"sig,omitempty"`
+}
+
+type noiseHandshakeMsg2Payload struct {
+	ServerUnix  int64  `json:"ts"`
+	ClientNonce string `json:"n"`
+}
+
+type noiseBootstrapRequest struct {
+	PeerID      string `json:"pid"`
+	MasterID    string `json:"mid"`
+	Challenge   string `json:"ch"`
+	Timestamp   int64  `json:"ts"`
+	MasterSig   string `json:"msig"`
+	RequestHMAC string `json:"hmac"`
+}
+
+type noiseBootstrapResponse struct {
+	PeerID                    string `json:"pid"`
+	AgentSigningPublicKey     string `json:"agent_signing_public_key"`
+	AgentNoiseStaticPublicKey string `json:"agent_noise_static_public_key"`
+	AgentSig                  string `json:"asig"`
+	ResponseHMAC              string `json:"hmac"`
+}
+
+func loadLocalNoiseKeyMaterial(cfg Config, peer ServerPeer) (localStatic noiseDHKey, localSignPriv ed25519.PrivateKey, localSignPubHex string, psk [32]byte, err error) {
+	pskSlice, err := derivePeerSubKey(cfg, peer, "noise-ikpsk2-key-v2")
+	if err != nil {
+		return localStatic, nil, "", psk, err
+	}
+	copy(psk[:], pskSlice)
+
+	var privHex, pubHex, signPrivHex, signPubHex string
+	if cfg.Role == "agent" {
+		privHex = cfg.AgentNoiseStaticPrivateKey
+		pubHex = cfg.AgentNoiseStaticPublicKey
+		signPrivHex = cfg.AgentSigningPrivateKey
+		signPubHex = cfg.AgentSigningPublicKey
+	} else {
+		privHex = cfg.MasterNoiseStaticPrivateKey
+		pubHex = cfg.MasterNoiseStaticPublicKey
+		signPrivHex = cfg.MasterSigningPrivateKey
+		signPubHex = cfg.MasterSigningPublicKey
+	}
+
+	sPriv, err1 := decodeHexExact(privHex, 32)
+	sPub, err2 := decodeHexExact(pubHex, 32)
+	if err1 != nil || err2 != nil {
+		return localStatic, nil, "", psk, errors.New("local X25519 static keypair is not initialized")
+	}
+	edPriv, err3 := decodeHexExact(signPrivHex, ed25519.PrivateKeySize)
+	if err3 != nil {
+		return localStatic, nil, "", psk, errors.New("local Ed25519 signing key is not initialized")
+	}
+
+	localStatic = noiseDHKey{Private: sPriv, Public: sPub}
+	return localStatic, ed25519.PrivateKey(edPriv), strings.ToLower(strings.TrimSpace(signPubHex)), psk, nil
+}
+
+func resolveExpectedRemoteStaticPublicKey(cfg Config, peer ServerPeer) ([]byte, error) {
+	if cfg.Role == "agent" {
+		pubHex := strings.TrimSpace(peer.MasterNoiseStaticPublicKey)
+		if pubHex == "" {
+			if tp, err := parseAndValidateToken(peer.Token); err == nil {
+				pubHex = tp.MasterNoiseStaticPublicKey
+			}
+		}
+		return decodeHexExact(pubHex, 32)
+	}
+
+	// Local role is Master: check if peer's AgentNoiseStaticPublicKey has been registered
+	pubHex := strings.TrimSpace(peer.AgentNoiseStaticPublicKey)
+	if pubHex != "" {
+		return decodeHexExact(pubHex, 32)
+	}
+
+	// Check live state in case a bootstrap or sync just registered it
+	stateMu.RLock()
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == peer.ID && appCfg.Servers[i].AgentNoiseStaticPublicKey != "" {
+			pubHex = appCfg.Servers[i].AgentNoiseStaticPublicKey
+			break
+		}
+	}
+	// In single-process loopback test environments where AgentNoiseStaticPublicKey was generated on appCfg,
+	// we still only use peer.AgentNoiseStaticPublicKey after bootstrap exchange registers it.
+	stateMu.RUnlock()
+
+	if pubHex == "" {
+		return nil, nil
+	}
+	return decodeHexExact(pubHex, 32)
+}
+
+func registerVerifiedAgentPublicKeys(peerID, agentNoisePubHex, agentSignPubHex string) {
+	normNoise := strings.ToLower(strings.TrimSpace(agentNoisePubHex))
+	normSign := strings.ToLower(strings.TrimSpace(agentSignPubHex))
+	if _, err := decodeHexExact(normNoise, 32); err != nil {
+		return
+	}
+
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == peerID {
+			changed := false
+			if appCfg.Servers[i].AgentNoiseStaticPublicKey != normNoise {
+				appCfg.Servers[i].AgentNoiseStaticPublicKey = normNoise
+				changed = true
+			}
+			if normSign != "" && appCfg.Servers[i].AgentSigningPublicKey != normSign {
+				appCfg.Servers[i].AgentSigningPublicKey = normSign
+				changed = true
+			}
+			if changed {
+				_ = saveConfig(configPath(), appCfg)
+			}
+			break
+		}
+	}
+}
+
+// Executes an authenticated bootstrap request when the Master initiates a connection to an Agent
+// whose `AgentNoiseStaticPublicKey` has not yet been registered on the Master.
+func bootstrapFetchAgentStaticKey(peer ServerPeer, tc TunnelConfig, timeout time.Duration) ([]byte, error) {
+	stateMu.RLock()
+	cfgSnapshot := appCfg
+	stateMu.RUnlock()
+
+	reqSubKey, err := derivePeerSubKey(cfgSnapshot, peer, "noise-bootstrap-req-v2")
+	if err != nil {
+		return nil, err
+	}
+	respSubKey, err := derivePeerSubKey(cfgSnapshot, peer, "noise-bootstrap-resp-v2")
+	if err != nil {
+		return nil, err
+	}
+	mSignPrivBytes, err := decodeHexExact(cfgSnapshot.MasterSigningPrivateKey, ed25519.PrivateKeySize)
+	if err != nil {
+		return nil, err
+	}
+
+	challenge, err := randomHex(32)
+	if err != nil {
+		return nil, err
+	}
+	ts := time.Now().Unix()
+	sigMsg := []byte(fmt.Sprintf("SAHAND-NOISE-BOOTSTRAP-REQ-V2|%s|%s|%s|%d",
+		strings.ToLower(cfgSnapshot.NodeID), strings.ToLower(peer.ID), challenge, ts))
+	mSig := ed25519.Sign(ed25519.PrivateKey(mSignPrivBytes), sigMsg)
+
+	reqPkt := noiseBootstrapRequest{
+		PeerID:    strings.ToLower(peer.ID),
+		MasterID:  strings.ToLower(cfgSnapshot.NodeID),
+		Challenge: challenge,
+		Timestamp: ts,
+		MasterSig: hex.EncodeToString(mSig),
+	}
+	macReq := hmac.New(sha256.New, reqSubKey)
+	_, _ = macReq.Write(sigMsg)
+	_, _ = macReq.Write(mSig)
+	reqPkt.RequestHMAC = hex.EncodeToString(macReq.Sum(nil))
+
+	rawReq, err := json.Marshal(reqPkt)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)), timeout)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	var wireHdr [3]byte
+	wireHdr[0] = noiseWireTypeBootstrapReq
+	binary.BigEndian.PutUint16(wireHdr[1:3], uint16(len(rawReq)))
+	if _, err := conn.Write(wireHdr[:]); err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(rawReq); err != nil {
+		return nil, err
+	}
+
+	if _, err := io.ReadFull(conn, wireHdr[:]); err != nil {
+		return nil, err
+	}
+	if wireHdr[0] != noiseWireTypeBootstrapResp {
+		return nil, errors.New("unexpected bootstrap response wire type")
+	}
+	respLen := int(binary.BigEndian.Uint16(wireHdr[1:3]))
+	if respLen <= 0 || respLen > noiseMaxHandshakeLen {
+		return nil, errors.New("invalid bootstrap response length")
+	}
+	respBytes := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, respBytes); err != nil {
+		return nil, err
+	}
+
+	var respPkt noiseBootstrapResponse
+	if err := unmarshalStrictJSON(respBytes, &respPkt); err != nil {
+		return nil, err
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.ToLower(respPkt.PeerID)), []byte(strings.ToLower(peer.ID))) != 1 {
+		return nil, errors.New("bootstrap response peer ID mismatch")
+	}
+
+	agentNoisePub, err := decodeHexExact(respPkt.AgentNoiseStaticPublicKey, 32)
+	if err != nil {
+		return nil, err
+	}
+	agentSignPub, err := decodeHexExact(respPkt.AgentSigningPublicKey, ed25519.PublicKeySize)
+	if err != nil {
+		return nil, err
+	}
+	agentSigBytes, err := decodeHexExact(respPkt.AgentSig, ed25519.SignatureSize)
+	if err != nil {
+		return nil, err
+	}
+	respHMACBytes, err := decodeHexExact(respPkt.ResponseHMAC, sha256.Size)
+	if err != nil {
+		return nil, err
+	}
+
+	respTranscript := []byte(fmt.Sprintf("SAHAND-NOISE-BOOTSTRAP-RESP-V2|%s|%s|%s|%s|%s",
+		challenge,
+		strings.ToLower(cfgSnapshot.NodeID),
+		strings.ToLower(peer.ID),
+		strings.ToLower(respPkt.AgentSigningPublicKey),
+		strings.ToLower(respPkt.AgentNoiseStaticPublicKey)))
+
+	macResp := hmac.New(sha256.New, respSubKey)
+	_, _ = macResp.Write(respTranscript)
+	_, _ = macResp.Write(agentSigBytes)
+	if subtle.ConstantTimeCompare(respHMACBytes, macResp.Sum(nil)) != 1 {
+		return nil, errors.New("bootstrap response HMAC verification failed")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(agentSignPub), respTranscript, agentSigBytes) {
+		return nil, errors.New("bootstrap response Ed25519 signature verification failed")
+	}
+
+	registerVerifiedAgentPublicKeys(peer.ID, respPkt.AgentNoiseStaticPublicKey, respPkt.AgentSigningPublicKey)
+	return agentNoisePub, nil
+}
+
+func handleNoiseBootstrapRequest(conn net.Conn, peer ServerPeer, rawReq []byte) {
+	stateMu.RLock()
+	cfgSnapshot := appCfg
+	stateMu.RUnlock()
+
+	var reqPkt noiseBootstrapRequest
+	if err := unmarshalStrictJSON(rawReq, &reqPkt); err != nil {
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.ToLower(reqPkt.PeerID)), []byte(strings.ToLower(peer.ID))) != 1 {
+		return
+	}
+	diff := time.Now().Unix() - reqPkt.Timestamp
+	if diff < -300 || diff > 300 {
+		return
+	}
+
+	reqSubKey, err := derivePeerSubKey(cfgSnapshot, peer, "noise-bootstrap-req-v2")
+	if err != nil {
+		return
+	}
+	respSubKey, err := derivePeerSubKey(cfgSnapshot, peer, "noise-bootstrap-resp-v2")
+	if err != nil {
+		return
+	}
+
+	// Verify Master's Ed25519 signature using the pinned MasterSigningPublicKey
+	masterSignPubHex := strings.TrimSpace(peer.MasterSigningPublicKey)
+	if masterSignPubHex == "" {
+		masterSignPubHex = strings.TrimSpace(cfgSnapshot.TrustedMasterSigningPublicKey)
+	}
+	if masterSignPubHex == "" {
+		if tp, tErr := parseAndValidateToken(peer.Token); tErr == nil {
+			masterSignPubHex = tp.MasterSigningPublicKey
+		}
+	}
+	masterSignPub, err := decodeHexExact(masterSignPubHex, ed25519.PublicKeySize)
+	if err != nil {
+		return
+	}
+	mSigBytes, err := decodeHexExact(reqPkt.MasterSig, ed25519.SignatureSize)
+	if err != nil {
+		return
+	}
+	reqHMACBytes, err := decodeHexExact(reqPkt.RequestHMAC, sha256.Size)
+	if err != nil {
+		return
+	}
+
+	sigMsg := []byte(fmt.Sprintf("SAHAND-NOISE-BOOTSTRAP-REQ-V2|%s|%s|%s|%d",
+		strings.ToLower(reqPkt.MasterID), strings.ToLower(peer.ID), reqPkt.Challenge, reqPkt.Timestamp))
+	macReq := hmac.New(sha256.New, reqSubKey)
+	_, _ = macReq.Write(sigMsg)
+	_, _ = macReq.Write(mSigBytes)
+	if subtle.ConstantTimeCompare(reqHMACBytes, macReq.Sum(nil)) != 1 {
+		return
+	}
+	if !ed25519.Verify(ed25519.PublicKey(masterSignPub), sigMsg, mSigBytes) {
+		return
+	}
+
+	// Sign and return the Agent's public keys
+	agentSignPrivHex := cfgSnapshot.AgentSigningPrivateKey
+	agentSignPubHex := cfgSnapshot.AgentSigningPublicKey
+	agentNoisePubHex := cfgSnapshot.AgentNoiseStaticPublicKey
+	agentSignPriv, err := decodeHexExact(agentSignPrivHex, ed25519.PrivateKeySize)
+	if err != nil || agentNoisePubHex == "" || agentSignPubHex == "" {
+		return
+	}
+
+	respTranscript := []byte(fmt.Sprintf("SAHAND-NOISE-BOOTSTRAP-RESP-V2|%s|%s|%s|%s|%s",
+		reqPkt.Challenge,
+		strings.ToLower(reqPkt.MasterID),
+		strings.ToLower(peer.ID),
+		strings.ToLower(agentSignPubHex),
+		strings.ToLower(agentNoisePubHex)))
+
+	aSig := ed25519.Sign(ed25519.PrivateKey(agentSignPriv), respTranscript)
+	macResp := hmac.New(sha256.New, respSubKey)
+	_, _ = macResp.Write(respTranscript)
+	_, _ = macResp.Write(aSig)
+
+	respPkt := noiseBootstrapResponse{
+		PeerID:                    strings.ToLower(peer.ID),
+		AgentSigningPublicKey:     strings.ToLower(agentSignPubHex),
+		AgentNoiseStaticPublicKey: strings.ToLower(agentNoisePubHex),
+		AgentSig:                  hex.EncodeToString(aSig),
+		ResponseHMAC:              hex.EncodeToString(macResp.Sum(nil)),
+	}
+	rawResp, err := json.Marshal(respPkt)
+	if err != nil {
+		return
+	}
+
+	var wireHdr [3]byte
+	wireHdr[0] = noiseWireTypeBootstrapResp
+	binary.BigEndian.PutUint16(wireHdr[1:3], uint16(len(rawResp)))
+	_, _ = conn.Write(wireHdr[:])
+	_, _ = conn.Write(rawResp)
+}
+
+// ============================================================================
+// 3. TRANSPORT STREAM FRAMING & 3-BYTE AAD ENCRYPTION (noiseTransportConn)
+// ============================================================================
+
+type noiseTransportConn struct {
+	raw            net.Conn
+	initiator      bool
+	transcriptHash [32]byte
+	peerStatic     []byte
+
+	readMu   sync.Mutex
+	writeMu  sync.Mutex
+	csRx     *noiseCipherState
+	csTx     *noiseCipherState
+	readBuf  bytes.Buffer
+	closed   atomic.Bool
+}
+
+func newNoiseTransportConn(raw net.Conn, initiator bool, csI2R, csR2I *noiseCipherState, h [32]byte, peerStatic []byte) *noiseTransportConn {
+	tc := &noiseTransportConn{
+		raw:            raw,
+		initiator:      initiator,
+		transcriptHash: h,
+		peerStatic:     append([]byte(nil), peerStatic...),
+	}
+	if initiator {
+		tc.csTx = csI2R
+		tc.csRx = csR2I
+	} else {
+		tc.csTx = csR2I
+		tc.csRx = csI2R
+	}
+	return tc
+}
+
+func (ntc *noiseTransportConn) PeerStatic() []byte {
+	cp := make([]byte, len(ntc.peerStatic))
+	copy(cp, ntc.peerStatic)
+	return cp
+}
+
+// Writes a single framed message with a 3-byte AAD header:
+// [FrameType:1][ObfuscatedPlaintextLen:2] || [Ciphertext:PlaintextLen] || [Poly1305Tag:16]
+func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) error {
+	if ntc.closed.Load() {
+		return net.ErrClosed
+	}
+	if len(plaintext) > noiseMaxPlaintextLen {
+		return fmt.Errorf("noise frame plaintext length %d exceeds maximum %d", len(plaintext), noiseMaxPlaintextLen)
+	}
+
+	ntc.writeMu.Lock()
+	defer ntc.writeMu.Unlock()
+	if ntc.closed.Load() {
+		return net.ErrClosed
+	}
+
+	ntc.csTx.mu.Lock()
+	mask := ntc.csTx.nextFrameMaskLocked()
+	ntc.csTx.mu.Unlock()
+
+	var hdr [noiseFrameHeaderLen]byte
+	hdr[0] = frameType
+	obfLen := uint16(len(plaintext)) ^ mask
+	binary.BigEndian.PutUint16(hdr[1:3], obfLen)
+
+	ciphertext, err := ntc.csTx.EncryptWithAd(hdr[:], plaintext)
 	if err != nil {
 		return err
 	}
-	ss.cs = cs
-	return nil
+
+	wire := make([]byte, noiseFrameHeaderLen+len(ciphertext))
+	copy(wire[0:noiseFrameHeaderLen], hdr[:])
+	copy(wire[noiseFrameHeaderLen:], ciphertext)
+
+	_, err = ntc.raw.Write(wire)
+	return err
 }
 
-func (ss *noiseStealthSymmetricState) encryptAndHash(plaintext []byte) ([]byte, error) {
-	if ss.cs == nil {
-		ss.mixHash(plaintext)
-		return plaintext, nil
+// Reads, bounds-checks before allocation, and AAD-authenticates a single frame.
+func (ntc *noiseTransportConn) ReadFrame() (byte, []byte, error) {
+	if ntc.closed.Load() {
+		return 0, nil, net.ErrClosed
 	}
-	ct, _, err := ss.cs.encrypt(ss.h[:], plaintext)
+
+	ntc.readMu.Lock()
+	defer ntc.readMu.Unlock()
+	if ntc.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
+
+	var hdr [noiseFrameHeaderLen]byte
+	if _, err := io.ReadFull(ntc.raw, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+
+	frameType := hdr[0]
+	switch frameType {
+	case noiseFrameTypeData, noiseFrameTypeRekeyInit, noiseFrameTypeRekeyAck, noiseFrameTypeRekeyCommit, noiseFrameTypeClose:
+	default:
+		_ = ntc.Close()
+		return 0, nil, fmt.Errorf("invalid noise transport frame type 0x%02x", frameType)
+	}
+
+	ntc.csRx.mu.Lock()
+	mask := ntc.csRx.nextFrameMaskLocked()
+	ntc.csRx.mu.Unlock()
+
+	plaintextLen := int(binary.BigEndian.Uint16(hdr[1:3]) ^ mask)
+	if plaintextLen < 0 || plaintextLen > noiseMaxPlaintextLen {
+		_ = ntc.Close()
+		return 0, nil, fmt.Errorf("noise frame length %d exceeds maximum %d", plaintextLen, noiseMaxPlaintextLen)
+	}
+
+	ciphertextLen := plaintextLen + noiseAEADTagLen
+	cipherBuf := make([]byte, ciphertextLen)
+	if _, err := io.ReadFull(ntc.raw, cipherBuf); err != nil {
+		_ = ntc.Close()
+		if errors.Is(err, io.EOF) {
+			return 0, nil, io.ErrUnexpectedEOF
+		}
+		return 0, nil, err
+	}
+
+	plaintext, err := ntc.csRx.DecryptWithAd(hdr[:], cipherBuf)
 	if err != nil {
-		return nil, err
+		_ = ntc.Close()
+		return 0, nil, err
 	}
-	ss.mixHash(ct)
-	return ct, nil
+
+	return frameType, plaintext, nil
 }
 
-func (ss *noiseStealthSymmetricState) decryptAndHash(ciphertext []byte) ([]byte, error) {
-	if ss.cs == nil {
-		ss.mixHash(ciphertext)
-		return ciphertext, nil
-	}
-	pt, err := ss.cs.decrypt(ss.h[:], ciphertext)
-	if err != nil {
-		return nil, err
-	}
-	ss.mixHash(ciphertext)
-	return pt, nil
-}
-
-func (ss *noiseStealthSymmetricState) split() (*noiseStealthCipher, *noiseStealthCipher, error) {
-	k1, k2 := noiseStealthHKDF2(ss.ck, nil)
-	c1, err := newNoiseStealthCipher(k1)
-	if err != nil {
-		return nil, nil, err
-	}
-	c2, err := newNoiseStealthCipher(k2)
-	if err != nil {
-		return nil, nil, err
-	}
-	return c1, c2, nil
-}
-
-func deriveNoiseStealthStaticKeypair(authKey []byte, domain string) (priv [32]byte, pub [32]byte, err error) {
-	mac := hmac.New(sha256.New, authKey)
-	_, _ = mac.Write([]byte("noise-ik-static:" + domain))
-	sum := mac.Sum(nil)
-	copy(priv[:], sum[:32])
-	priv[0] &= 248
-	priv[31] &= 127
-	priv[31] |= 64
-
-	pubSlice, err := curve25519.X25519(priv[:], curve25519.Basepoint)
-	if err != nil {
-		return priv, pub, err
-	}
-	copy(pub[:], pubSlice)
-	return priv, pub, nil
-}
-
-func computeHandshakeLenMask(authKey []byte, ephemPub [32]byte) [2]byte {
-	h, _ := blake2s.New256(nil)
-	_, _ = h.Write([]byte("stealth-hs-mask:"))
-	_, _ = h.Write(authKey)
-	_, _ = h.Write(ephemPub[:])
-	sum := h.Sum(nil)
-	return [2]byte{sum[0], sum[1]}
-}
-
-type noiseStealthHandshakePayload struct {
-	Version    int    `json:"v"`
-	Mode       byte   `json:"m"`
-	PeerID     string `json:"pid"`
-	NodeID     string `json:"nid"`
-	TargetPort string `json:"port,omitempty"`
-	TimeHdr    string `json:"tm,omitempty"`
-	Timestamp  int64  `json:"ts"`
-	Padding    string `json:"pad"`
-}
-
-// noiseStealthConn wraps a net.Conn with Noise_IK and obfuscated 2-byte frame lengths.
-type noiseStealthConn struct {
-	net.Conn
-	readMu  sync.Mutex
-	writeMu sync.Mutex
-	rx      *noiseStealthCipher
-	tx      *noiseStealthCipher
-	readBuf bytes.Buffer
-}
-
-func (sc *noiseStealthConn) Write(p []byte) (int, error) {
-	sc.writeMu.Lock()
-	defer sc.writeMu.Unlock()
-
+func (ntc *noiseTransportConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		chunk := p
-		if len(chunk) > noiseStealthMaxPayload {
-			chunk = p[:noiseStealthMaxPayload]
+		if len(chunk) > noiseMaxPlaintextLen {
+			chunk = p[:noiseMaxPlaintextLen]
 		}
-		ct, mask, err := sc.tx.encrypt(nil, chunk)
-		if err != nil {
-			return total, err
-		}
-		frameLen := uint16(len(ct))
-		var hdr [2]byte
-		binary.BigEndian.PutUint16(hdr[:], frameLen)
-		hdr[0] ^= mask[0]
-		hdr[1] ^= mask[1]
-
-		if _, err := sc.Conn.Write(hdr[:]); err != nil {
-			return total, err
-		}
-		if _, err := sc.Conn.Write(ct); err != nil {
+		if err := ntc.WriteFrame(noiseFrameTypeData, chunk); err != nil {
 			return total, err
 		}
 		total += len(chunk)
@@ -285,412 +1055,240 @@ func (sc *noiseStealthConn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (sc *noiseStealthConn) Read(p []byte) (int, error) {
-	sc.readMu.Lock()
-	defer sc.readMu.Unlock()
-
-	if sc.readBuf.Len() > 0 {
-		return sc.readBuf.Read(p)
+func (ntc *noiseTransportConn) Read(p []byte) (int, error) {
+	if ntc.readBuf.Len() > 0 {
+		return ntc.readBuf.Read(p)
 	}
-	var hdr [2]byte
-	if _, err := io.ReadFull(sc.Conn, hdr[:]); err != nil {
-		return 0, err
+	for {
+		fType, plain, err := ntc.ReadFrame()
+		if err != nil {
+			return 0, err
+		}
+		if fType == noiseFrameTypeClose {
+			return 0, io.EOF
+		}
+		if fType == noiseFrameTypeData {
+			if len(plain) == 0 {
+				continue
+			}
+			ntc.readBuf.Write(plain)
+			return ntc.readBuf.Read(p)
+		}
 	}
-	mask := sc.rx.peekNextLenMask()
-	hdr[0] ^= mask[0]
-	hdr[1] ^= mask[1]
-	frameLen := int(binary.BigEndian.Uint16(hdr[:]))
-	if frameLen <= 0 || frameLen > noiseStealthMaxPayload+chacha20poly1305.Overhead {
-		return 0, errors.New("invalid stealth frame length")
-	}
-
-	ct := make([]byte, frameLen)
-	if _, err := io.ReadFull(sc.Conn, ct); err != nil {
-		return 0, err
-	}
-	pt, err := sc.rx.decrypt(nil, ct)
-	if err != nil {
-		return 0, err
-	}
-	sc.readBuf.Write(pt)
-	return sc.readBuf.Read(p)
 }
 
-// Client Handshake: Noise_IK_25519_ChaChaPoly_BLAKE2s
-// Pre-message: <- s
-// Message 1:   -> e, es, s, ss + encrypted payload (with random padding)
-// Message 2:   <- e, ee, se + encrypted ack (with random padding)
+func (ntc *noiseTransportConn) CloseWrite() error {
+	_ = ntc.WriteFrame(noiseFrameTypeClose, nil)
+	closeWriteTCP(ntc.raw)
+	return nil
+}
+
+func (ntc *noiseTransportConn) Close() error {
+	if ntc.closed.Swap(true) {
+		return nil
+	}
+	if ntc.csTx != nil {
+		ntc.csTx.Zeroize()
+	}
+	if ntc.csRx != nil {
+		ntc.csRx.Zeroize()
+	}
+	return ntc.raw.Close()
+}
+
+// ============================================================================
+// 4. BIDIRECTIONAL HANDSHAKE ESTABLISHMENT & 1.5-RTT MESSAGE 3 GATE
+// ============================================================================
+
+// Message 3 Application Header (sent only after Message 2 completes and `Split()` succeeds):
+// [AppCmd:1][TargetPort:2][TimeHdrLen:1][TimeHdr...]
+func encodeNoiseMessage3Header(appCmd byte, targetPort uint16, timeHdr string) []byte {
+	if len(timeHdr) > 120 {
+		timeHdr = timeHdr[:120]
+	}
+	out := make([]byte, 4+len(timeHdr))
+	out[0] = appCmd
+	binary.BigEndian.PutUint16(out[1:3], targetPort)
+	out[3] = byte(len(timeHdr))
+	copy(out[4:], []byte(timeHdr))
+	return out
+}
+
+func decodeNoiseMessage3Header(plain []byte) (appCmd byte, targetPort uint16, timeHdr string, err error) {
+	if len(plain) < 4 {
+		return 0, 0, "", errors.New("noise message 3 header too short")
+	}
+	appCmd = plain[0]
+	targetPort = binary.BigEndian.Uint16(plain[1:3])
+	thLen := int(plain[3])
+	if 4+thLen > len(plain) {
+		return 0, 0, "", errors.New("noise message 3 time header length mismatch")
+	}
+	timeHdr = string(plain[4 : 4+thLen])
+	return appCmd, targetPort, timeHdr, nil
+}
+
 func dialNoiseStealthSession(
 	peer ServerPeer,
 	tc TunnelConfig,
-	mode byte,
-	targetPort string,
+	appCmd byte,
+	targetPort uint16,
 	timeout time.Duration,
-) (*noiseStealthConn, error) {
+) (*noiseTransportConn, error) {
 	stateMu.RLock()
 	cfgSnapshot := appCfg
 	stateMu.RUnlock()
 
-	authKey, err := derivePeerAuthKey(cfgSnapshot, peer)
+	localStatic, localSignPriv, localSignPubHex, psk, err := loadLocalNoiseKeyMaterial(cfgSnapshot, peer)
 	if err != nil {
 		return nil, err
 	}
 
-	// Responder static keypair & Initiator static keypair
-	_, rsPub, err := deriveNoiseStealthStaticKeypair(authKey, "responder")
+	remoteStaticPub, err := resolveExpectedRemoteStaticPublicKey(cfgSnapshot, peer)
 	if err != nil {
 		return nil, err
 	}
-	isPriv, isPub, err := deriveNoiseStealthStaticKeypair(authKey, "initiator")
+	if len(remoteStaticPub) != 32 {
+		// Perform authenticated static-key bootstrap exchange so we never assume the remote static key is magically known
+		remoteStaticPub, err = bootstrapFetchAgentStaticKey(peer, tc, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("failed to bootstrap remote static public key: %w", err)
+		}
+	}
+
+	prologue := []byte("SAHAND-NOISE-IKPSK2-V2|" + strings.ToLower(peer.ID))
+	hs, err := newNoiseIKpsk2HandshakeState(noiseIKpsk2Config{
+		Initiator:     true,
+		Prologue:      prologue,
+		StaticKeypair: localStatic,
+		PeerStatic:    remoteStaticPub,
+		PresharedKey:  psk[:],
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	targetAddr := net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort))
+	nonceHex, err := randomHex(16)
+	if err != nil {
+		return nil, err
+	}
+	nowUnix := time.Now().Unix()
+
+	idTranscript := []byte(fmt.Sprintf("SAHAND-NOISE-ID-V2|%s|%s|%s|%d|%s",
+		strings.ToLower(cfgSnapshot.NodeID),
+		strings.ToLower(peer.ID),
+		hex.EncodeToString(localStatic.Public),
+		nowUnix,
+		nonceHex))
+	idSig := ed25519.Sign(localSignPriv, idTranscript)
+
+	msg1PayloadStruct := noiseHandshakeMsg1Payload{
+		TimestampUnix: nowUnix,
+		ClientNonce:   nonceHex,
+		SenderNodeID:  strings.ToLower(cfgSnapshot.NodeID),
+		PeerID:        strings.ToLower(peer.ID),
+		SigningPubKey: localSignPubHex,
+		IdentitySig:   hex.EncodeToString(idSig),
+	}
+	msg1PayloadBytes, err := json.Marshal(msg1PayloadStruct)
+	if err != nil {
+		return nil, err
+	}
+
+	msg1Wire, _, _, err := hs.WriteMessage(msg1PayloadBytes)
+	if err != nil {
+		return nil, err
+	}
+
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 20 * time.Second}
-	rawConn, err := dialer.Dial("tcp", targetAddr)
+	rawConn, err := dialer.Dial("tcp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)))
 	if err != nil {
 		return nil, err
 	}
 	enableKeepAlive(rawConn)
-	_ = rawConn.SetDeadline(time.Now().Add(timeout + 2*time.Second))
+	_ = rawConn.SetDeadline(time.Now().Add(timeout))
 
-	ss := newNoiseStealthSymmetricState()
-	// Pre-message: <- s
-	ss.mixHash(rsPub[:])
-
-	// -> e
-	ePriv, ePub, err := generateEphemeralX25519()
-	if err != nil {
+	var wireHdr [3]byte
+	wireHdr[0] = noiseWireTypeHandshakeMsg1
+	binary.BigEndian.PutUint16(wireHdr[1:3], uint16(len(msg1Wire)))
+	if _, err := rawConn.Write(wireHdr[:]); err != nil {
 		_ = rawConn.Close()
 		return nil, err
 	}
-	ss.mixHash(ePub[:])
-
-	// -> es
-	es, err := curve25519.X25519(ePriv[:], rsPub[:])
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	if err := ss.mixKey(es); err != nil {
+	if _, err := rawConn.Write(msg1Wire); err != nil {
 		_ = rawConn.Close()
 		return nil, err
 	}
 
-	// -> s
-	encS, err := ss.encryptAndHash(isPub[:])
-	if err != nil {
+	// Read Handshake Message 2
+	if _, err := io.ReadFull(rawConn, wireHdr[:]); err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+	if wireHdr[0] != noiseWireTypeHandshakeMsg2 {
+		_ = rawConn.Close()
+		return nil, errors.New("unexpected noise handshake message 2 wire type")
+	}
+	msg2Len := int(binary.BigEndian.Uint16(wireHdr[1:3]))
+	if msg2Len <= 0 || msg2Len > noiseMaxHandshakeLen {
+		_ = rawConn.Close()
+		return nil, errors.New("invalid noise handshake message 2 length")
+	}
+	msg2Wire := make([]byte, msg2Len)
+	if _, err := io.ReadFull(rawConn, msg2Wire); err != nil {
 		_ = rawConn.Close()
 		return nil, err
 	}
 
-	// -> ss
-	ssDH, err := curve25519.X25519(isPriv[:], rsPub[:])
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	if err := ss.mixKey(ssDH); err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-
-	padHex, _ := randomHex(16 + randomIntN(64))
-	hsPayload := noiseStealthHandshakePayload{
-		Version:    noiseStealthProtoVersion,
-		Mode:       mode,
-		PeerID:     peer.ID,
-		NodeID:     cfgSnapshot.NodeID,
-		TargetPort: targetPort,
-		TimeHdr:    buildMasterTimeHeader(),
-		Timestamp:  time.Now().Unix(),
-		Padding:    padHex,
-	}
-	rawPayload, err := json.Marshal(hsPayload)
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	encPayload, err := ss.encryptAndHash(rawPayload)
+	msg2Plain, csI2R, csR2I, err := hs.ReadMessage(msg2Wire)
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, err
 	}
 
-	bodyLen := len(encS) + len(encPayload)
-	mask1 := computeHandshakeLenMask(authKey, ePub)
-	var lenHdr1 [2]byte
-	binary.BigEndian.PutUint16(lenHdr1[:], uint16(bodyLen))
-	lenHdr1[0] ^= mask1[0]
-	lenHdr1[1] ^= mask1[1]
-
-	msg1 := make([]byte, 0, 32+2+bodyLen)
-	msg1 = append(msg1, ePub[:]...)
-	msg1 = append(msg1, lenHdr1[:]...)
-	msg1 = append(msg1, encS...)
-	msg1 = append(msg1, encPayload...)
-
-	if _, err := rawConn.Write(msg1); err != nil {
+	var msg2Payload noiseHandshakeMsg2Payload
+	if err := unmarshalStrictJSON(msg2Plain, &msg2Payload); err != nil {
 		_ = rawConn.Close()
 		return nil, err
 	}
+	if subtle.ConstantTimeCompare([]byte(msg2Payload.ClientNonce), []byte(nonceHex)) != 1 {
+		_ = rawConn.Close()
+		return nil, errors.New("noise handshake message 2 nonce echo mismatch")
+	}
 
-	// Read Message 2: [rePub:32][obfLen:2][encAck]
-	var reHdr [34]byte
-	if _, err := io.ReadFull(rawConn, reHdr[:]); err != nil {
+	// Verify PeerStatic() matches the expected remote static public key
+	if subtle.ConstantTimeCompare(hs.PeerStatic(), remoteStaticPub) != 1 {
 		_ = rawConn.Close()
-		return nil, err
+		return nil, errors.New("noise PeerStatic() mismatch on initiator")
 	}
-	var rePub [32]byte
-	copy(rePub[:], reHdr[0:32])
-	mask2 := computeHandshakeLenMask(authKey, rePub)
-	reHdr[32] ^= mask2[0]
-	reHdr[33] ^= mask2[1]
-	ackLen := int(binary.BigEndian.Uint16(reHdr[32:34]))
-	if ackLen < chacha20poly1305.Overhead || ackLen > 2048 {
-		_ = rawConn.Close()
-		return nil, errors.New("invalid stealth handshake response length")
-	}
-	encAck := make([]byte, ackLen)
-	if _, err := io.ReadFull(rawConn, encAck); err != nil {
-		_ = rawConn.Close()
+
+	ntc := newNoiseTransportConn(rawConn, true, csI2R, csR2I, hs.ChannelBinding(), hs.PeerStatic())
+
+	// Send Message 3 (the first post-split encrypted transport frame carrying the application command)
+	msg3Plain := encodeNoiseMessage3Header(appCmd, targetPort, buildMasterTimeHeader())
+	if err := ntc.WriteFrame(noiseFrameTypeData, msg3Plain); err != nil {
+		_ = ntc.Close()
 		return nil, err
 	}
 
-	// <- e
-	ss.mixHash(rePub[:])
-	// <- ee
-	ee, err := curve25519.X25519(ePriv[:], rePub[:])
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	if err := ss.mixKey(ee); err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	// <- se
-	se, err := curve25519.X25519(isPriv[:], rePub[:])
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	if err := ss.mixKey(se); err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-
-	ackPlain, err := ss.decryptAndHash(encAck)
-	if err != nil || len(ackPlain) == 0 || ackPlain[0] != noiseStealthStatusOK {
-		_ = rawConn.Close()
-		return nil, errors.New("stealth handshake rejected")
-	}
-
-	txCS, rxCS, err := ss.split()
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, err
-	}
-	return &noiseStealthConn{
-		Conn: rawConn,
-		tx:   txCS,
-		rx:   rxCS,
-	}, nil
-}
-
-// Active-probing resistant silent tarpit: absorbs probe and closes without writing a single byte.
-func silentDropProber(rawConn net.Conn) {
-	jitter := time.Duration(60+randomIntN(160)) * time.Millisecond
-	time.Sleep(jitter)
-	_ = rawConn.Close()
-}
-
-func acceptNoiseStealthSession(
-	rawConn net.Conn,
-	peer ServerPeer,
-) (*noiseStealthConn, noiseStealthHandshakePayload, error) {
-	var hsPayload noiseStealthHandshakePayload
-
-	stateMu.RLock()
-	cfgSnapshot := appCfg
-	stateMu.RUnlock()
-
-	authKey, err := derivePeerAuthKey(cfgSnapshot, peer)
-	if err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-
-	rsPriv, rsPub, err := deriveNoiseStealthStaticKeypair(authKey, "responder")
-	if err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-	_, expectedInitPub, err := deriveNoiseStealthStaticKeypair(authKey, "initiator")
-	if err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-
-	var initHdr [34]byte
-	if _, err := io.ReadFull(rawConn, initHdr[:]); err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-	var ePub [32]byte
-	copy(ePub[:], initHdr[0:32])
-	mask1 := computeHandshakeLenMask(authKey, ePub)
-	initHdr[32] ^= mask1[0]
-	initHdr[33] ^= mask1[1]
-	bodyLen := int(binary.BigEndian.Uint16(initHdr[32:34]))
-
-	// encS is 32 + 16 = 48 bytes; payload is at least 16 bytes
-	if bodyLen < 64 || bodyLen > 4096 {
-		silentDropProber(rawConn)
-		return nil, hsPayload, errors.New("invalid stealth body length")
-	}
-
-	body := make([]byte, bodyLen)
-	if _, err := io.ReadFull(rawConn, body); err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-
-	ss := newNoiseStealthSymmetricState()
-	ss.mixHash(rsPub[:])
-	ss.mixHash(ePub[:])
-
-	es, err := curve25519.X25519(rsPriv[:], ePub[:])
-	if err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-	if err := ss.mixKey(es); err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-
-	// Decrypt Initiator's static public key s (first 48 bytes of body)
-	clientStaticPub, err := ss.decryptAndHash(body[0:48])
-	if err != nil || !bytes.Equal(clientStaticPub, expectedInitPub[:]) {
-		silentDropProber(rawConn)
-		return nil, hsPayload, errors.New("stealth static key authentication failed")
-	}
-
-	var isPub [32]byte
-	copy(isPub[:], clientStaticPub)
-	ssDH, err := curve25519.X25519(rsPriv[:], isPub[:])
-	if err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-	if err := ss.mixKey(ssDH); err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-
-	plainPayload, err := ss.decryptAndHash(body[48:])
-	if err != nil {
-		silentDropProber(rawConn)
-		return nil, hsPayload, err
-	}
-	if err := json.Unmarshal(plainPayload, &hsPayload); err != nil || hsPayload.Version != noiseStealthProtoVersion {
-		silentDropProber(rawConn)
-		return nil, hsPayload, errors.New("invalid stealth handshake payload")
-	}
-
-	if hsPayload.TimeHdr != "" {
-		applyMasterTimeHeader(hsPayload.TimeHdr)
-	}
-
-	// Build Message 2: <- e, ee, se
-	rePriv, rePub, err := generateEphemeralX25519()
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-	ss.mixHash(rePub[:])
-
-	ee, err := curve25519.X25519(rePriv[:], ePub[:])
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-	if err := ss.mixKey(ee); err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-
-	se, err := curve25519.X25519(rePriv[:], isPub[:])
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-	if err := ss.mixKey(se); err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-
-	ackPadLen := 16 + randomIntN(48)
-	ackPlain := make([]byte, 1+ackPadLen)
-	ackPlain[0] = noiseStealthStatusOK
-	_, _ = io.ReadFull(rand.Reader, ackPlain[1:])
-
-	encAck, err := ss.encryptAndHash(ackPlain)
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-
-	mask2 := computeHandshakeLenMask(authKey, rePub)
-	var lenHdr2 [2]byte
-	binary.BigEndian.PutUint16(lenHdr2[:], uint16(len(encAck)))
-	lenHdr2[0] ^= mask2[0]
-	lenHdr2[1] ^= mask2[1]
-
-	msg2 := make([]byte, 0, 32+2+len(encAck))
-	msg2 = append(msg2, rePub[:]...)
-	msg2 = append(msg2, lenHdr2[:]...)
-	msg2 = append(msg2, encAck...)
-
-	if _, err := rawConn.Write(msg2); err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-
-	rxCS, txCS, err := ss.split()
-	if err != nil {
-		_ = rawConn.Close()
-		return nil, hsPayload, err
-	}
-	return &noiseStealthConn{
-		Conn: rawConn,
-		tx:   txCS,
-		rx:   rxCS,
-	}, hsPayload, nil
+	return ntc, nil
 }
 
 // ============================================================================
-// 2. SERVER LISTENER & ENGINE 1 / ENGINE 2 DISPATCH
+// 5. SERVER LISTENER, 1.5-RTT GATE & TCP/UDP FORWARDING (:28010)
 // ============================================================================
 
 var (
-	noiseStealthMu          sync.RWMutex
-	noiseStealthExitUDPMux  = make(map[string]*noiseStealthUDPExitManager)
-	noiseStealthEntryUDPMux = make(map[string]*noiseStealthUDPEntryManager)
+	noiseStealthMu            sync.RWMutex
+	noiseStealthUDPEntryByKey = make(map[string]*net.UDPConn)
 )
 
 func stopNoiseStealthPeerResources(peerID string) {
 	noiseStealthMu.Lock()
-	if exitMux, ok := noiseStealthExitUDPMux[peerID]; ok {
-		exitMux.closeAll()
-		delete(noiseStealthExitUDPMux, peerID)
-	}
-	for k, entryMux := range noiseStealthEntryUDPMux {
+	for k, uConn := range noiseStealthUDPEntryByKey {
 		if strings.HasPrefix(k, peerID+"|") {
-			entryMux.closeAll()
-			delete(noiseStealthEntryUDPMux, k)
+			_ = uConn.Close()
+			delete(noiseStealthUDPEntryByKey, k)
 		}
 	}
 	noiseStealthMu.Unlock()
@@ -703,102 +1301,262 @@ func startNoiseStealthServerListener(peer ServerPeer, tc TunnelConfig) (net.List
 		return nil, err
 	}
 
-	noiseStealthMu.Lock()
-	if old, ok := noiseStealthExitUDPMux[peer.ID]; ok {
-		old.closeAll()
-	}
-	exitMux := newNoiseStealthUDPExitManager(tc.SpeedLimitMBps)
-	noiseStealthExitUDPMux[peer.ID] = exitMux
-	noiseStealthMu.Unlock()
-
 	go func() {
 		for {
-			rawConn, err := ln.Accept()
-			if err != nil {
+			conn, aErr := ln.Accept()
+			if aErr != nil {
 				return
 			}
-			enableKeepAlive(rawConn)
-			go handleIncomingNoiseStealthConn(rawConn, peer, tc, exitMux)
+			enableKeepAlive(conn)
+			go handleNoiseStealthServerConn(conn, peer, tc)
 		}
 	}()
+
 	return ln, nil
 }
 
-func handleIncomingNoiseStealthConn(
-	rawConn net.Conn,
-	peer ServerPeer,
-	tc TunnelConfig,
-	exitMux *noiseStealthUDPExitManager,
-) {
-	_ = rawConn.SetDeadline(time.Now().Add(12 * time.Second))
+func handleNoiseStealthServerConn(conn net.Conn, peer ServerPeer, tc TunnelConfig) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(noiseHandshakeTimeout))
 
-	sc, hs, err := acceptNoiseStealthSession(rawConn, peer)
+	var wireHdr [3]byte
+	if _, err := io.ReadFull(conn, wireHdr[:]); err != nil {
+		return
+	}
+	pktType := wireHdr[0]
+	pktLen := int(binary.BigEndian.Uint16(wireHdr[1:3]))
+	if pktLen <= 0 || pktLen > noiseMaxHandshakeLen {
+		return
+	}
+	pktBytes := make([]byte, pktLen)
+	if _, err := io.ReadFull(conn, pktBytes); err != nil {
+		return
+	}
+
+	// Handle authenticated Static-Key Bootstrap Request
+	if pktType == noiseWireTypeBootstrapReq {
+		handleNoiseBootstrapRequest(conn, peer, pktBytes)
+		return
+	}
+	if pktType != noiseWireTypeHandshakeMsg1 {
+		return
+	}
+
+	stateMu.RLock()
+	cfgSnapshot := appCfg
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == peer.ID {
+			peer = appCfg.Servers[i]
+			break
+		}
+	}
+	stateMu.RUnlock()
+
+	localStatic, _, _, psk, err := loadLocalNoiseKeyMaterial(cfgSnapshot, peer)
 	if err != nil {
 		return
 	}
-	defer sc.Close()
 
-	remoteHost, _, _ := net.SplitHostPort(rawConn.RemoteAddr().String())
-	effectivePeerID := peer.ID
-	if hs.PeerID != "" {
-		effectivePeerID = hs.PeerID
+	prologue := []byte("SAHAND-NOISE-IKPSK2-V2|" + strings.ToLower(peer.ID))
+	hs, err := newNoiseIKpsk2HandshakeState(noiseIKpsk2Config{
+		Initiator:     false,
+		Prologue:      prologue,
+		StaticKeypair: localStatic,
+		PresharedKey:  psk[:],
+	})
+	if err != nil {
+		return
 	}
 
-	switch hs.Mode {
-	case noiseStealthModeProbe:
-		var ping [12]byte
-		if _, err := io.ReadFull(sc, ping[:]); err != nil {
+	// Process Handshake Message 1 (`-> e, es, s, ss`).
+	// CRITICAL STAGE 4 RULE: Message 1 alone NEVER triggers destination connections or state mutations.
+	msg1Plain, _, _, err := hs.ReadMessage(pktBytes)
+	if err != nil {
+		return
+	}
+
+	var msg1Payload noiseHandshakeMsg1Payload
+	if err := unmarshalStrictJSON(msg1Plain, &msg1Payload); err != nil {
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(strings.ToLower(msg1Payload.PeerID)), []byte(strings.ToLower(peer.ID))) != 1 {
+		return
+	}
+	if diff := time.Now().Unix() - msg1Payload.TimestampUnix; diff < -300 || diff > 300 {
+		return
+	}
+
+	// Verify `hs.PeerStatic()` against the expected remote static public key
+	peerStaticBytes := hs.PeerStatic()
+	if len(peerStaticBytes) != 32 || subtle.ConstantTimeCompare(peerStaticBytes, localStatic.Public) == 1 {
+		// Reject reflection attempts where initiator static key equals responder static key
+		return
+	}
+
+	expectedRemoteStatic, _ := resolveExpectedRemoteStaticPublicKey(cfgSnapshot, peer)
+	if len(expectedRemoteStatic) == 32 {
+		if subtle.ConstantTimeCompare(peerStaticBytes, expectedRemoteStatic) != 1 {
 			return
 		}
-		_, _ = sc.Write(ping[:])
-		markPeerConnectedInbound(effectivePeerID, remoteHost, tc.ID, tc.ListenPort, 1)
+	} else {
+		// If Master is receiving an initial Agent-initiated connection before AgentNoiseStaticPublicKey was registered,
+		// verify the Agent's Ed25519 identity signature over `hs.PeerStatic()` (registration still waits for Message 3!).
+		agentSignPub, err1 := decodeHexExact(msg1Payload.SigningPubKey, ed25519.PublicKeySize)
+		agentIdSig, err2 := decodeHexExact(msg1Payload.IdentitySig, ed25519.SignatureSize)
+		if err1 != nil || err2 != nil {
+			return
+		}
+		idTranscript := []byte(fmt.Sprintf("SAHAND-NOISE-ID-V2|%s|%s|%s|%d|%s",
+			msg1Payload.SenderNodeID,
+			msg1Payload.PeerID,
+			hex.EncodeToString(peerStaticBytes),
+			msg1Payload.TimestampUnix,
+			msg1Payload.ClientNonce))
+		if !ed25519.Verify(ed25519.PublicKey(agentSignPub), idTranscript, agentIdSig) {
+			return
+		}
+	}
 
-	case noiseStealthModeParitySync:
-		handleNoiseStealthParitySyncServer(sc, effectivePeerID, remoteHost)
+	// Construct and send Handshake Message 2 (`<- e, ee, se, psk`)
+	msg2PayloadBytes, err := json.Marshal(noiseHandshakeMsg2Payload{
+		ServerUnix:  time.Now().Unix(),
+		ClientNonce: msg1Payload.ClientNonce,
+	})
+	if err != nil {
+		return
+	}
 
-	case noiseStealthModeTCPForward:
+	msg2Wire, csI2R, csR2I, err := hs.WriteMessage(msg2PayloadBytes)
+	if err != nil {
+		return
+	}
+
+	wireHdr[0] = noiseWireTypeHandshakeMsg2
+	binary.BigEndian.PutUint16(wireHdr[1:3], uint16(len(msg2Wire)))
+	if _, err := conn.Write(wireHdr[:]); err != nil {
+		return
+	}
+	if _, err := conn.Write(msg2Wire); err != nil {
+		return
+	}
+
+	ntc := newNoiseTransportConn(conn, false, csI2R, csR2I, hs.ChannelBinding(), peerStaticBytes)
+	defer ntc.Close()
+
+	// Wait for Message 3 (the first post-split frame encrypted under csI2R, proving ephemeral `ee` liveness).
+	// No destination dialing or state mutation occurs until this frame is decrypted and authenticated.
+	fType, msg3Plain, err := ntc.ReadFrame()
+	if err != nil || fType != noiseFrameTypeData {
+		return
+	}
+
+	appCmd, targetPort, timeHdr, err := decodeNoiseMessage3Header(msg3Plain)
+	if err != nil {
+		return
+	}
+	if timeHdr != "" {
+		applyMasterTimeHeader(timeHdr)
+	}
+
+	// Message 3 succeeded! If this was an Agent introducing its static key to the Master, register it now.
+	if cfgSnapshot.Role == "master" && len(expectedRemoteStatic) == 0 {
+		registerVerifiedAgentPublicKeys(peer.ID, hex.EncodeToString(peerStaticBytes), msg1Payload.SigningPubKey)
+	}
+
+	remoteHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+	switch appCmd {
+	case noiseAppCmdProbe:
+		var ping [16]byte
+		if _, err := io.ReadFull(ntc, ping[:]); err != nil {
+			return
+		}
+		if _, err := ntc.Write(ping[:]); err != nil {
+			return
+		}
+		markPeerConnectedInbound(peer.ID, remoteHost, tc.ID, tc.ListenPort, 1)
+
+	case noiseAppCmdParitySync:
+		handleWebTransportParitySyncStream(ntc, peer.ID, remoteHost)
+
+	case noiseAppCmdTCPForward:
 		if !tc.Enabled {
-			_, _ = sc.Write([]byte{noiseStealthStatusForbidden})
 			return
 		}
-		_ = sc.SetDeadline(time.Time{})
-		targetPort := strings.TrimSpace(hs.TargetPort)
-		if targetPort == "" {
-			ports := parsePortList(tc.ForwardPorts)
-			if len(ports) > 0 {
-				targetPort = ports[0]
-			} else {
-				targetPort = "2053"
-			}
-		}
-		target, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", targetPort), 5*time.Second)
+		authorizedPort, err := authorizeWSSTargetPort(tc, strconv.Itoa(int(targetPort)))
 		if err != nil {
-			_, _ = sc.Write([]byte{noiseStealthStatusUnreachable})
 			return
 		}
-		defer target.Close()
-		enableKeepAlive(target)
+		targetConn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", authorizedPort), 5*time.Second)
+		if err != nil {
+			return
+		}
+		defer targetConn.Close()
+		enableKeepAlive(targetConn)
 
-		if _, err := sc.Write([]byte{noiseStealthStatusOK}); err != nil {
-			return
-		}
-		pipeNoiseStealthAndTCP(sc, target, tc.SpeedLimitMBps)
+		_ = conn.SetDeadline(time.Time{})
+		markPeerConnectedInbound(peer.ID, remoteHost, tc.ID, tc.ListenPort, 1)
+		pipeNoiseTransportAndTCP(ntc, targetConn, tc.SpeedLimitMBps)
 
-	case noiseStealthModeUDPForward:
-		if !tc.Enabled || exitMux == nil {
+	case noiseAppCmdUDPForward:
+		if !tc.Enabled {
 			return
 		}
-		_ = sc.SetDeadline(time.Time{})
-		portNum, _ := strconv.Atoi(strings.TrimSpace(hs.TargetPort))
-		if portNum <= 0 {
-			portNum = 2053
+		authorizedPort, err := authorizeWSSTargetPort(tc, strconv.Itoa(int(targetPort)))
+		if err != nil {
+			return
 		}
-		exitMux.serveUDPChannel(sc, uint16(portNum))
+		_, dgram, err := ntc.ReadFrame()
+		if err != nil || len(dgram) == 0 {
+			return
+		}
+		atomic.AddUint64(&appRxBytes, uint64(len(dgram)))
+
+		uConn, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", authorizedPort), 3*time.Second)
+		if err != nil {
+			return
+		}
+		defer uConn.Close()
+		_ = uConn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := uConn.Write(dgram); err != nil {
+			return
+		}
+		rep := make([]byte, noiseMaxPlaintextLen)
+		n, err := uConn.Read(rep)
+		if err == nil && n > 0 {
+			atomic.AddUint64(&appTxBytes, uint64(n))
+			_ = ntc.WriteFrame(noiseFrameTypeData, rep[:n])
+		}
 	}
 }
 
+func pipeNoiseTransportAndTCP(ntc *noiseTransportConn, tcpConn net.Conn, speedLimitMBps string) {
+	mbLimit := parseSpeedLimit(speedLimitMBps)
+	toNoise := newThrottledWriter(ntc, &appTxBytes, mbLimit)
+	toTCP := newThrottledWriter(tcpConn, &appRxBytes, mbLimit)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 16*1024)
+		_, _ = io.CopyBuffer(toNoise, tcpConn, buf)
+		_ = ntc.CloseWrite()
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 16*1024)
+		_, _ = io.CopyBuffer(toTCP, ntc, buf)
+		closeWriteTCP(tcpConn)
+	}()
+
+	wg.Wait()
+}
+
 // ============================================================================
-// 3. ENGINE 1: PROBE & PARITY SYNC
+// 6. ENGINE 1 & ENGINE 2 ENTRY POINTS (probe, parity sync, TCP & UDP forward)
 // ============================================================================
 
 func probeNoiseStealth(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
@@ -809,31 +1567,31 @@ func probeNoiseStealth(peer ServerPeer, tc TunnelConfig, _ string) MethodResult 
 	}
 
 	start := time.Now()
-	sc, err := dialNoiseStealthSession(peer, tc, noiseStealthModeProbe, fmt.Sprintf("probe:%d", tc.ListenPort), 4*time.Second)
+	ntc, err := dialNoiseStealthSession(peer, tc, noiseAppCmdProbe, uint16(tc.ListenPort), 4*time.Second)
 	if err != nil {
 		res.Success = false
-		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "i/o timeout") {
+		msg := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(msg, "timeout"):
 			res.ErrorReason = "Timeout"
-		} else if strings.Contains(err.Error(), "stealth") || strings.Contains(err.Error(), "auth") {
+		case strings.Contains(msg, "auth") || strings.Contains(msg, "static") || strings.Contains(msg, "token"):
 			res.ErrorReason = "Authentication failure"
-		} else {
+		default:
 			res.ErrorReason = "Port unreachable"
 		}
 		return res
 	}
-	defer sc.Close()
+	defer ntc.Close()
 
-	var ping [12]byte
-	var pong [12]byte
-	binary.BigEndian.PutUint32(ping[0:4], 1)
-	binary.BigEndian.PutUint64(ping[4:12], uint64(time.Now().UnixNano()))
-
-	if _, err := sc.Write(ping[:]); err != nil {
+	var ping [16]byte
+	var pong [16]byte
+	_, _ = io.ReadFull(rand.Reader, ping[:])
+	if _, err := ntc.Write(ping[:]); err != nil {
 		res.Success = false
 		res.ErrorReason = "Protocol mismatch"
 		return res
 	}
-	if _, err := io.ReadFull(sc, pong[:]); err != nil || !bytes.Equal(ping[:], pong[:]) {
+	if _, err := io.ReadFull(ntc, pong[:]); err != nil || !bytes.Equal(ping[:], pong[:]) {
 		res.Success = false
 		res.ErrorReason = "Protocol mismatch"
 		return res
@@ -851,31 +1609,39 @@ func probeNoiseStealth(peer ServerPeer, tc TunnelConfig, _ string) MethodResult 
 }
 
 func pushNoiseStealthParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
-	sc, err := dialNoiseStealthSession(peer, tc, noiseStealthModeParitySync, strconv.Itoa(tc.ListenPort), 4*time.Second)
+	ntc, err := dialNoiseStealthSession(peer, tc, noiseAppCmdParitySync, uint16(tc.ListenPort), 4*time.Second)
 	if err != nil {
 		return false
 	}
-	defer sc.Close()
+	defer ntc.Close()
 
 	stateMu.RLock()
 	senderID := appCfg.NodeID
 	role := appCfg.Role
 	certPin := appCfg.CertPin
+	mSignPub := appCfg.MasterSigningPublicKey
+	mNoisePub := appCfg.MasterNoiseStaticPublicKey
+	aSignPub := appCfg.AgentSigningPublicKey
+	aNoisePub := appCfg.AgentNoiseStaticPublicKey
 	stateMu.RUnlock()
 
-	padLen := 32 + randomIntN(128)
+	padLen := 24 + randomIntN(64)
 	padHex, _ := randomHex(padLen)
 
 	pkt := SyncPacket{
-		Type:          "parity_sync",
-		SenderID:      senderID,
-		PeerID:        peer.ID,
-		MethodID:      tc.ID,
-		Port:          tc.ListenPort,
-		LatencyMS:     latencyMS,
-		ConfigVersion: peer.ConfigVersion,
-		CertPin:       certPin,
-		Padding:       padHex,
+		Type:                       "parity_sync",
+		SenderID:                   senderID,
+		PeerID:                     peer.ID,
+		MethodID:                   tc.ID,
+		Port:                       tc.ListenPort,
+		LatencyMS:                  latencyMS,
+		ConfigVersion:              peer.ConfigVersion,
+		CertPin:                    certPin,
+		MasterSigningPublicKey:     mSignPub,
+		MasterNoiseStaticPublicKey: mNoisePub,
+		AgentSigningPublicKey:      aSignPub,
+		AgentNoiseStaticPublicKey:  aNoisePub,
+		Padding:                    padHex,
 	}
 	if role == "master" {
 		now := time.Now()
@@ -892,14 +1658,14 @@ func pushNoiseStealthParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int6
 	}
 	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(rawPkt)))
-	if _, err := sc.Write(lenBuf[:]); err != nil {
+	if _, err := ntc.Write(lenBuf[:]); err != nil {
 		return false
 	}
-	if _, err := sc.Write(rawPkt); err != nil {
+	if _, err := ntc.Write(rawPkt); err != nil {
 		return false
 	}
 
-	if _, err := io.ReadFull(sc, lenBuf[:]); err != nil {
+	if _, err := io.ReadFull(ntc, lenBuf[:]); err != nil {
 		return false
 	}
 	respLen := binary.BigEndian.Uint32(lenBuf[:])
@@ -907,7 +1673,7 @@ func pushNoiseStealthParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int6
 		return false
 	}
 	respBytes := make([]byte, respLen)
-	if _, err := io.ReadFull(sc, respBytes); err != nil {
+	if _, err := io.ReadFull(ntc, respBytes); err != nil {
 		return false
 	}
 	var resp SyncResponse
@@ -919,462 +1685,83 @@ func pushNoiseStealthParitySync(peer ServerPeer, tc TunnelConfig, latencyMS int6
 	return true
 }
 
-func handleNoiseStealthParitySyncServer(sc *noiseStealthConn, effectivePeerID, remoteHost string) {
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(sc, lenBuf[:]); err != nil {
-		return
-	}
-	pktLen := binary.BigEndian.Uint32(lenBuf[:])
-	if pktLen == 0 || pktLen > 256*1024 {
-		return
-	}
-	rawPkt := make([]byte, pktLen)
-	if _, err := io.ReadFull(sc, rawPkt); err != nil {
-		return
-	}
-	var pkt SyncPacket
-	if json.Unmarshal(rawPkt, &pkt) != nil {
-		return
-	}
-
-	resp := processIncomingSync(effectivePeerID, remoteHost, pkt)
-	respBytes, err := json.Marshal(resp)
-	if err != nil {
-		return
-	}
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(respBytes)))
-	_, _ = sc.Write(lenBuf[:])
-	_, _ = sc.Write(respBytes)
-}
-
-// ============================================================================
-// 4. ENGINE 2: BIDIRECTIONAL TCP & UDP FORWARDING
-// ============================================================================
-
 func forwardNoiseStealthTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig, targetPort string) {
 	defer client.Close()
 
-	sc, err := dialNoiseStealthSession(peer, tc, noiseStealthModeTCPForward, targetPort, 5*time.Second)
+	authorizedPort, err := authorizeWSSTargetPort(tc, targetPort)
 	if err != nil {
 		return
 	}
-	defer sc.Close()
+	portNum, _ := strconv.Atoi(authorizedPort)
 
-	var status [1]byte
-	if _, err := io.ReadFull(sc, status[:]); err != nil || status[0] != noiseStealthStatusOK {
-		return
-	}
-	_ = sc.SetDeadline(time.Time{})
-
-	pipeNoiseStealthAndTCP(sc, client, tc.SpeedLimitMBps)
-}
-
-func pipeNoiseStealthAndTCP(sc *noiseStealthConn, tcpConn net.Conn, speedLimitMBps string) {
-	mbLimit := parseSpeedLimit(speedLimitMBps)
-	toStealth := newThrottledWriter(sc, &appTxBytes, mbLimit)
-	toTCP := newThrottledWriter(tcpConn, &appRxBytes, mbLimit)
-
-	done := make(chan struct{}, 2)
-	go func() {
-		buf := make([]byte, 32*1024)
-		_, _ = io.CopyBuffer(toStealth, tcpConn, buf)
-		_ = sc.Close()
-		done <- struct{}{}
-	}()
-	go func() {
-		buf := make([]byte, 32*1024)
-		_, _ = io.CopyBuffer(toTCP, sc, buf)
-		if tc, ok := tcpConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-	<-done
-}
-
-type noiseStealthUDPEntrySession struct {
-	sessionID    uint32
-	clientAddr   *net.UDPAddr
-	entryConn    *net.UDPConn
-	lastActivity atomic.Int64
-}
-
-type noiseStealthUDPEntryManager struct {
-	mu          sync.RWMutex
-	peer        ServerPeer
-	tunnel      TunnelConfig
-	targetPort  uint16
-	byAddr      map[string]*noiseStealthUDPEntrySession
-	bySessionID map[uint32]*noiseStealthUDPEntrySession
-	nextID      atomic.Uint32
-	scMu        sync.Mutex
-	sc          *noiseStealthConn
-	limiter     io.Writer
-	stopCh      chan struct{}
-	closed      atomic.Bool
-}
-
-func newNoiseStealthUDPEntryManager(peer ServerPeer, tc TunnelConfig, targetPort uint16) *noiseStealthUDPEntryManager {
-	m := &noiseStealthUDPEntryManager{
-		peer:        peer,
-		tunnel:      tc,
-		targetPort:  targetPort,
-		byAddr:      make(map[string]*noiseStealthUDPEntrySession),
-		bySessionID: make(map[uint32]*noiseStealthUDPEntrySession),
-		limiter:     newThrottledWriter(io.Discard, &appTxBytes, parseSpeedLimit(tc.SpeedLimitMBps)),
-		stopCh:      make(chan struct{}),
-	}
-	go m.janitorLoop()
-	return m
-}
-
-func (m *noiseStealthUDPEntryManager) janitorLoop() {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-m.stopCh:
-			return
-		case <-ticker.C:
-			cutoff := time.Now().Unix() - int64(noiseStealthUDPIdleTTL.Seconds())
-			m.mu.Lock()
-			for k, s := range m.byAddr {
-				if s.lastActivity.Load() < cutoff {
-					delete(m.byAddr, k)
-					delete(m.bySessionID, s.sessionID)
-				}
-			}
-			m.mu.Unlock()
-		}
-	}
-}
-
-func (m *noiseStealthUDPEntryManager) closeAll() {
-	if m.closed.Swap(true) {
-		return
-	}
-	close(m.stopCh)
-	m.scMu.Lock()
-	if m.sc != nil {
-		_ = m.sc.Close()
-		m.sc = nil
-	}
-	m.scMu.Unlock()
-}
-
-func (m *noiseStealthUDPEntryManager) getOrCreateSession(entryConn *net.UDPConn, clientAddr *net.UDPAddr) *noiseStealthUDPEntrySession {
-	key := clientAddr.String()
-	now := time.Now().Unix()
-
-	m.mu.RLock()
-	if s, ok := m.byAddr[key]; ok {
-		s.lastActivity.Store(now)
-		m.mu.RUnlock()
-		return s
-	}
-	m.mu.RUnlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, ok := m.byAddr[key]; ok {
-		s.lastActivity.Store(now)
-		return s
-	}
-	sid := m.nextID.Add(1)
-	if sid == 0 {
-		sid = m.nextID.Add(1)
-	}
-	addrCopy := &net.UDPAddr{
-		IP:   append([]byte(nil), clientAddr.IP...),
-		Port: clientAddr.Port,
-		Zone: clientAddr.Zone,
-	}
-	s := &noiseStealthUDPEntrySession{
-		sessionID:  sid,
-		clientAddr: addrCopy,
-		entryConn:  entryConn,
-	}
-	s.lastActivity.Store(now)
-	m.byAddr[key] = s
-	m.bySessionID[sid] = s
-	return s
-}
-
-func (m *noiseStealthUDPEntryManager) getOrOpenChannel() (*noiseStealthConn, error) {
-	m.scMu.Lock()
-	defer m.scMu.Unlock()
-
-	if m.sc != nil {
-		return m.sc, nil
-	}
-	sc, err := dialNoiseStealthSession(m.peer, m.tunnel, noiseStealthModeUDPForward, strconv.Itoa(int(m.targetPort)), 5*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	_ = sc.SetDeadline(time.Time{})
-	m.sc = sc
-	go m.readRepliesLoop(sc)
-	return sc, nil
-}
-
-func (m *noiseStealthUDPEntryManager) readRepliesLoop(sc *noiseStealthConn) {
-	defer func() {
-		_ = sc.Close()
-		m.scMu.Lock()
-		if m.sc == sc {
-			m.sc = nil
-		}
-		m.scMu.Unlock()
-	}()
-
-	var hdr [8]byte
-	for {
-		if _, err := io.ReadFull(sc, hdr[:]); err != nil {
-			return
-		}
-		sid := binary.BigEndian.Uint32(hdr[0:4])
-		pktLen := int(binary.BigEndian.Uint16(hdr[6:8]))
-		if pktLen <= 0 || pktLen > 65507 {
-			return
-		}
-		payload := make([]byte, pktLen)
-		if _, err := io.ReadFull(sc, payload); err != nil {
-			return
-		}
-		m.mu.RLock()
-		sess, ok := m.bySessionID[sid]
-		m.mu.RUnlock()
-		if ok {
-			sess.lastActivity.Store(time.Now().Unix())
-			atomic.AddUint64(&appRxBytes, uint64(len(payload)))
-			_, _ = sess.entryConn.WriteToUDP(payload, sess.clientAddr)
-		}
-	}
-}
-
-func (m *noiseStealthUDPEntryManager) handleClientPacket(entryConn *net.UDPConn, clientAddr *net.UDPAddr, payload []byte) {
-	if len(payload) == 0 || len(payload) > 16384 {
-		return
-	}
-	sess := m.getOrCreateSession(entryConn, clientAddr)
-	sc, err := m.getOrOpenChannel()
+	ntc, err := dialNoiseStealthSession(peer, tc, noiseAppCmdTCPForward, uint16(portNum), 5*time.Second)
 	if err != nil {
 		return
 	}
-	_, _ = m.limiter.Write(payload)
+	defer ntc.Close()
+	_ = ntc.raw.SetDeadline(time.Time{})
 
-	frame := make([]byte, 8+len(payload))
-	binary.BigEndian.PutUint32(frame[0:4], sess.sessionID)
-	binary.BigEndian.PutUint16(frame[4:6], m.targetPort)
-	binary.BigEndian.PutUint16(frame[6:8], uint16(len(payload)))
-	copy(frame[8:], payload)
-
-	if _, err := sc.Write(frame); err != nil {
-		_ = sc.Close()
-	}
-}
-
-type noiseStealthUDPExitSession struct {
-	sessionID    uint32
-	targetPort   uint16
-	localConn    *net.UDPConn
-	lastActivity atomic.Int64
-	closed       atomic.Bool
-}
-
-type noiseStealthUDPExitManager struct {
-	mu       sync.RWMutex
-	sessions map[uint32]*noiseStealthUDPExitSession
-	limiter  io.Writer
-	stopCh   chan struct{}
-	closed   atomic.Bool
-}
-
-func newNoiseStealthUDPExitManager(speedLimitMBps string) *noiseStealthUDPExitManager {
-	m := &noiseStealthUDPExitManager{
-		sessions: make(map[uint32]*noiseStealthUDPExitSession),
-		limiter:  newThrottledWriter(io.Discard, &appTxBytes, parseSpeedLimit(speedLimitMBps)),
-		stopCh:   make(chan struct{}),
-	}
-	go m.janitorLoop()
-	return m
-}
-
-func (m *noiseStealthUDPExitManager) janitorLoop() {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-m.stopCh:
-			return
-		case <-ticker.C:
-			cutoff := time.Now().Unix() - int64(noiseStealthUDPIdleTTL.Seconds())
-			m.mu.Lock()
-			for sid, s := range m.sessions {
-				if s.lastActivity.Load() < cutoff {
-					if s.closed.CompareAndSwap(false, true) {
-						_ = s.localConn.Close()
-					}
-					delete(m.sessions, sid)
-				}
-			}
-			m.mu.Unlock()
-		}
-	}
-}
-
-func (m *noiseStealthUDPExitManager) closeAll() {
-	if m.closed.Swap(true) {
-		return
-	}
-	close(m.stopCh)
-	m.mu.Lock()
-	for sid, s := range m.sessions {
-		if s.closed.CompareAndSwap(false, true) {
-			_ = s.localConn.Close()
-		}
-		delete(m.sessions, sid)
-	}
-	m.mu.Unlock()
-}
-
-func (m *noiseStealthUDPExitManager) serveUDPChannel(sc *noiseStealthConn, defaultPort uint16) {
-	defer sc.Close()
-	var hdr [8]byte
-	for {
-		if _, err := io.ReadFull(sc, hdr[:]); err != nil {
-			return
-		}
-		sid := binary.BigEndian.Uint32(hdr[0:4])
-		tPort := binary.BigEndian.Uint16(hdr[4:6])
-		pktLen := int(binary.BigEndian.Uint16(hdr[6:8]))
-		if pktLen <= 0 || pktLen > 65507 {
-			return
-		}
-		if tPort == 0 {
-			tPort = defaultPort
-		}
-		payload := make([]byte, pktLen)
-		if _, err := io.ReadFull(sc, payload); err != nil {
-			return
-		}
-
-		sess, err := m.getOrCreateExitSession(sc, sid, tPort)
-		if err != nil {
-			continue
-		}
-		sess.lastActivity.Store(time.Now().Unix())
-		atomic.AddUint64(&appRxBytes, uint64(len(payload)))
-		_, _ = sess.localConn.Write(payload)
-	}
-}
-
-func (m *noiseStealthUDPExitManager) getOrCreateExitSession(
-	sc *noiseStealthConn,
-	sid uint32,
-	targetPort uint16,
-) (*noiseStealthUDPExitSession, error) {
-	now := time.Now().Unix()
-	m.mu.RLock()
-	if s, ok := m.sessions[sid]; ok && !s.closed.Load() {
-		s.lastActivity.Store(now)
-		m.mu.RUnlock()
-		return s, nil
-	}
-	m.mu.RUnlock()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if s, ok := m.sessions[sid]; ok && !s.closed.Load() {
-		s.lastActivity.Store(now)
-		return s, nil
-	}
-	dstAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(targetPort)}
-	localUDP, err := net.DialUDP("udp", nil, dstAddr)
-	if err != nil {
-		return nil, err
-	}
-	s := &noiseStealthUDPExitSession{
-		sessionID:  sid,
-		targetPort: targetPort,
-		localConn:  localUDP,
-	}
-	s.lastActivity.Store(now)
-	m.sessions[sid] = s
-
-	go func(sess *noiseStealthUDPExitSession) {
-		defer func() {
-			if sess.closed.CompareAndSwap(false, true) {
-				_ = sess.localConn.Close()
-			}
-			m.mu.Lock()
-			if cur, ok := m.sessions[sess.sessionID]; ok && cur == sess {
-				delete(m.sessions, sess.sessionID)
-			}
-			m.mu.Unlock()
-		}()
-		buf := make([]byte, 16384)
-		for {
-			_ = sess.localConn.SetReadDeadline(time.Now().Add(noiseStealthUDPIdleTTL))
-			n, err := sess.localConn.Read(buf)
-			if err != nil {
-				return
-			}
-			if n > 0 {
-				sess.lastActivity.Store(time.Now().Unix())
-				_, _ = m.limiter.Write(buf[:n])
-				frame := make([]byte, 8+n)
-				binary.BigEndian.PutUint32(frame[0:4], sess.sessionID)
-				binary.BigEndian.PutUint16(frame[4:6], sess.targetPort)
-				binary.BigEndian.PutUint16(frame[6:8], uint16(n))
-				copy(frame[8:], buf[:n])
-				if _, wErr := sc.Write(frame); wErr != nil {
-					return
-				}
-			}
-		}
-	}(s)
-
-	return s, nil
+	pipeNoiseTransportAndTCP(ntc, client, tc.SpeedLimitMBps)
 }
 
 func startNoiseStealthUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetPort string) net.PacketConn {
-	portNum, err := strconv.Atoi(strings.TrimSpace(targetPort))
-	if err != nil || portNum < 1 || portNum > 65535 {
-		return nil
-	}
-	udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort("0.0.0.0", strconv.Itoa(portNum)))
+	authorizedPort, err := authorizeWSSTargetPort(tc, targetPort)
 	if err != nil {
 		return nil
 	}
-	entryConn, err := net.ListenUDP("udp", udpAddr)
+	portNum, _ := strconv.Atoi(authorizedPort)
+
+	uAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort("0.0.0.0", strconv.Itoa(portNum)))
 	if err != nil {
 		return nil
 	}
+	entryConn, err := net.ListenUDP("udp", uAddr)
+	if err != nil {
+		return nil
+	}
+	configureUDPSocketBuffers(entryConn)
 
 	muxKey := fmt.Sprintf("%s|%d", peer.ID, portNum)
 	noiseStealthMu.Lock()
-	if old, ok := noiseStealthEntryUDPMux[muxKey]; ok {
-		old.closeAll()
+	if old, ok := noiseStealthUDPEntryByKey[muxKey]; ok {
+		_ = old.Close()
 	}
-	mgr := newNoiseStealthUDPEntryManager(peer, tc, uint16(portNum))
-	noiseStealthEntryUDPMux[muxKey] = mgr
+	noiseStealthUDPEntryByKey[muxKey] = entryConn
 	noiseStealthMu.Unlock()
 
 	go func() {
-		defer mgr.closeAll()
-		buf := make([]byte, 16384)
+		buf := make([]byte, noiseMaxPlaintextLen)
 		for {
-			n, clientAddr, err := entryConn.ReadFromUDP(buf)
-			if err != nil {
+			n, cliAddr, rErr := entryConn.ReadFromUDP(buf)
+			if rErr != nil {
 				return
 			}
-			if n > 0 {
-				pkt := make([]byte, n)
-				copy(pkt, buf[:n])
-				mgr.handleClientPacket(entryConn, clientAddr, pkt)
+			if n <= 0 {
+				continue
 			}
+			payload := make([]byte, n)
+			copy(payload, buf[:n])
+			cliCopy := cloneUDPAddr(cliAddr)
+
+			go func(dgram []byte, cAddr *net.UDPAddr) {
+				ntc, dErr := dialNoiseStealthSession(peer, tc, noiseAppCmdUDPForward, uint16(portNum), 4*time.Second)
+				if dErr != nil {
+					return
+				}
+				defer ntc.Close()
+
+				atomic.AddUint64(&appTxBytes, uint64(len(dgram)))
+				if err := ntc.WriteFrame(noiseFrameTypeData, dgram); err != nil {
+					return
+				}
+				fType, rep, err := ntc.ReadFrame()
+				if err == nil && fType == noiseFrameTypeData && len(rep) > 0 {
+					atomic.AddUint64(&appRxBytes, uint64(len(rep)))
+					_, _ = entryConn.WriteToUDP(rep, cAddr)
+				}
+			}(payload, cliCopy)
 		}
 	}()
+
 	return entryConn
 }
