@@ -191,7 +191,7 @@ func TestGREFRPForwardingFailoverRestorationAndLifecycle(t *testing.T) {
 	tc.GREFRP = normalizeGREFRPConfig(tc.GREFRP, frpCarrierPort, "")
 	tc.GREFRP.FRPServerPort = frpCarrierPort
 	tc.GREFRP.RemotePublicIP = "127.0.0.1"
-	tc.GREFRP.HealthCheckSec = 1
+	tc.GREFRP.HealthCheckSec = 60 // Use manual step evaluation during test to avoid background races
 	tc.GREFRP.FailureThreshold = 2
 	tc.GREFRP.RecoveryThreshold = 2
 	tc.GREFRP.AutoPublicFallback = true
@@ -341,26 +341,16 @@ func TestGREFRPForwardingFailoverRestorationAndLifecycle(t *testing.T) {
 		t.Fatalf("expected active greFRPRuntime")
 	}
 
-	// Point remotePrivIP to an unreachable TEST-NET address while remotePubIP remains reachable (127.0.0.1)
-	rt.remotePrivIP = "192.0.2.254"
-	rt.remotePubIP = "192.0.2.253" // Force evaluateGREHealthStep to use remotePrivIP instead of loopback shortcut
-	// Temporarily set remotePubIP back to 127.0.0.1 for fallback target
-	gfCfg := normalizeGREFRPConfig(rt.tunnel.GREFRP, rt.tunnel.ListenPort, rt.tunnel.ForwardPorts)
+	gfCfg := normalizeGREFRPConfig(tc.GREFRP, tc.ListenPort, tc.ForwardPorts)
 	gfCfg.FailureThreshold = 2
 	gfCfg.RecoveryThreshold = 2
 
-	// Trigger 2 consecutive health checks where GRE target (192.0.2.254) fails and Public IP (127.0.0.1) succeeds
-	rt.remotePubIP = "127.0.0.1"
-	// Make currentTargetHost test 192.0.2.254 by setting remotePrivIP to 127.0.0.254 with no listener on a dead port
-	origPort := rt.tunnel.ListenPort
-	rt.tunnel.ListenPort = 1 // Unbound port to simulate GRE failure
+	// Simulate GRE failure by pointing to an unbound port for 1 check, then restoring port and switching to PUBLIC_FALLBACK
+	origPort := tc.ListenPort
+	rt.setTestEndpoints("127.0.0.1", "127.0.0.1", 1)
 	rt.evaluateGREHealthStep(gfCfg)
-	rt.tunnel.ListenPort = origPort
+	rt.setTestEndpoints("127.0.0.1", "127.0.0.1", origPort)
 
-	// Now test direct failover when GRE private IP fails but public IP succeeds
-	rt.activePath.Store(greFRPPathGRE)
-	rt.consecFail.Store(1) // Already 1 failure
-	// Simulate 2nd failure on GRE followed by public fallback switch
 	rt.activePath.Store(greFRPPathPublic)
 	rt.reconnectCount.Add(1)
 
@@ -384,7 +374,7 @@ func TestGREFRPForwardingFailoverRestorationAndLifecycle(t *testing.T) {
 	_ = fbConn.Close()
 
 	// Restore GRE health and run RecoveryThreshold (2) health checks -> verify automatic restoration to GRE
-	rt.remotePrivIP = "127.0.0.1"
+	rt.setTestEndpoints("127.0.0.1", "127.0.0.1", origPort)
 	rt.evaluateGREHealthStep(gfCfg)
 	rt.evaluateGREHealthStep(gfCfg)
 
