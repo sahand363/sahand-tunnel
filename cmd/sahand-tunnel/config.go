@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"crypto/ecdh"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
@@ -12,6 +15,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -27,26 +31,43 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
+)
+
+const (
+	tokenVersionV2   = 2
+	tokenPrefixV2    = "st2."
+	maxTokenWireSize = 4096
 )
 
 type Config struct {
-	Role              string       `json:"role"`
-	NodeID            string       `json:"node_id"`
-	ListenAddr        string       `json:"listen_addr"`
-	PanelURL          string       `json:"panel_url,omitempty"`
-	PanelPort         int          `json:"panel_port"`
-	AdminUsername     string       `json:"admin_username"`
-	AdminSalt         string       `json:"admin_salt"`
-	AdminHash         string       `json:"admin_hash"`
-	TokenSecret       string       `json:"token_secret,omitempty"`
-	TLSCertPEM        string       `json:"tls_cert_pem,omitempty"`
-	TLSKeyPEM         string       `json:"tls_key_pem,omitempty"`
-	CertPin           string       `json:"cert_pin,omitempty"`
-	MasterTZName      string       `json:"master_tz_name,omitempty"`
-	MasterTZOffsetSec int          `json:"master_tz_offset_sec,omitempty"`
-	MasterClockDelta  int64        `json:"master_clock_delta,omitempty"`
-	Servers           []ServerPeer `json:"servers,omitempty"`
-	CreatedAt         time.Time    `json:"created_at"`
+	Role                          string       `json:"role"`
+	NodeID                        string       `json:"node_id"`
+	ListenAddr                    string       `json:"listen_addr"`
+	PanelURL                      string       `json:"panel_url,omitempty"`
+	PanelPort                     int          `json:"panel_port"`
+	AdminUsername                 string       `json:"admin_username"`
+	AdminSalt                     string       `json:"admin_salt"`
+	AdminHash                     string       `json:"admin_hash"`
+	TokenSecret                   string       `json:"token_secret,omitempty"`
+	MasterSigningPrivateKey       string       `json:"master_signing_private_key,omitempty"`
+	MasterSigningPublicKey        string       `json:"master_signing_public_key,omitempty"`
+	MasterNoiseStaticPrivateKey   string       `json:"master_noise_static_private_key,omitempty"`
+	MasterNoiseStaticPublicKey    string       `json:"master_noise_static_public_key,omitempty"`
+	AgentSigningPrivateKey        string       `json:"agent_signing_private_key,omitempty"`
+	AgentSigningPublicKey         string       `json:"agent_signing_public_key,omitempty"`
+	AgentNoiseStaticPrivateKey    string       `json:"agent_noise_static_private_key,omitempty"`
+	AgentNoiseStaticPublicKey     string       `json:"agent_noise_static_public_key,omitempty"`
+	TrustedMasterSigningPublicKey string       `json:"trusted_master_signing_public_key,omitempty"`
+	TLSCertPEM                    string       `json:"tls_cert_pem,omitempty"`
+	TLSKeyPEM                     string       `json:"tls_key_pem,omitempty"`
+	CertPin                       string       `json:"cert_pin,omitempty"`
+	MasterTZName                  string       `json:"master_tz_name,omitempty"`
+	MasterTZOffsetSec             int          `json:"master_tz_offset_sec,omitempty"`
+	MasterClockDelta              int64        `json:"master_clock_delta,omitempty"`
+	Servers                       []ServerPeer `json:"servers,omitempty"`
+	CreatedAt                     time.Time    `json:"created_at"`
 }
 
 type MethodCatalogueItem struct {
@@ -95,20 +116,20 @@ type GREFRPForwardRule struct {
 }
 
 type GREFRPDiagnostics struct {
-	EngineName          string   `json:"engine_name"`
-	GREInterfaceStatus  string   `json:"gre_interface_status"`
-	GREPrivatePingOK    bool     `json:"gre_private_ping_ok"`
-	GREPacketLossPct    int      `json:"gre_packet_loss_pct"`
-	GRERoundTripMS      int64    `json:"gre_rtt_ms"`
-	FRPSServiceStatus   string   `json:"frps_service_status"`
-	FRPCServiceStatus   string   `json:"frpc_service_status"`
-	ActivePath          string   `json:"active_path"` // "GRE" or "PUBLIC_FALLBACK"
-	PortForwardStatus   string   `json:"port_forward_status"`
-	ServiceUptime       string   `json:"service_uptime"`
-	ReconnectCount      int      `json:"reconnect_count"`
-	LastFailureReason   string   `json:"last_failure_reason,omitempty"`
-	LastRecoveryAt      string   `json:"last_recovery_at,omitempty"`
-	RecentLogs          []string `json:"recent_logs,omitempty"`
+	EngineName         string   `json:"engine_name"`
+	GREInterfaceStatus string   `json:"gre_interface_status"`
+	GREPrivatePingOK   bool     `json:"gre_private_ping_ok"`
+	GREPacketLossPct   int      `json:"gre_packet_loss_pct"`
+	GRERoundTripMS     int64    `json:"gre_rtt_ms"`
+	FRPSServiceStatus  string   `json:"frps_service_status"`
+	FRPCServiceStatus  string   `json:"frpc_service_status"`
+	ActivePath         string   `json:"active_path"` // "GRE" or "PUBLIC_FALLBACK"
+	PortForwardStatus  string   `json:"port_forward_status"`
+	ServiceUptime      string   `json:"service_uptime"`
+	ReconnectCount     int      `json:"reconnect_count"`
+	LastFailureReason  string   `json:"last_failure_reason,omitempty"`
+	LastRecoveryAt     string   `json:"last_recovery_at,omitempty"`
+	RecentLogs         []string `json:"recent_logs,omitempty"`
 }
 
 type GREFRPConfig struct {
@@ -126,9 +147,9 @@ type GREFRPConfig struct {
 	RecoveryThreshold  int                 `json:"recovery_threshold"`  // default 2
 	AutoPublicFallback bool                `json:"auto_public_fallback"`
 	AutoRestoreGRE     bool                `json:"auto_restore_gre"`
-	FRPVersion         string              `json:"frp_version"`         // "0.61.1"
-	FRPTransport       string              `json:"frp_transport"`       // "tcp", "kcp", "quic", "websocket", "wss"
-	FRPServerPort      int                 `json:"frp_server_port"`     // default 28025
+	FRPVersion         string              `json:"frp_version"`     // "0.61.1"
+	FRPTransport       string              `json:"frp_transport"`   // "tcp", "kcp", "quic", "websocket", "wss"
+	FRPServerPort      int                 `json:"frp_server_port"` // default 28025
 	FRPAuthToken       string              `json:"frp_auth_token"`
 	FRPEncryption      bool                `json:"frp_encryption"`
 	FRPCompression     bool                `json:"frp_compression"`
@@ -159,69 +180,86 @@ type TunnelConfig struct {
 }
 
 type ServerPeer struct {
-	ID              string          `json:"id"`
-	Name            string          `json:"name"`
-	IP              string          `json:"ip"`
-	Token           string          `json:"token"`
-	TokenRevoked    bool            `json:"token_revoked,omitempty"`
-	ConfigVersion   int             `json:"config_version"`
-	SyncState       string          `json:"sync_state"`
-	Status          string          `json:"status"`
-	Running         bool            `json:"running"`
-	ActiveMethodID  int             `json:"active_method_id"`
-	ActiveMethod    string          `json:"active_method"`
-	ActivePort      int             `json:"active_port"`
-	ActiveSecurity  int             `json:"active_security"`
-	ActiveLatencyMS int64           `json:"active_latency_ms"`
-	ActiveDirection string          `json:"active_direction,omitempty"`
-	ActiveInitiator string          `json:"active_initiator,omitempty"`
-	LastInboundAt   int64           `json:"last_inbound_at,omitempty"`
-	NextRetryAt     string          `json:"next_retry_at,omitempty"`
-	RemoteCertPin   string          `json:"remote_cert_pin,omitempty"`
-	RecentLifelines []LifelineEvent `json:"recent_lifelines"`
-	Tunnels         []TunnelConfig  `json:"tunnels"`
+	ID                         string          `json:"id"`
+	Name                       string          `json:"name"`
+	IP                         string          `json:"ip"`
+	Token                      string          `json:"token"`
+	TokenRevoked               bool            `json:"token_revoked,omitempty"`
+	PeerSecret                 string          `json:"peer_secret,omitempty"`
+	MasterSigningPublicKey     string          `json:"master_signing_public_key,omitempty"`
+	MasterNoiseStaticPublicKey string          `json:"master_noise_static_public_key,omitempty"`
+	AgentSigningPublicKey      string          `json:"agent_signing_public_key,omitempty"`
+	AgentNoiseStaticPublicKey  string          `json:"agent_noise_static_public_key,omitempty"`
+	TrustedFingerprint         string          `json:"trusted_fingerprint,omitempty"`
+	ConfigVersion              int             `json:"config_version"`
+	SyncState                  string          `json:"sync_state"`
+	Status                     string          `json:"status"`
+	Running                    bool            `json:"running"`
+	ActiveMethodID             int             `json:"active_method_id"`
+	ActiveMethod               string          `json:"active_method"`
+	ActivePort                 int             `json:"active_port"`
+	ActiveSecurity             int             `json:"active_security"`
+	ActiveLatencyMS            int64           `json:"active_latency_ms"`
+	ActiveDirection            string          `json:"active_direction,omitempty"`
+	ActiveInitiator            string          `json:"active_initiator,omitempty"`
+	LastInboundAt              int64           `json:"last_inbound_at,omitempty"`
+	NextRetryAt                string          `json:"next_retry_at,omitempty"`
+	RemoteCertPin              string          `json:"remote_cert_pin,omitempty"`
+	RecentLifelines            []LifelineEvent `json:"recent_lifelines"`
+	Tunnels                    []TunnelConfig  `json:"tunnels"`
 }
 
 type TokenPayload struct {
-	V      int    `json:"v"`
-	MID    string `json:"mid"`
-	AID    string `json:"aid"`
-	MIP    string `json:"mip,omitempty"`
-	Pin    string `json:"pin,omitempty"`
-	TS     int64  `json:"ts"`
-	Exp    int64  `json:"exp"`
-	TZName string `json:"tzn,omitempty"`
-	TZOff  int    `json:"tzo,omitempty"`
-	Ports  []int  `json:"ports"`
-	Key    string `json:"key"`
-	Sig    string `json:"sig"`
+	V                          int    `json:"v"`
+	CV                         int    `json:"cv"`
+	MID                        string `json:"mid"`
+	AID                        string `json:"aid"`
+	MIP                        string `json:"mip,omitempty"`
+	Pin                        string `json:"pin,omitempty"`
+	MasterSigningPublicKey     string `json:"master_signing_public_key"`
+	MasterNoiseStaticPublicKey string `json:"master_noise_static_public_key"`
+	TS                         int64  `json:"ts"`
+	Exp                        int64  `json:"exp"`
+	TZName                     string `json:"tzn,omitempty"`
+	TZOff                      int    `json:"tzo,omitempty"`
+	Ports                      []int  `json:"ports"`
+	Key                        string `json:"key"`
+	Sig                        string `json:"sig"`
 }
 
 type SyncPacket struct {
-	Type          string         `json:"type"`
-	SenderID      string         `json:"sender_id"`
-	PeerID        string         `json:"peer_id"`
-	MethodID      int            `json:"method_id"`
-	Port          int            `json:"port"`
-	LatencyMS     int64          `json:"latency_ms"`
-	ConfigVersion int            `json:"config_version"`
-	MasterUnix    int64          `json:"m_unix,omitempty"`
-	MasterTZName  string         `json:"m_tzn,omitempty"`
-	MasterTZOff   int            `json:"m_tzo,omitempty"`
-	Tunnels       []TunnelConfig `json:"tunnels,omitempty"`
-	CertPin       string         `json:"cert_pin,omitempty"`
-	Padding       string         `json:"pad,omitempty"`
+	Type                       string         `json:"type"`
+	SenderID                   string         `json:"sender_id"`
+	PeerID                     string         `json:"peer_id"`
+	MethodID                   int            `json:"method_id"`
+	Port                       int            `json:"port"`
+	LatencyMS                  int64          `json:"latency_ms"`
+	ConfigVersion              int            `json:"config_version"`
+	MasterUnix                 int64          `json:"m_unix,omitempty"`
+	MasterTZName               string         `json:"m_tzn,omitempty"`
+	MasterTZOff                int            `json:"m_tzo,omitempty"`
+	Tunnels                    []TunnelConfig `json:"tunnels,omitempty"`
+	CertPin                    string         `json:"cert_pin,omitempty"`
+	MasterSigningPublicKey     string         `json:"master_signing_public_key,omitempty"`
+	MasterNoiseStaticPublicKey string         `json:"master_noise_static_public_key,omitempty"`
+	AgentSigningPublicKey      string         `json:"agent_signing_public_key,omitempty"`
+	AgentNoiseStaticPublicKey  string         `json:"agent_noise_static_public_key,omitempty"`
+	Padding                    string         `json:"pad,omitempty"`
 }
 
 type SyncResponse struct {
-	OK            bool           `json:"ok"`
-	NodeID        string         `json:"node_id"`
-	ConfigVersion int            `json:"config_version"`
-	MasterUnix    int64          `json:"m_unix,omitempty"`
-	MasterTZName  string         `json:"m_tzn,omitempty"`
-	MasterTZOff   int            `json:"m_tzo,omitempty"`
-	Tunnels       []TunnelConfig `json:"tunnels,omitempty"`
-	CertPin       string         `json:"cert_pin,omitempty"`
+	OK                         bool           `json:"ok"`
+	NodeID                     string         `json:"node_id"`
+	ConfigVersion              int            `json:"config_version"`
+	MasterUnix                 int64          `json:"m_unix,omitempty"`
+	MasterTZName               string         `json:"m_tzn,omitempty"`
+	MasterTZOff                int            `json:"m_tzo,omitempty"`
+	Tunnels                    []TunnelConfig `json:"tunnels,omitempty"`
+	CertPin                    string         `json:"cert_pin,omitempty"`
+	MasterSigningPublicKey     string         `json:"master_signing_public_key,omitempty"`
+	MasterNoiseStaticPublicKey string         `json:"master_noise_static_public_key,omitempty"`
+	AgentSigningPublicKey      string         `json:"agent_signing_public_key,omitempty"`
+	AgentNoiseStaticPublicKey  string         `json:"agent_noise_static_public_key,omitempty"`
 }
 
 type DailyUsage struct {
@@ -237,11 +275,16 @@ type AnalyticsStore struct {
 }
 
 type NodeInfo struct {
-	AppVersion string `json:"app_version"`
-	Role       string `json:"role"`
-	NodeID     string `json:"node_id"`
-	Status     string `json:"status"`
-	PanelURL   string `json:"panel_url"`
+	AppVersion                  string `json:"app_version"`
+	Role                        string `json:"role"`
+	NodeID                      string `json:"node_id"`
+	Status                      string `json:"status"`
+	PanelURL                    string `json:"panel_url"`
+	MasterSigningPublicKey      string `json:"master_signing_public_key,omitempty"`
+	MasterNoiseStaticPublicKey  string `json:"master_noise_static_public_key,omitempty"`
+	MasterSigningKeyFingerprint string `json:"master_signing_key_fingerprint,omitempty"`
+	AgentSigningPublicKey       string `json:"agent_signing_public_key,omitempty"`
+	AgentNoiseStaticPublicKey   string `json:"agent_noise_static_public_key,omitempty"`
 }
 
 type Session struct {
@@ -513,6 +556,166 @@ func generateSelfSignedCert() (string, string, string, error) {
 	return string(certPEM), string(keyPEM), pin, nil
 }
 
+// ============================================================================
+// STAGE 1: INDEPENDENT KEYPAIR GENERATION, FINGERPRINTS & STRICT JSON VALIDATION
+// ============================================================================
+
+func generateEd25519KeypairHex() (privHex string, pubHex string, err error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	return hex.EncodeToString(priv), hex.EncodeToString(pub), nil
+}
+
+func validateEd25519KeypairHex(privHex, pubHex string) bool {
+	privBytes, err1 := hex.DecodeString(strings.TrimSpace(privHex))
+	pubBytes, err2 := hex.DecodeString(strings.TrimSpace(pubHex))
+	if err1 != nil || err2 != nil || len(privBytes) != ed25519.PrivateKeySize || len(pubBytes) != ed25519.PublicKeySize {
+		return false
+	}
+	derivedPub := ed25519.PrivateKey(privBytes).Public().(ed25519.PublicKey)
+	return subtle.ConstantTimeCompare(derivedPub, pubBytes) == 1
+}
+
+func generateX25519KeypairHex() (privHex string, pubHex string, err error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	return hex.EncodeToString(priv.Bytes()), hex.EncodeToString(priv.PublicKey().Bytes()), nil
+}
+
+func validateX25519KeypairHex(privHex, pubHex string) bool {
+	privBytes, err1 := hex.DecodeString(strings.TrimSpace(privHex))
+	pubBytes, err2 := hex.DecodeString(strings.TrimSpace(pubHex))
+	if err1 != nil || err2 != nil || len(privBytes) != 32 || len(pubBytes) != 32 {
+		return false
+	}
+	privKey, err := ecdh.X25519().NewPrivateKey(privBytes)
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(privKey.PublicKey().Bytes(), pubBytes) == 1
+}
+
+func decodeHexExact(raw string, expectedBytes int) ([]byte, error) {
+	clean := strings.ToLower(strings.TrimSpace(raw))
+	if len(clean) != expectedBytes*2 {
+		return nil, fmt.Errorf("expected %d hex characters, got %d", expectedBytes*2, len(clean))
+	}
+	out, err := hex.DecodeString(clean)
+	if err != nil || len(out) != expectedBytes {
+		return nil, fmt.Errorf("invalid hex encoding: %w", err)
+	}
+	return out, nil
+}
+
+// Computes the full 32-byte SHA-256 fingerprint (64 lowercase hex chars) of an Ed25519 public key.
+func ComputeSigningKeyFingerprint(pubKeyHex string) (string, error) {
+	pubBytes, err := decodeHexExact(pubKeyHex, ed25519.PublicKeySize)
+	if err != nil {
+		return "", fmt.Errorf("invalid signing public key: %w", err)
+	}
+	sum := sha256.Sum256(pubBytes)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func normalizeFingerprintHex(raw string) (string, error) {
+	clean := strings.ToLower(strings.TrimSpace(raw))
+	clean = strings.TrimPrefix(clean, "sha256:")
+	clean = strings.ReplaceAll(clean, ":", "")
+	clean = strings.ReplaceAll(clean, "-", "")
+	clean = strings.ReplaceAll(clean, " ", "")
+	if len(clean) != sha256.Size*2 {
+		return "", fmt.Errorf("invalid fingerprint length (expected 64 hex characters / 32-byte SHA-256 digest)")
+	}
+	if _, err := hex.DecodeString(clean); err != nil {
+		return "", fmt.Errorf("invalid fingerprint hex format: %w", err)
+	}
+	return clean, nil
+}
+
+// Recursively scans a JSON token stream to reject duplicate keys at any object depth.
+func checkNoDuplicateJSONKeys(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			keyStr, ok := keyTok.(string)
+			if !ok {
+				return errors.New("expected string key in JSON object")
+			}
+			if _, dup := seen[keyStr]; dup {
+				return fmt.Errorf("duplicate JSON key %q is not allowed", keyStr)
+			}
+			seen[keyStr] = struct{}{}
+			if err := checkNoDuplicateJSONKeys(dec); err != nil {
+				return err
+			}
+		}
+		endTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if endTok != json.Delim('}') {
+			return errors.New("malformed JSON object closing delimiter")
+		}
+	case '[':
+		for dec.More() {
+			if err := checkNoDuplicateJSONKeys(dec); err != nil {
+				return err
+			}
+		}
+		endTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if endTok != json.Delim(']') {
+			return errors.New("malformed JSON array closing delimiter")
+		}
+	}
+	return nil
+}
+
+// Strict JSON unmarshaler:
+// 1. Rejects duplicate object keys at any nesting level.
+// 2. Rejects unknown struct fields via DisallowUnknownFields().
+// 3. Uses a second Decode call and requires io.EOF to reject trailing tokens or garbage bytes.
+func unmarshalStrictJSON(data []byte, dst any) error {
+	dupScanner := json.NewDecoder(bytes.NewReader(data))
+	if err := checkNoDuplicateJSONKeys(dupScanner); err != nil {
+		return err
+	}
+	var extraCheck any
+	if err := dupScanner.Decode(&extraCheck); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected trailing data after JSON document")
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("unexpected trailing data after JSON document")
+	}
+	return nil
+}
+
 func defaultGREFRPConfig(listenPort int, forwardPorts string) *GREFRPConfig {
 	if listenPort <= 0 {
 		listenPort = 28025
@@ -693,10 +896,17 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 
 func loadExistingConfig(path string) (Config, bool, error) {
 	var cfg Config
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	info, statErr := os.Stat(path)
+	if errors.Is(statErr, os.ErrNotExist) {
 		return cfg, false, nil
 	}
+	if statErr != nil {
+		return cfg, false, statErr
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		_ = os.Chmod(path, 0600)
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, false, err
 	}
@@ -713,13 +923,33 @@ func saveConfig(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
+	}
+	if existing, err := os.ReadFile(path); err == nil && len(existing) > 0 {
+		_ = os.WriteFile(path+".bak", existing, 0600)
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
 		return err
 	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = os.Chmod(tmp, 0600)
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return err
@@ -737,6 +967,48 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 		cfg.TokenSecret = sec
 		changed = true
 	}
+
+	// Generate independent random keypairs per role; private keys stay exclusively on this device.
+	if cfg.Role != "agent" {
+		if !validateEd25519KeypairHex(cfg.MasterSigningPrivateKey, cfg.MasterSigningPublicKey) {
+			privHex, pubHex, err := generateEd25519KeypairHex()
+			if err != nil {
+				return false, err
+			}
+			cfg.MasterSigningPrivateKey = privHex
+			cfg.MasterSigningPublicKey = pubHex
+			changed = true
+		}
+		if !validateX25519KeypairHex(cfg.MasterNoiseStaticPrivateKey, cfg.MasterNoiseStaticPublicKey) {
+			privHex, pubHex, err := generateX25519KeypairHex()
+			if err != nil {
+				return false, err
+			}
+			cfg.MasterNoiseStaticPrivateKey = privHex
+			cfg.MasterNoiseStaticPublicKey = pubHex
+			changed = true
+		}
+	}
+
+	if !validateEd25519KeypairHex(cfg.AgentSigningPrivateKey, cfg.AgentSigningPublicKey) {
+		privHex, pubHex, err := generateEd25519KeypairHex()
+		if err != nil {
+			return false, err
+		}
+		cfg.AgentSigningPrivateKey = privHex
+		cfg.AgentSigningPublicKey = pubHex
+		changed = true
+	}
+	if !validateX25519KeypairHex(cfg.AgentNoiseStaticPrivateKey, cfg.AgentNoiseStaticPublicKey) {
+		privHex, pubHex, err := generateX25519KeypairHex()
+		if err != nil {
+			return false, err
+		}
+		cfg.AgentNoiseStaticPrivateKey = privHex
+		cfg.AgentNoiseStaticPublicKey = pubHex
+		changed = true
+	}
+
 	if cfg.TLSCertPEM == "" || cfg.TLSKeyPEM == "" || cfg.CertPin == "" {
 		cPEM, kPEM, pin, err := generateSelfSignedCert()
 		if err != nil {
@@ -763,23 +1035,57 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 		}
 	}
 	localCert = cert
+
 	for i := range cfg.Servers {
-		cfg.Servers[i].Tunnels = normalizeTunnels(cfg.Servers[i].Tunnels)
-		if cfg.Servers[i].ConfigVersion <= 0 {
-			cfg.Servers[i].ConfigVersion = 1
+		srv := &cfg.Servers[i]
+		srv.Tunnels = normalizeTunnels(srv.Tunnels)
+		if srv.ConfigVersion <= 0 {
+			srv.ConfigVersion = 1
 		}
-		if cfg.Servers[i].Status == "" {
-			cfg.Servers[i].Status = "WAITING"
+		if srv.Status == "" {
+			srv.Status = "WAITING"
 		}
-		if cfg.Servers[i].SyncState == "" {
-			cfg.Servers[i].SyncState = "synced"
+		if srv.SyncState == "" {
+			srv.SyncState = "synced"
 		}
-		if cfg.Servers[i].RecentLifelines == nil {
-			cfg.Servers[i].RecentLifelines = []LifelineEvent{}
+		if srv.RecentLifelines == nil {
+			srv.RecentLifelines = []LifelineEvent{}
 		}
 		if cfg.Role == "master" {
-			if tok, err := generatePeerToken(*cfg, cfg.Servers[i]); err == nil && tok != cfg.Servers[i].Token {
-				cfg.Servers[i].Token = tok
+			if _, err := decodeHexExact(srv.PeerSecret, 32); err != nil {
+				sec, sErr := randomHex(32)
+				if sErr != nil {
+					return false, sErr
+				}
+				srv.PeerSecret = sec
+				changed = true
+			}
+			if srv.MasterSigningPublicKey != cfg.MasterSigningPublicKey {
+				srv.MasterSigningPublicKey = cfg.MasterSigningPublicKey
+				changed = true
+			}
+			if srv.MasterNoiseStaticPublicKey != cfg.MasterNoiseStaticPublicKey {
+				srv.MasterNoiseStaticPublicKey = cfg.MasterNoiseStaticPublicKey
+				changed = true
+			}
+			if tok, err := generatePeerToken(*cfg, *srv); err == nil && tok != srv.Token {
+				srv.Token = tok
+				changed = true
+			}
+		} else if cfg.Role == "agent" {
+			if srv.AgentSigningPublicKey != cfg.AgentSigningPublicKey {
+				srv.AgentSigningPublicKey = cfg.AgentSigningPublicKey
+				changed = true
+			}
+			if srv.AgentNoiseStaticPublicKey != cfg.AgentNoiseStaticPublicKey {
+				srv.AgentNoiseStaticPublicKey = cfg.AgentNoiseStaticPublicKey
+				changed = true
+			}
+			// Reject legacy st1. tokens on Agent startup and mark as requiring re-pairing
+			if strings.HasPrefix(strings.TrimSpace(srv.Token), "st1.") {
+				srv.Running = false
+				srv.Status = "TOKEN UPGRADE REQUIRED"
+				srv.SyncState = "reauth_required"
 				changed = true
 			}
 		}
@@ -788,87 +1094,450 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 	return changed, nil
 }
 
-func signTokenPayload(tp TokenPayload, secret string) string {
-	portsStr := make([]string, len(tp.Ports))
-	for i, p := range tp.Ports {
-		portsStr[i] = strconv.Itoa(p)
+// ============================================================================
+// STAGE 1: CANONICAL BINARY SERIALIZATION, ED25519 SIGNING & TRUST ESTABLISHMENT
+// ============================================================================
+
+func encodeCanonicalTokenPayload(tp TokenPayload) ([]byte, error) {
+	if tp.V != tokenVersionV2 {
+		return nil, fmt.Errorf("unsupported token version %d (expected %d)", tp.V, tokenVersionV2)
 	}
-	canonical := fmt.Sprintf("%d|%s|%s|%s|%d|%d|%s|%s",
-		tp.V, tp.MID, tp.AID, tp.Pin, tp.TS, tp.Exp, strings.Join(portsStr, ","), tp.Key)
-	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(canonical))
-	return hex.EncodeToString(mac.Sum(nil))
+	if tp.CV < 1 || tp.CV > 1_000_000_000 {
+		return nil, fmt.Errorf("invalid token config version %d", tp.CV)
+	}
+	mid := strings.ToLower(strings.TrimSpace(tp.MID))
+	aid := strings.ToLower(strings.TrimSpace(tp.AID))
+	if mid == "" || aid == "" {
+		return nil, errors.New("missing MID or AID in token payload")
+	}
+	if mid == aid {
+		return nil, errors.New("token MID and AID must be distinct")
+	}
+	if len(mid) > 128 || len(aid) > 128 {
+		return nil, errors.New("token MID or AID exceeds maximum length")
+	}
+
+	mpkBytes, err := decodeHexExact(tp.MasterSigningPublicKey, ed25519.PublicKeySize)
+	if err != nil {
+		return nil, fmt.Errorf("invalid master_signing_public_key: %w", err)
+	}
+	mnpkBytes, err := decodeHexExact(tp.MasterNoiseStaticPublicKey, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid master_noise_static_public_key: %w", err)
+	}
+	pinBytes, err := decodeHexExact(tp.Pin, sha256.Size)
+	if err != nil {
+		return nil, fmt.Errorf("invalid certificate pin in token: %w", err)
+	}
+	keyBytes, err := decodeHexExact(tp.Key, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid 256-bit peer key in token: %w", err)
+	}
+
+	mip := strings.TrimSpace(tp.MIP)
+	if mip != "" {
+		if len(mip) > 45 || net.ParseIP(mip) == nil {
+			return nil, fmt.Errorf("invalid master IP %q in token", mip)
+		}
+	}
+	if tp.TS <= 0 || tp.Exp <= tp.TS {
+		return nil, errors.New("invalid token timestamps")
+	}
+	if tp.TZOff < -50400 || tp.TZOff > 50400 {
+		return nil, errors.New("invalid token timezone offset")
+	}
+	if len(tp.TZName) > 32 {
+		return nil, errors.New("token timezone name too long")
+	}
+	for i := 0; i < len(tp.TZName); i++ {
+		if tp.TZName[i] < 0x20 || tp.TZName[i] > 0x7E {
+			return nil, errors.New("invalid character in token timezone name")
+		}
+	}
+	if len(tp.Ports) != 30 {
+		return nil, fmt.Errorf("expected exactly 30 ports in token, got %d", len(tp.Ports))
+	}
+	seenPorts := make(map[int]struct{}, 30)
+	for _, p := range tp.Ports {
+		if p < 1024 || p > 65535 {
+			return nil, fmt.Errorf("invalid port %d in token", p)
+		}
+		if _, dup := seenPorts[p]; dup {
+			return nil, fmt.Errorf("duplicate port %d in token", p)
+		}
+		seenPorts[p] = struct{}{}
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("SAHAND-TOKEN-ED25519-V2\x00")
+
+	var u32 [4]byte
+	var u64 [8]byte
+	var u16 [2]byte
+
+	binary.BigEndian.PutUint32(u32[:], uint32(tp.V))
+	buf.Write(u32[:])
+	binary.BigEndian.PutUint32(u32[:], uint32(tp.CV))
+	buf.Write(u32[:])
+
+	binary.BigEndian.PutUint16(u16[:], uint16(len(mid)))
+	buf.Write(u16[:])
+	buf.WriteString(mid)
+
+	binary.BigEndian.PutUint16(u16[:], uint16(len(aid)))
+	buf.Write(u16[:])
+	buf.WriteString(aid)
+
+	buf.Write(mpkBytes)
+	buf.Write(mnpkBytes)
+	buf.Write(pinBytes)
+	buf.Write(keyBytes)
+
+	binary.BigEndian.PutUint64(u64[:], uint64(tp.TS))
+	buf.Write(u64[:])
+	binary.BigEndian.PutUint64(u64[:], uint64(tp.Exp))
+	buf.Write(u64[:])
+	binary.BigEndian.PutUint32(u32[:], uint32(int32(tp.TZOff)))
+	buf.Write(u32[:])
+
+	binary.BigEndian.PutUint16(u16[:], uint16(len(mip)))
+	buf.Write(u16[:])
+	buf.WriteString(mip)
+
+	binary.BigEndian.PutUint16(u16[:], uint16(len(tp.TZName)))
+	buf.Write(u16[:])
+	buf.WriteString(tp.TZName)
+
+	binary.BigEndian.PutUint16(u16[:], uint16(len(tp.Ports)))
+	buf.Write(u16[:])
+	for _, p := range tp.Ports {
+		binary.BigEndian.PutUint16(u16[:], uint16(p))
+		buf.Write(u16[:])
+	}
+
+	return buf.Bytes(), nil
+}
+
+func signTokenPayloadEd25519(tp TokenPayload, masterSigningPrivKeyHex string) (string, error) {
+	privBytes, err := decodeHexExact(masterSigningPrivKeyHex, ed25519.PrivateKeySize)
+	if err != nil {
+		return "", fmt.Errorf("invalid master Ed25519 signing private key: %w", err)
+	}
+	canonical, err := encodeCanonicalTokenPayload(tp)
+	if err != nil {
+		return "", err
+	}
+	sig := ed25519.Sign(ed25519.PrivateKey(privBytes), canonical)
+	return hex.EncodeToString(sig), nil
 }
 
 func generatePeerToken(cfg Config, peer ServerPeer) (string, error) {
+	if !validateEd25519KeypairHex(cfg.MasterSigningPrivateKey, cfg.MasterSigningPublicKey) {
+		return "", errors.New("master Ed25519 signing keypair is not initialized")
+	}
+	if !validateX25519KeypairHex(cfg.MasterNoiseStaticPrivateKey, cfg.MasterNoiseStaticPublicKey) {
+		return "", errors.New("master X25519 static keypair is not initialized")
+	}
+
 	ports := make([]int, 0, 30)
 	tunnels := normalizeTunnels(peer.Tunnels)
 	for _, t := range tunnels {
 		ports = append(ports, t.ListenPort)
 	}
+
+	peerSecretHex := strings.ToLower(strings.TrimSpace(peer.PeerSecret))
+	if _, err := decodeHexExact(peerSecretHex, 32); err != nil {
+		// Deterministically derive a per-peer 256-bit secret from Master's 256-bit TokenSecret if PeerSecret wasn't persisted yet
+		if secretBytes, sErr := decodeHexExact(cfg.TokenSecret, 32); sErr == nil {
+			mac := hmac.New(sha256.New, secretBytes)
+			_, _ = mac.Write([]byte("sahand-peer-random-secret-v2|" + peer.ID + "|" + strconv.Itoa(peer.ConfigVersion)))
+			peerSecretHex = hex.EncodeToString(mac.Sum(nil))
+		} else {
+			genSec, gErr := randomHex(32)
+			if gErr != nil {
+				return "", gErr
+			}
+			peerSecretHex = genSec
+		}
+	}
+
+	cv := peer.ConfigVersion
+	if cv <= 0 {
+		cv = 1
+	}
+
 	now := time.Now()
 	zName, zOff := now.Zone()
-	sharedKeyMac := hmac.New(sha256.New, []byte(cfg.TokenSecret))
-	_, _ = sharedKeyMac.Write([]byte(peer.ID + "|sahand-peer-key-v1"))
-	derivedKey := hex.EncodeToString(sharedKeyMac.Sum(nil)[:16])
 
 	tp := TokenPayload{
-		V:      peer.ConfigVersion,
-		MID:    cfg.NodeID,
-		AID:    peer.ID,
-		Pin:    cfg.CertPin,
-		TS:     now.Unix(),
-		Exp:    now.Add(365 * 24 * time.Hour).Unix(),
-		TZName: zName,
-		TZOff:  zOff,
-		Ports:  ports,
-		Key:    derivedKey,
+		V:                          tokenVersionV2,
+		CV:                         cv,
+		MID:                        strings.ToLower(strings.TrimSpace(cfg.NodeID)),
+		AID:                        strings.ToLower(strings.TrimSpace(peer.ID)),
+		Pin:                        strings.ToLower(strings.TrimSpace(cfg.CertPin)),
+		MasterSigningPublicKey:     strings.ToLower(strings.TrimSpace(cfg.MasterSigningPublicKey)),
+		MasterNoiseStaticPublicKey: strings.ToLower(strings.TrimSpace(cfg.MasterNoiseStaticPublicKey)),
+		TS:                         now.Unix(),
+		Exp:                        now.Add(365 * 24 * time.Hour).Unix(),
+		TZName:                     zName,
+		TZOff:                      zOff,
+		Ports:                      ports,
+		Key:                        peerSecretHex,
 	}
-	tp.Sig = signTokenPayload(tp, cfg.TokenSecret)
+
+	sigHex, err := signTokenPayloadEd25519(tp, cfg.MasterSigningPrivateKey)
+	if err != nil {
+		return "", err
+	}
+	tp.Sig = sigHex
+
 	raw, err := json.Marshal(tp)
 	if err != nil {
 		return "", err
 	}
-	return "st1." + base64.RawURLEncoding.EncodeToString(raw), nil
+	return tokenPrefixV2 + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func parseAndValidateToken(rawToken string) (TokenPayload, error) {
 	var tp TokenPayload
 	trimmed := strings.TrimSpace(rawToken)
-	if !strings.HasPrefix(trimmed, "st1.") {
-		return tp, errors.New("invalid token prefix (expected st1.)")
+	if len(trimmed) > maxTokenWireSize {
+		return tp, errors.New("token exceeds maximum allowed size")
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(trimmed, "st1."))
+	if strings.HasPrefix(trimmed, "st1.") {
+		return tp, errors.New("legacy st1. token is rejected; use an Ed25519-signed st2. token")
+	}
+	if !strings.HasPrefix(trimmed, tokenPrefixV2) {
+		return tp, errors.New("invalid token prefix (expected st2.)")
+	}
+
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(trimmed, tokenPrefixV2))
 	if err != nil {
-		return tp, errors.New("invalid token encoding")
+		return tp, errors.New("invalid token base64url encoding")
 	}
-	if err := json.Unmarshal(decoded, &tp); err != nil {
-		return tp, errors.New("corrupted token payload")
+
+	if err := unmarshalStrictJSON(decoded, &tp); err != nil {
+		return tp, fmt.Errorf("invalid token JSON payload: %w", err)
 	}
-	if tp.MID == "" || tp.AID == "" || len(tp.Ports) != 30 || tp.Key == "" || tp.Sig == "" {
-		return tp, errors.New("incomplete token fields")
-	}
+
 	if time.Now().Unix() > tp.Exp {
 		return tp, errors.New("token has expired")
 	}
+
+	canonical, err := encodeCanonicalTokenPayload(tp)
+	if err != nil {
+		return tp, err
+	}
+	pubBytes, err := decodeHexExact(tp.MasterSigningPublicKey, ed25519.PublicKeySize)
+	if err != nil {
+		return tp, errors.New("invalid master signing public key in token")
+	}
+	sigBytes, err := decodeHexExact(tp.Sig, ed25519.SignatureSize)
+	if err != nil {
+		return tp, errors.New("invalid Ed25519 signature encoding in token")
+	}
+
+	if !ed25519.Verify(ed25519.PublicKey(pubBytes), canonical, sigBytes) {
+		return tp, errors.New("token Ed25519 signature verification failed")
+	}
+
 	return tp, nil
 }
 
-func derivePeerAuthKey(_ Config, peer ServerPeer) ([]byte, error) {
+// Verifies the out-of-band Master Signing Key Fingerprint before establishing or persisting
+// initial trust on an Agent node. If fingerprint verification or Ed25519 signature verification
+// fails, no trust state is persisted.
+func VerifyAndEstablishInitialTrust(cfg *Config, masterIP, rawToken, expectedFingerprint string) (ServerPeer, error) {
+	var empty ServerPeer
+	if cfg == nil {
+		return empty, errors.New("configuration is nil")
+	}
+	ip := strings.TrimSpace(masterIP)
+	if ip == "" || net.ParseIP(ip) == nil {
+		return empty, errors.New("valid master IP address is required")
+	}
+
+	tp, err := parseAndValidateToken(rawToken)
+	if err != nil {
+		return empty, err
+	}
+
+	actualFP, err := ComputeSigningKeyFingerprint(tp.MasterSigningPublicKey)
+	if err != nil {
+		return empty, err
+	}
+
+	normExpectedFP := ""
+	if strings.TrimSpace(expectedFingerprint) != "" {
+		normExpectedFP, err = normalizeFingerprintHex(expectedFingerprint)
+		if err != nil {
+			return empty, err
+		}
+	} else if strings.TrimSpace(cfg.TrustedMasterSigningPublicKey) != "" {
+		// Allow re-pairing with an updated token from an already-verified Master signing key
+		pinnedFP, fpErr := ComputeSigningKeyFingerprint(cfg.TrustedMasterSigningPublicKey)
+		if fpErr != nil {
+			return empty, errors.New("master signing key fingerprint is required for initial trust verification")
+		}
+		normExpectedFP = pinnedFP
+	} else {
+		return empty, errors.New("master signing key fingerprint is required for initial trust verification")
+	}
+
+	if subtle.ConstantTimeCompare([]byte(actualFP), []byte(normExpectedFP)) != 1 {
+		return empty, errors.New("master signing key fingerprint mismatch: refusing to establish initial trust")
+	}
+
+	if cfg.TrustedMasterSigningPublicKey != "" &&
+		subtle.ConstantTimeCompare(
+			[]byte(strings.ToLower(strings.TrimSpace(cfg.TrustedMasterSigningPublicKey))),
+			[]byte(strings.ToLower(strings.TrimSpace(tp.MasterSigningPublicKey))),
+		) != 1 {
+		return empty, errors.New("token signing key does not match previously pinned master signing public key")
+	}
+
+	if !validateEd25519KeypairHex(cfg.AgentSigningPrivateKey, cfg.AgentSigningPublicKey) {
+		privHex, pubHex, gErr := generateEd25519KeypairHex()
+		if gErr != nil {
+			return empty, gErr
+		}
+		cfg.AgentSigningPrivateKey = privHex
+		cfg.AgentSigningPublicKey = pubHex
+	}
+	if !validateX25519KeypairHex(cfg.AgentNoiseStaticPrivateKey, cfg.AgentNoiseStaticPublicKey) {
+		privHex, pubHex, gErr := generateX25519KeypairHex()
+		if gErr != nil {
+			return empty, gErr
+		}
+		cfg.AgentNoiseStaticPrivateKey = privHex
+		cfg.AgentNoiseStaticPublicKey = pubHex
+	}
+
+	tunnels := defaultTunnelsForServer()
+	cidr, mIP, aIP := deriveDefaultSlash30ForPeer(tp.AID)
+	for i := range tunnels {
+		if i < len(tp.Ports) && tp.Ports[i] >= 1024 && tp.Ports[i] <= 65535 {
+			tunnels[i].ListenPort = tp.Ports[i]
+		}
+		if tunnels[i].ID == 25 && tunnels[i].GREFRP != nil {
+			tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
+			tunnels[i].GREFRP.LocalPrivateIP = aIP
+			tunnels[i].GREFRP.RemotePrivateIP = mIP
+			tunnels[i].GREFRP.RemotePublicIP = ip
+			if len(tp.AID) >= 6 {
+				tunnels[i].GREFRP.GREInterfaceName = "gre-" + tp.AID[:6]
+			}
+			tunnels[i].GREFRP.FRPServerPort = tunnels[i].ListenPort
+		}
+	}
+
+	peer := ServerPeer{
+		ID:                         tp.AID,
+		Name:                       "Master (" + ip + ")",
+		IP:                         ip,
+		Token:                      strings.TrimSpace(rawToken),
+		PeerSecret:                 tp.Key,
+		MasterSigningPublicKey:     tp.MasterSigningPublicKey,
+		MasterNoiseStaticPublicKey: tp.MasterNoiseStaticPublicKey,
+		AgentSigningPublicKey:      cfg.AgentSigningPublicKey,
+		AgentNoiseStaticPublicKey:  cfg.AgentNoiseStaticPublicKey,
+		TrustedFingerprint:         actualFP,
+		ConfigVersion:              tp.CV,
+		SyncState:                  "synced",
+		Status:                     "TESTING",
+		Running:                    true,
+		RemoteCertPin:              tp.Pin,
+		RecentLifelines:            []LifelineEvent{},
+		Tunnels:                    tunnels,
+	}
+
+	cfg.TrustedMasterSigningPublicKey = tp.MasterSigningPublicKey
+	if tp.TZName != "" || tp.TZOff != 0 {
+		cfg.MasterTZName = tp.TZName
+		cfg.MasterTZOffsetSec = tp.TZOff
+	}
+	cfg.Servers = []ServerPeer{peer}
+
+	if err := saveConfig(configPath(), *cfg); err != nil {
+		return empty, err
+	}
+	return peer, nil
+}
+
+// Derives the 256-bit (32-byte) root authentication key for a verified peer using HKDF-HMAC-SHA256
+// over the high-entropy 256-bit per-peer secret (`tp.Key`). Public identifiers (`MID`, `AID`) are
+// used strictly as HKDF salt/context and never as secret key material.
+func derivePeerAuthKey(cfg Config, peer ServerPeer) ([]byte, error) {
 	if peer.TokenRevoked {
 		return nil, errors.New("peer token has been revoked")
 	}
 	if strings.TrimSpace(peer.Token) == "" {
 		return nil, errors.New("peer token is missing")
 	}
+
 	tp, err := parseAndValidateToken(peer.Token)
 	if err != nil {
 		return nil, err
 	}
-	if peer.ID != "" && tp.AID != peer.ID {
+
+	if peer.ID != "" && subtle.ConstantTimeCompare([]byte(strings.ToLower(strings.TrimSpace(peer.ID))), []byte(tp.AID)) != 1 {
 		return nil, errors.New("peer ID mismatch with token AID")
 	}
-	mac := hmac.New(sha256.New, []byte("sahand-quic-v1-pair-auth"))
-	_, _ = mac.Write([]byte(tp.AID + "|" + tp.MID))
-	return mac.Sum(nil)[:16], nil
+
+	// Enforce pinned MasterSigningPublicKey trust
+	expectedMasterSignPub := strings.ToLower(strings.TrimSpace(peer.MasterSigningPublicKey))
+	if expectedMasterSignPub == "" {
+		if cfg.Role == "agent" {
+			expectedMasterSignPub = strings.ToLower(strings.TrimSpace(cfg.TrustedMasterSigningPublicKey))
+			if expectedMasterSignPub == "" {
+				return nil, errors.New("initial trust not established: master signing public key is not verified")
+			}
+		} else if cfg.MasterSigningPublicKey != "" {
+			expectedMasterSignPub = strings.ToLower(strings.TrimSpace(cfg.MasterSigningPublicKey))
+		}
+	}
+	if expectedMasterSignPub == "" {
+		return nil, errors.New("master signing public key trust anchor is missing")
+	}
+	if subtle.ConstantTimeCompare([]byte(tp.MasterSigningPublicKey), []byte(expectedMasterSignPub)) != 1 {
+		return nil, errors.New("token master signing public key does not match trusted master key")
+	}
+
+	// If PeerSecret is explicitly recorded on the peer, enforce constant-time equality with tp.Key
+	if peer.PeerSecret != "" {
+		if subtle.ConstantTimeCompare([]byte(strings.ToLower(strings.TrimSpace(peer.PeerSecret))), []byte(tp.Key)) != 1 {
+			return nil, errors.New("token peer secret does not match stored peer secret")
+		}
+	}
+
+	pskBytes, err := decodeHexExact(tp.Key, 32)
+	if err != nil {
+		return nil, errors.New("invalid 256-bit peer secret in token")
+	}
+
+	salt := []byte("sahand-hkdf-salt-v2|" + tp.MID + "|" + tp.AID)
+	info := []byte("sahand-peer-root-auth-key-v2")
+	r := hkdf.New(sha256.New, pskBytes, salt, info)
+	rootKey := make([]byte, 32)
+	if _, err := io.ReadFull(r, rootKey); err != nil {
+		return nil, err
+	}
+	return rootKey, nil
+}
+
+// Derives a domain-separated 256-bit (32-byte) subkey from the peer's root authentication key.
+func derivePeerSubKey(cfg Config, peer ServerPeer, domainLabel string) ([]byte, error) {
+	if strings.TrimSpace(domainLabel) == "" {
+		return nil, errors.New("subkey domain label is required")
+	}
+	rootKey, err := derivePeerAuthKey(cfg, peer)
+	if err != nil {
+		return nil, err
+	}
+	r := hkdf.Expand(sha256.New, rootKey, []byte("sahand-subkey-v2|"+domainLabel))
+	subKey := make([]byte, 32)
+	if _, err := io.ReadFull(r, subKey); err != nil {
+		return nil, err
+	}
+	return subKey, nil
 }
