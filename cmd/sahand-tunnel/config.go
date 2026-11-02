@@ -83,6 +83,61 @@ type LifelineEvent struct {
 	ConnectedAt string `json:"connected_at"`
 }
 
+type GREFRPForwardRule struct {
+	Name          string `json:"name"`
+	Protocol      string `json:"protocol"`        // "tcp", "udp", or "tcp+udp"
+	LocalAddr     string `json:"local_addr"`      // default "127.0.0.1"
+	LocalPort     string `json:"local_port"`      // single port "45001" or range "45001-45005"
+	RemotePort    string `json:"remote_port"`     // single port "45001" or range "45001-45005"
+	UseEncryption bool   `json:"use_encryption"`
+	UseCompress   bool   `json:"use_compression"`
+	ProxyProtoV2  bool   `json:"proxy_proto_v2"`
+}
+
+type GREFRPDiagnostics struct {
+	EngineName          string   `json:"engine_name"`
+	GREInterfaceStatus  string   `json:"gre_interface_status"`
+	GREPrivatePingOK    bool     `json:"gre_private_ping_ok"`
+	GREPacketLossPct    int      `json:"gre_packet_loss_pct"`
+	GRERoundTripMS      int64    `json:"gre_rtt_ms"`
+	FRPSServiceStatus   string   `json:"frps_service_status"`
+	FRPCServiceStatus   string   `json:"frpc_service_status"`
+	ActivePath          string   `json:"active_path"` // "GRE" or "PUBLIC_FALLBACK"
+	PortForwardStatus   string   `json:"port_forward_status"`
+	ServiceUptime       string   `json:"service_uptime"`
+	ReconnectCount      int      `json:"reconnect_count"`
+	LastFailureReason   string   `json:"last_failure_reason,omitempty"`
+	LastRecoveryAt      string   `json:"last_recovery_at,omitempty"`
+	RecentLogs          []string `json:"recent_logs,omitempty"`
+}
+
+type GREFRPConfig struct {
+	InternalEngine     string              `json:"internal_engine"` // "gre-frp"
+	LocalPublicIP      string              `json:"local_public_ip"`
+	RemotePublicIP     string              `json:"remote_public_ip"`
+	GREInterfaceName   string              `json:"gre_interface_name"`
+	PrivateSubnetCIDR  string              `json:"private_subnet_cidr"` // e.g. "10.77.25.0/30"
+	LocalPrivateIP     string              `json:"local_private_ip"`    // e.g. "10.77.25.1"
+	RemotePrivateIP    string              `json:"remote_private_ip"`   // e.g. "10.77.25.2"
+	MTU                int                 `json:"mtu"`                 // default 1400
+	RouteConfig        string              `json:"route_config"`        // e.g. "auto (/30 point-to-point)"
+	HealthCheckSec     int                 `json:"health_check_sec"`    // default 5
+	FailureThreshold   int                 `json:"failure_threshold"`   // default 3
+	RecoveryThreshold  int                 `json:"recovery_threshold"`  // default 2
+	AutoPublicFallback bool                `json:"auto_public_fallback"`
+	AutoRestoreGRE     bool                `json:"auto_restore_gre"`
+	FRPVersion         string              `json:"frp_version"`         // "0.61.1"
+	FRPTransport       string              `json:"frp_transport"`       // "tcp", "kcp", "quic", "websocket", "wss"
+	FRPServerPort      int                 `json:"frp_server_port"`     // default 28025
+	FRPAuthToken       string              `json:"frp_auth_token"`
+	FRPEncryption      bool                `json:"frp_encryption"`
+	FRPCompression     bool                `json:"frp_compression"`
+	FRPTCPMux          bool                `json:"frp_tcp_mux"`
+	FRPProxyProtoV2    bool                `json:"frp_proxy_proto_v2"`
+	ForwardingRules    []GREFRPForwardRule `json:"forwarding_rules"`
+	Diagnostics        GREFRPDiagnostics   `json:"diagnostics"`
+}
+
 type TunnelConfig struct {
 	ID             int           `json:"id"`
 	Name           string        `json:"name"`
@@ -97,7 +152,6 @@ type TunnelConfig struct {
 	CertPin        string        `json:"cert_pin,omitempty"`
 	RawTransport   string        `json:"raw_transport,omitempty"`
 	GREFRP         *GREFRPConfig `json:"gre_frp,omitempty"`
-	GREFRPStatus   *GREFRPStatus `json:"gre_frp_status,omitempty"`
 	HeartbeatSec   int           `json:"heartbeat_sec,omitempty"`
 	StreamLimit    int           `json:"stream_limit,omitempty"`
 	SpeedLimitMBps string        `json:"speed_limit_mbps"`
@@ -459,10 +513,89 @@ func generateSelfSignedCert() (string, string, string, error) {
 	return string(certPEM), string(keyPEM), pin, nil
 }
 
+func defaultGREFRPConfig(listenPort int, forwardPorts string) *GREFRPConfig {
+	if listenPort <= 0 {
+		listenPort = 28025
+	}
+	if strings.TrimSpace(forwardPorts) == "" {
+		forwardPorts = "32025"
+	}
+	return &GREFRPConfig{
+		InternalEngine:     "gre-frp",
+		GREInterfaceName:   "sahand-gre0",
+		PrivateSubnetCIDR:  "10.77.25.0/30",
+		LocalPrivateIP:     "10.77.25.1",
+		RemotePrivateIP:    "10.77.25.2",
+		MTU:                1400,
+		RouteConfig:        "10.77.25.0/30 via sahand-gre0",
+		HealthCheckSec:     5,
+		FailureThreshold:   3,
+		RecoveryThreshold:  2,
+		AutoPublicFallback: true,
+		AutoRestoreGRE:     true,
+		FRPVersion:         "0.61.1",
+		FRPTransport:       "tcp",
+		FRPServerPort:      listenPort,
+		FRPEncryption:      true,
+		FRPCompression:     false,
+		FRPTCPMux:          true,
+		FRPProxyProtoV2:    false,
+		ForwardingRules:    buildGREFRPRulesFromCSV(forwardPorts, true, false, false),
+		Diagnostics: GREFRPDiagnostics{
+			EngineName:         "gre-frp",
+			GREInterfaceStatus: "STANDBY",
+			FRPSServiceStatus:  "BUILT-IN READY",
+			FRPCServiceStatus:  "BUILT-IN READY",
+			ActivePath:         "GRE",
+			PortForwardStatus:  "READY",
+		},
+	}
+}
+
+func buildGREFRPRulesFromCSV(csvPorts string, enc, comp, ppv2 bool) []GREFRPForwardRule {
+	var rules []GREFRPForwardRule
+	parts := strings.Split(csvPorts, ",")
+	for idx, raw := range parts {
+		token := strings.TrimSpace(raw)
+		if token == "" {
+			continue
+		}
+		localPort := token
+		remotePort := token
+		if strings.Contains(token, ":") {
+			segs := strings.SplitN(token, ":", 2)
+			remotePort = strings.TrimSpace(segs[0])
+			localPort = strings.TrimSpace(segs[1])
+		}
+		rules = append(rules, GREFRPForwardRule{
+			Name:          fmt.Sprintf("rule-%02d", idx+1),
+			Protocol:      "tcp+udp",
+			LocalAddr:     "127.0.0.1",
+			LocalPort:     localPort,
+			RemotePort:    remotePort,
+			UseEncryption: enc,
+			UseCompress:   comp,
+			ProxyProtoV2:  ppv2,
+		})
+	}
+	if len(rules) == 0 {
+		rules = append(rules, GREFRPForwardRule{
+			Name:          "rule-01",
+			Protocol:      "tcp+udp",
+			LocalAddr:     "127.0.0.1",
+			LocalPort:     "32025",
+			RemotePort:    "32025",
+			UseEncryption: enc,
+			UseCompress:   comp,
+			ProxyProtoV2:  ppv2,
+		})
+	}
+	return rules
+}
+
 func defaultTunnelsForServer() []TunnelConfig {
 	list := make([]TunnelConfig, 0, len(methodCatalogue))
 	for _, item := range methodCatalogue {
-		fwd := strconv.Itoa(32000 + item.ID)
 		tc := TunnelConfig{
 			ID:             item.ID,
 			Name:           item.Name,
@@ -471,7 +604,7 @@ func defaultTunnelsForServer() []TunnelConfig {
 			Implemented:    item.Implemented,
 			Enabled:        item.ID == 1,
 			ListenPort:     item.DefaultPort,
-			ForwardPorts:   fwd,
+			ForwardPorts:   strconv.Itoa(32000 + item.ID),
 			SpeedLimitMBps: "0",
 			LastDiscovery: MethodResult{
 				MethodID: item.ID,
@@ -486,8 +619,7 @@ func defaultTunnelsForServer() []TunnelConfig {
 			case "raw_transport":
 				tc.RawTransport = "auto"
 			case "gre_frp":
-				tc.GREFRP = defaultGREFRPConfig("master", ServerPeer{}, 0, fwd)
-				tc.GREFRPStatus = defaultGREFRPStatus()
+				tc.GREFRP = defaultGREFRPConfig(tc.ListenPort, tc.ForwardPorts)
 			case "heartbeat_sec":
 				tc.HeartbeatSec = 30
 			case "stream_limit":
@@ -539,15 +671,8 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 					cur.RawTransport = rt
 				}
 			}
-			if def.ID == greFRPMethodID {
-				role := "master"
-				if atomicIsAgent.Load() {
-					role = "agent"
-				}
-				cur.GREFRP = normalizeGREFRPConfig(cur.GREFRP, role, ServerPeer{}, 0, cur.ListenPort, cur.ForwardPorts)
-				if cur.GREFRPStatus == nil {
-					cur.GREFRPStatus = defaultGREFRPStatus()
-				}
+			if def.ID == 25 {
+				cur.GREFRP = normalizeGREFRPConfig(cur.GREFRP, cur.ListenPort, cur.ForwardPorts)
 			}
 			if cur.HeartbeatSec <= 0 {
 				cur.HeartbeatSec = def.HeartbeatSec
@@ -640,18 +765,6 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 	localCert = cert
 	for i := range cfg.Servers {
 		cfg.Servers[i].Tunnels = normalizeTunnels(cfg.Servers[i].Tunnels)
-		for j := range cfg.Servers[i].Tunnels {
-			if cfg.Servers[i].Tunnels[j].ID == greFRPMethodID {
-				cfg.Servers[i].Tunnels[j].GREFRP = normalizeGREFRPConfig(
-					cfg.Servers[i].Tunnels[j].GREFRP,
-					cfg.Role,
-					cfg.Servers[i],
-					i,
-					cfg.Servers[i].Tunnels[j].ListenPort,
-					cfg.Servers[i].Tunnels[j].ForwardPorts,
-				)
-			}
-		}
 		if cfg.Servers[i].ConfigVersion <= 0 {
 			cfg.Servers[i].ConfigVersion = 1
 		}
