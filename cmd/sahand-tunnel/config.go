@@ -84,22 +84,24 @@ type LifelineEvent struct {
 }
 
 type TunnelConfig struct {
-	ID             int          `json:"id"`
-	Name           string       `json:"name"`
-	Security       int          `json:"security"`
-	TrafficType    string       `json:"traffic_type"`
-	Implemented    bool         `json:"implemented"`
-	Enabled        bool         `json:"enabled"`
-	ListenPort     int          `json:"listen_port"`
-	ForwardPorts   string       `json:"forward_ports"`
-	SNI            string       `json:"sni,omitempty"`
-	WSPath         string       `json:"ws_path,omitempty"`
-	CertPin        string       `json:"cert_pin,omitempty"`
-	RawTransport   string       `json:"raw_transport,omitempty"`
-	HeartbeatSec   int          `json:"heartbeat_sec,omitempty"`
-	StreamLimit    int          `json:"stream_limit,omitempty"`
-	SpeedLimitMBps string       `json:"speed_limit_mbps"`
-	LastDiscovery  MethodResult `json:"last_discovery"`
+	ID             int           `json:"id"`
+	Name           string        `json:"name"`
+	Security       int           `json:"security"`
+	TrafficType    string        `json:"traffic_type"`
+	Implemented    bool          `json:"implemented"`
+	Enabled        bool          `json:"enabled"`
+	ListenPort     int           `json:"listen_port"`
+	ForwardPorts   string        `json:"forward_ports"`
+	SNI            string        `json:"sni,omitempty"`
+	WSPath         string        `json:"ws_path,omitempty"`
+	CertPin        string        `json:"cert_pin,omitempty"`
+	RawTransport   string        `json:"raw_transport,omitempty"`
+	GREFRP         *GREFRPConfig `json:"gre_frp,omitempty"`
+	GREFRPStatus   *GREFRPStatus `json:"gre_frp_status,omitempty"`
+	HeartbeatSec   int           `json:"heartbeat_sec,omitempty"`
+	StreamLimit    int           `json:"stream_limit,omitempty"`
+	SpeedLimitMBps string        `json:"speed_limit_mbps"`
+	LastDiscovery  MethodResult  `json:"last_discovery"`
 }
 
 type ServerPeer struct {
@@ -217,7 +219,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{22, "WebSocket Multiplex", 89, "tcp", true, 28022, []string{"listen_port", "forward_ports", "sni", "ws_path", "stream_limit", "speed_limit_mbps"}},
 	{23, "HTTP Upgrade", 74, "tcp", true, 28023, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
 	{24, "SAHAND-RAW", 96, "tcp+udp", true, 28024, []string{"listen_port", "forward_ports", "raw_transport", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
-	{25, "Secure Relay", 85, "tcp", false, 28025, []string{"listen_port", "forward_ports", "sni"}},
+	{25, "GRE + FRP", 91, "tcp+udp", true, 28025, []string{"listen_port", "forward_ports", "gre_frp", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{26, "Stream Bridge", 80, "tcp+udp", false, 28026, []string{"listen_port", "forward_ports", "stream_limit"}},
 	{27, "Fallback TCP", 42, "tcp", false, 28027, []string{"listen_port", "forward_ports"}},
 	{28, "Custom TLS", 91, "tcp", false, 28028, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
@@ -460,6 +462,7 @@ func generateSelfSignedCert() (string, string, string, error) {
 func defaultTunnelsForServer() []TunnelConfig {
 	list := make([]TunnelConfig, 0, len(methodCatalogue))
 	for _, item := range methodCatalogue {
+		fwd := strconv.Itoa(32000 + item.ID)
 		tc := TunnelConfig{
 			ID:             item.ID,
 			Name:           item.Name,
@@ -468,7 +471,7 @@ func defaultTunnelsForServer() []TunnelConfig {
 			Implemented:    item.Implemented,
 			Enabled:        item.ID == 1,
 			ListenPort:     item.DefaultPort,
-			ForwardPorts:   strconv.Itoa(32000 + item.ID),
+			ForwardPorts:   fwd,
 			SpeedLimitMBps: "0",
 			LastDiscovery: MethodResult{
 				MethodID: item.ID,
@@ -482,6 +485,9 @@ func defaultTunnelsForServer() []TunnelConfig {
 				tc.WSPath = "/ws"
 			case "raw_transport":
 				tc.RawTransport = "auto"
+			case "gre_frp":
+				tc.GREFRP = defaultGREFRPConfig("master", ServerPeer{}, 0, fwd)
+				tc.GREFRPStatus = defaultGREFRPStatus()
 			case "heartbeat_sec":
 				tc.HeartbeatSec = 30
 			case "stream_limit":
@@ -531,6 +537,16 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 					cur.RawTransport = def.RawTransport
 				} else {
 					cur.RawTransport = rt
+				}
+			}
+			if def.ID == greFRPMethodID {
+				role := "master"
+				if atomicIsAgent.Load() {
+					role = "agent"
+				}
+				cur.GREFRP = normalizeGREFRPConfig(cur.GREFRP, role, ServerPeer{}, 0, cur.ListenPort, cur.ForwardPorts)
+				if cur.GREFRPStatus == nil {
+					cur.GREFRPStatus = defaultGREFRPStatus()
 				}
 			}
 			if cur.HeartbeatSec <= 0 {
@@ -624,6 +640,18 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 	localCert = cert
 	for i := range cfg.Servers {
 		cfg.Servers[i].Tunnels = normalizeTunnels(cfg.Servers[i].Tunnels)
+		for j := range cfg.Servers[i].Tunnels {
+			if cfg.Servers[i].Tunnels[j].ID == greFRPMethodID {
+				cfg.Servers[i].Tunnels[j].GREFRP = normalizeGREFRPConfig(
+					cfg.Servers[i].Tunnels[j].GREFRP,
+					cfg.Role,
+					cfg.Servers[i],
+					i,
+					cfg.Servers[i].Tunnels[j].ListenPort,
+					cfg.Servers[i].Tunnels[j].ForwardPorts,
+				)
+			}
+		}
 		if cfg.Servers[i].ConfigVersion <= 0 {
 			cfg.Servers[i].ConfigVersion = 1
 		}
