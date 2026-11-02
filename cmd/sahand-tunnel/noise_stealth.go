@@ -69,7 +69,6 @@ type noiseDHKey struct {
 	Public  []byte
 }
 
-// Implements Noise Specification Section 5.1 CipherState for ChaChaPoly.
 type noiseCipherState struct {
 	mu      sync.Mutex
 	key     [32]byte
@@ -87,9 +86,6 @@ func newNoiseCipherState(key [32]byte, maskKey [32]byte) *noiseCipherState {
 	}
 }
 
-// Encodes the 64-bit sequence number `n` into the 96-bit ChaChaPoly nonce per
-// Noise Specification Revision 34 Section 7.3: 32 bits of zeros followed by
-// little-endian encoding of `n`.
 func encodeNoiseChaChaPolyNonce(n uint64) [12]byte {
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[4:12], n)
@@ -883,8 +879,8 @@ type noiseTransportConn struct {
 	readMu          sync.Mutex
 	writeMu         sync.Mutex
 	bufMu           sync.Mutex
-	csRx            *noiseCipherState
-	csTx            *noiseCipherState
+	csRx            atomic.Pointer[noiseCipherState]
+	csTx            atomic.Pointer[noiseCipherState]
 	txFramesInEpoch uint64
 	autoRekeyEvery  uint64
 	readBuf         bytes.Buffer
@@ -911,11 +907,11 @@ func newNoiseTransportConn(raw net.Conn, initiator bool, csI2R, csR2I *noiseCiph
 		autoRekeyEvery: noiseDefaultAutoRekeyCount,
 	}
 	if initiator {
-		tc.csTx = csI2R
-		tc.csRx = csR2I
+		tc.csTx.Store(csI2R)
+		tc.csRx.Store(csR2I)
 	} else {
-		tc.csTx = csR2I
-		tc.csRx = csI2R
+		tc.csTx.Store(csR2I)
+		tc.csRx.Store(csI2R)
 	}
 	return tc
 }
@@ -946,16 +942,20 @@ func (ntc *noiseTransportConn) writeFrameLocked(frameType byte, plaintext []byte
 		return fmt.Errorf("noise frame plaintext length %d exceeds maximum %d", len(plaintext), noiseMaxPlaintextLen)
 	}
 
-	ntc.csTx.mu.Lock()
-	mask := ntc.csTx.nextFrameMaskLocked()
-	ntc.csTx.mu.Unlock()
+	tx := ntc.csTx.Load()
+	if tx == nil {
+		return net.ErrClosed
+	}
+	tx.mu.Lock()
+	mask := tx.nextFrameMaskLocked()
+	tx.mu.Unlock()
 
 	var hdr [noiseFrameHeaderLen]byte
 	hdr[0] = frameType
 	obfLen := uint16(len(plaintext)) ^ mask
 	binary.BigEndian.PutUint16(hdr[1:3], obfLen)
 
-	ciphertext, err := ntc.csTx.EncryptWithAd(hdr[:], plaintext)
+	ciphertext, err := tx.EncryptWithAd(hdr[:], plaintext)
 	if err != nil {
 		return err
 	}
@@ -998,83 +998,97 @@ func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) erro
 	return err
 }
 
-func (ntc *noiseTransportConn) ReadFrame() (byte, []byte, error) {
+func (ntc *noiseTransportConn) readFrameLocked() (byte, []byte, error) {
 	if ntc.closed.Load() {
 		return 0, nil, net.ErrClosed
 	}
 
+	var hdr [noiseFrameHeaderLen]byte
+	if _, err := io.ReadFull(ntc.raw, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+
+	frameType := hdr[0]
+	switch frameType {
+	case noiseFrameTypeData, noiseFrameTypeRekeyInit, noiseFrameTypeRekeyAck, noiseFrameTypeRekeyCommit, noiseFrameTypeClose:
+	default:
+		_ = ntc.Close()
+		return 0, nil, fmt.Errorf("invalid noise transport frame type 0x%02x", frameType)
+	}
+
+	rx := ntc.csRx.Load()
+	if rx == nil {
+		return 0, nil, net.ErrClosed
+	}
+	rx.mu.Lock()
+	mask := rx.nextFrameMaskLocked()
+	rx.mu.Unlock()
+
+	plaintextLen := int(binary.BigEndian.Uint16(hdr[1:3]) ^ mask)
+	if plaintextLen < 0 || plaintextLen > noiseMaxPlaintextLen {
+		_ = ntc.Close()
+		return 0, nil, fmt.Errorf("noise frame length %d exceeds maximum %d", plaintextLen, noiseMaxPlaintextLen)
+	}
+
+	ciphertextLen := plaintextLen + noiseAEADTagLen
+	cipherBuf := make([]byte, ciphertextLen)
+	if _, err := io.ReadFull(ntc.raw, cipherBuf); err != nil {
+		_ = ntc.Close()
+		if errors.Is(err, io.EOF) {
+			return 0, nil, io.ErrUnexpectedEOF
+		}
+		return 0, nil, err
+	}
+
+	plaintext, err := rx.DecryptWithAd(hdr[:], cipherBuf)
+	if err != nil {
+		_ = ntc.Close()
+		return 0, nil, err
+	}
+
+	switch frameType {
+	case noiseFrameTypeRekeyInit:
+		if err := ntc.handleIncomingRekeyInitLocked(plaintext); err != nil {
+			_ = ntc.Close()
+			return 0, nil, err
+		}
+		return frameType, nil, nil
+
+	case noiseFrameTypeRekeyAck:
+		if err := ntc.handleIncomingRekeyAckLocked(plaintext); err != nil {
+			_ = ntc.Close()
+			return 0, nil, err
+		}
+		return frameType, nil, nil
+
+	case noiseFrameTypeRekeyCommit:
+		if err := ntc.handleIncomingRekeyCommitLocked(plaintext); err != nil {
+			_ = ntc.Close()
+			return 0, nil, err
+		}
+		return frameType, nil, nil
+
+	default:
+		return frameType, plaintext, nil
+	}
+}
+
+func (ntc *noiseTransportConn) ReadFrame() (byte, []byte, error) {
+	if ntc.closed.Load() {
+		return 0, nil, net.ErrClosed
+	}
 	ntc.readMu.Lock()
 	defer ntc.readMu.Unlock()
 
 	for {
-		if ntc.closed.Load() {
-			return 0, nil, net.ErrClosed
-		}
-
-		var hdr [noiseFrameHeaderLen]byte
-		if _, err := io.ReadFull(ntc.raw, hdr[:]); err != nil {
-			return 0, nil, err
-		}
-
-		frameType := hdr[0]
-		switch frameType {
-		case noiseFrameTypeData, noiseFrameTypeRekeyInit, noiseFrameTypeRekeyAck, noiseFrameTypeRekeyCommit, noiseFrameTypeClose:
-		default:
-			_ = ntc.Close()
-			return 0, nil, fmt.Errorf("invalid noise transport frame type 0x%02x", frameType)
-		}
-
-		ntc.csRx.mu.Lock()
-		mask := ntc.csRx.nextFrameMaskLocked()
-		ntc.csRx.mu.Unlock()
-
-		plaintextLen := int(binary.BigEndian.Uint16(hdr[1:3]) ^ mask)
-		if plaintextLen < 0 || plaintextLen > noiseMaxPlaintextLen {
-			_ = ntc.Close()
-			return 0, nil, fmt.Errorf("noise frame length %d exceeds maximum %d", plaintextLen, noiseMaxPlaintextLen)
-		}
-
-		ciphertextLen := plaintextLen + noiseAEADTagLen
-		cipherBuf := make([]byte, ciphertextLen)
-		if _, err := io.ReadFull(ntc.raw, cipherBuf); err != nil {
-			_ = ntc.Close()
-			if errors.Is(err, io.EOF) {
-				return 0, nil, io.ErrUnexpectedEOF
-			}
-			return 0, nil, err
-		}
-
-		plaintext, err := ntc.csRx.DecryptWithAd(hdr[:], cipherBuf)
+		fType, plain, err := ntc.readFrameLocked()
 		if err != nil {
-			_ = ntc.Close()
 			return 0, nil, err
 		}
-
-		switch frameType {
-		case noiseFrameTypeRekeyInit:
-			if err := ntc.handleIncomingRekeyInitLocked(plaintext); err != nil {
-				_ = ntc.Close()
-				return 0, nil, err
-			}
+		if fType == noiseFrameTypeRekeyInit || fType == noiseFrameTypeRekeyAck || fType == noiseFrameTypeRekeyCommit {
 			continue
-
-		case noiseFrameTypeRekeyAck:
-			if err := ntc.handleIncomingRekeyAckLocked(plaintext); err != nil {
-				_ = ntc.Close()
-				return 0, nil, err
-			}
-			continue
-
-		case noiseFrameTypeRekeyCommit:
-			if err := ntc.handleIncomingRekeyCommitLocked(plaintext); err != nil {
-				_ = ntc.Close()
-				return 0, nil, err
-			}
-			continue
-
-		default:
-			return frameType, plaintext, nil
 		}
+		return fType, plain, nil
 	}
 }
 
@@ -1152,11 +1166,11 @@ func (ntc *noiseTransportConn) Close() error {
 	ntc.rekeyWaitCommit = false
 	ntc.rekeyMu.Unlock()
 
-	if ntc.csTx != nil {
-		ntc.csTx.Zeroize()
+	if tx := ntc.csTx.Load(); tx != nil {
+		tx.Zeroize()
 	}
-	if ntc.csRx != nil {
-		ntc.csRx.Zeroize()
+	if rx := ntc.csRx.Load(); rx != nil {
+		rx.Zeroize()
 	}
 	return ntc.raw.Close()
 }
