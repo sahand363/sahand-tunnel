@@ -284,47 +284,48 @@ func (ntc *noiseTransportConn) Rekey(timeout time.Duration) error {
 		return err
 	}
 
-	// If no other goroutine is currently holding readMu, drive readFrameLocked directly
-	// until REKEY_ACK is processed or the timeout expires.
-	if ntc.readMu.TryLock() {
-		_ = ntc.raw.SetReadDeadline(time.Now().Add(timeout))
-		for {
-			ntc.rekeyMu.Lock()
-			inProg := ntc.rekeyInProgress
-			ntc.rekeyMu.Unlock()
-			if !inProg {
-				break
-			}
-			fType, plain, rErr := ntc.readFrameLocked()
-			if rErr != nil {
-				_ = ntc.raw.SetReadDeadline(time.Time{})
-				ntc.readMu.Unlock()
-				_ = ntc.Close()
-				return rErr
-			}
-			if fType == noiseFrameTypeData && len(plain) > 0 {
-				ntc.bufMu.Lock()
-				ntc.readBuf.Write(plain)
-				ntc.bufMu.Unlock()
-			}
-		}
-		_ = ntc.raw.SetReadDeadline(time.Time{})
-		ntc.readMu.Unlock()
-	}
-
+	deadline := time.Now().Add(timeout)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	select {
-	case rErr := <-doneCh:
-		if rErr != nil {
+	for {
+		select {
+		case rErr := <-doneCh:
+			if rErr != nil {
+				_ = ntc.Close()
+				return rErr
+			}
+			return nil
+		case <-timer.C:
 			_ = ntc.Close()
-			return rErr
+			return errors.New("noise transport rekey timed out")
+		default:
 		}
-		return nil
-	case <-timer.C:
-		_ = ntc.Close()
-		return errors.New("noise transport rekey timed out")
+
+		if ntc.readMu.TryLock() {
+			ntc.rekeyMu.Lock()
+			inProg := ntc.rekeyInProgress
+			ntc.rekeyMu.Unlock()
+
+			if inProg {
+				_ = ntc.raw.SetReadDeadline(deadline)
+				fType, plain, rErr := ntc.readFrameLocked()
+				_ = ntc.raw.SetReadDeadline(time.Time{})
+				if rErr != nil {
+					ntc.readMu.Unlock()
+					_ = ntc.Close()
+					return rErr
+				}
+				if fType == noiseFrameTypeData && len(plain) > 0 {
+					ntc.bufMu.Lock()
+					ntc.readBuf.Write(plain)
+					ntc.bufMu.Unlock()
+				}
+			}
+			ntc.readMu.Unlock()
+		} else {
+			time.Sleep(2 * time.Millisecond)
+		}
 	}
 }
 
