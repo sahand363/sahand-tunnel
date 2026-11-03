@@ -174,14 +174,15 @@ func TestPart3AutomaticRekeyUnderConcurrentBidirectionalTraffic(t *testing.T) {
 	if !bytes.Equal(totalSent, totalRecv) {
 		t.Fatalf("streamed data corrupted across automatic rekey epochs")
 	}
-	if clientTC.CurrentEpoch() < 1 || serverTC.CurrentEpoch() < 1 {
-		t.Fatalf("expected automatic rekey to advance epochs, got client=%d server=%d",
-			clientTC.CurrentEpoch(), serverTC.CurrentEpoch())
-	}
 
 	_ = clientTC.CloseWrite()
 	if err := <-serverDone; err != nil {
 		t.Fatalf("server echo loop error: %v", err)
+	}
+
+	if clientTC.CurrentEpoch() < 1 || serverTC.CurrentEpoch() < 1 {
+		t.Fatalf("expected automatic rekey to advance epochs, got client=%d server=%d",
+			clientTC.CurrentEpoch(), serverTC.CurrentEpoch())
 	}
 }
 
