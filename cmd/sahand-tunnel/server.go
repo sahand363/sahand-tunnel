@@ -129,6 +129,98 @@ func sampleAnalyticsTick() {
 	}
 }
 
+// Allocates a non-colliding set of Engine 1 (`ListenPort`) and Engine 2 (`ForwardPorts`)
+// defaults when adding a new server on the Master node so multiple servers never
+// collide on local listener sockets:
+//   - Server 1 (slot 0): Engine 1 = 28001..28030, Engine 2 = 32001..32030
+//   - Server 2 (slot 1): Engine 1 = 29001..29030, Engine 2 = 33001..33030
+//   - Server 3 (slot 2): Engine 1 = 30001..30030, Engine 2 = 34001..34030
+func allocateNonCollidingTunnelsForNewPeer(existing []ServerPeer, peerID, remoteIP string) []TunnelConfig {
+	usedListenPorts := make(map[int]bool)
+	usedForwardPorts := make(map[int]bool)
+	for _, srv := range existing {
+		for _, t := range srv.Tunnels {
+			if t.ListenPort > 0 {
+				usedListenPorts[t.ListenPort] = true
+			}
+			for _, fpStr := range parsePortList(t.ForwardPorts) {
+				if p, err := strconv.Atoi(fpStr); err == nil && p > 0 {
+					usedForwardPorts[p] = true
+				}
+			}
+		}
+	}
+
+	slot := 0
+	for slot < 25 {
+		e1Base := 28000 + slot*1000
+		e2Base := 32000 + slot*1000
+		if e2Base+30 > 65000 {
+			break
+		}
+		conflict := false
+		for id := 1; id <= 30; id++ {
+			if usedListenPorts[e1Base+id] || usedForwardPorts[e2Base+id] {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			break
+		}
+		slot++
+	}
+
+	e1Base := 28000 + slot*1000
+	e2Base := 32000 + slot*1000
+	tunnels := defaultTunnelsForServer()
+	cidr, mIP, aIP := deriveDefaultSlash30ForPeer(peerID)
+
+	for i := range tunnels {
+		id := tunnels[i].ID
+		tunnels[i].ListenPort = e1Base + id
+		tunnels[i].ForwardPorts = strconv.Itoa(e2Base + id)
+
+		if id == 25 && tunnels[i].GREFRP != nil {
+			tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
+			tunnels[i].GREFRP.LocalPrivateIP = mIP
+			tunnels[i].GREFRP.RemotePrivateIP = aIP
+			tunnels[i].GREFRP.RemotePublicIP = remoteIP
+			if len(peerID) >= 6 {
+				tunnels[i].GREFRP.GREInterfaceName = "gre-" + peerID[:6]
+			}
+			tunnels[i].GREFRP.RouteConfig = fmt.Sprintf("%s via %s", cidr, tunnels[i].GREFRP.GREInterfaceName)
+			tunnels[i].GREFRP.FRPServerPort = tunnels[i].ListenPort
+			tunnels[i].GREFRP.ForwardingRules = buildGREFRPRulesFromCSV(
+				tunnels[i].ForwardPorts,
+				tunnels[i].GREFRP.FRPEncryption,
+				tunnels[i].GREFRP.FRPCompression,
+				tunnels[i].GREFRP.FRPProxyProtoV2,
+			)
+		}
+
+		if id == 26 && tunnels[i].SpoofWG != nil {
+			tunnels[i].SpoofWG.Role = "local"
+			tunnels[i].SpoofWG.PeerPublicIP = remoteIP
+			if slot > 0 {
+				subnetOctet := (20 + slot) % 250
+				if subnetOctet <= 0 {
+					subnetOctet = 21
+				}
+				tunnels[i].SpoofWG.WGLocalIP = fmt.Sprintf("10.%d.0.1", subnetOctet)
+				tunnels[i].SpoofWG.WGPeerIP = fmt.Sprintf("10.%d.0.2", subnetOctet)
+				tunnels[i].SpoofWG.SpoofListenPort = defaultSpoofPort + slot
+				tunnels[i].SpoofWG.RecvPort = defaultRecvPort + slot
+				tunnels[i].SpoofWG.CorePort = defaultCorePort + slot
+				tunnels[i].SpoofWG.WGListen = defaultWGListen + slot
+			}
+			tunnels[i].SpoofWG = normalizeSpoofWGConfig(tunnels[i].SpoofWG)
+		}
+	}
+
+	return tunnels
+}
+
 func runServer() error {
 	cfg, exists, err := loadExistingConfig(configPath())
 	if err != nil {
@@ -366,23 +458,7 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "could not generate peer secret", http.StatusInternalServerError)
 			return
 		}
-		tunnels := defaultTunnelsForServer()
-		cidr, mIP, aIP := deriveDefaultSlash30ForPeer(peerID)
-		for i := range tunnels {
-			if tunnels[i].ID == 25 && tunnels[i].GREFRP != nil {
-				tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
-				tunnels[i].GREFRP.LocalPrivateIP = mIP
-				tunnels[i].GREFRP.RemotePrivateIP = aIP
-				tunnels[i].GREFRP.RemotePublicIP = ip
-				tunnels[i].GREFRP.GREInterfaceName = "gre-" + peerID[:6]
-				tunnels[i].GREFRP.RouteConfig = fmt.Sprintf("%s via %s", cidr, tunnels[i].GREFRP.GREInterfaceName)
-			}
-			if tunnels[i].ID == 26 && tunnels[i].SpoofWG != nil {
-				tunnels[i].SpoofWG.Role = "local"
-				tunnels[i].SpoofWG.PeerPublicIP = ip
-				tunnels[i].SpoofWG = normalizeSpoofWGConfig(tunnels[i].SpoofWG)
-			}
-		}
+		tunnels := allocateNonCollidingTunnelsForNewPeer(appCfg.Servers, peerID, ip)
 
 		peer := ServerPeer{
 			ID:                         peerID,
@@ -428,9 +504,6 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		prevPeerID = appCfg.Servers[0].ID
 	}
 
-	// If the web UI form did not include an explicit master_key_fingerprint field,
-	// use the already-pinned TrustedMasterSigningPublicKey or derive the fingerprint
-	// from the verified Ed25519-signed st2. token so 1-click UI pairing works seamlessly.
 	fpToVerify := strings.TrimSpace(req.MasterKeyFingerprint)
 	if fpToVerify == "" {
 		if appCfg.TrustedMasterSigningPublicKey != "" {
