@@ -1288,7 +1288,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, dist fs.FS) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = io.WriteString(index)
+	_, _ = w.Write(index)
 }
 
 const loginHTML = `<!DOCTYPE html>
