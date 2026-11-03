@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"io"
 	"net"
 	"os"
@@ -182,10 +183,6 @@ func TestSpoofWGProbeParitySyncAndBidirectionalForwarding(t *testing.T) {
 	}
 
 	// 3. Engine 2 UDP Forwarding
-	udpEntryPort := allocateFreeUDPPort(t)
-	tcUDP := tc
-	tcUDP.ForwardPorts = strconv.Itoa(udpEntryPort)
-	// Map udpEntryPort to udpTargetPort by testing direct dialSpoofWGCarrier UDP command
 	uCarrier, err := dialSpoofWGCarrier(peer, tc, spoofWGCmdUDP, udpTargetPort, 4*time.Second)
 	if err != nil {
 		t.Fatalf("dialSpoofWGCarrier UDP failed: %v", err)
