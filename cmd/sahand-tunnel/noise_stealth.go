@@ -586,11 +586,6 @@ func loadLocalNoiseKeyMaterial(cfg Config, peer ServerPeer) (localStatic noiseDH
 	return localStatic, ed25519.PrivateKey(edPriv), strings.ToLower(strings.TrimSpace(signPubHex)), psk, nil
 }
 
-// Loads the Responder's static keypair and expected remote Initiator static public key.
-// - On an Agent node (or a local 127.0.0.1 listener in single-process Master->Agent tests),
-//   the responder uses AgentNoiseStaticPrivateKey and expects MasterNoiseStaticPublicKey.
-// - On a Master node receiving an inbound reverse connection from a remote Agent IP,
-//   the responder uses MasterNoiseStaticPrivateKey and expects peer.AgentNoiseStaticPublicKey.
 func loadResponderNoiseKeyMaterial(cfg Config, peer ServerPeer) (localStatic noiseDHKey, expectedRemoteStatic []byte, psk [32]byte, err error) {
 	pskSlice, err := derivePeerSubKey(cfg, peer, "noise-ikpsk2-key-v2")
 	if err != nil {
@@ -1036,11 +1031,13 @@ func (ntc *noiseTransportConn) WriteFrame(frameType byte, plaintext []byte) erro
 		ntc.initiator &&
 		ntc.autoRekeyEvery > 0 &&
 		ntc.txFramesInEpoch >= ntc.autoRekeyEvery
+	if shouldAutoRekey {
+		if _, payload, rErr := ntc.beginRekeyInit(); rErr == nil {
+			_ = ntc.writeFrameLocked(noiseFrameTypeRekeyInit, payload)
+		}
+	}
 	ntc.writeMu.Unlock()
 
-	if shouldAutoRekey {
-		_ = ntc.Rekey(noiseDefaultRekeyWait)
-	}
 	return err
 }
 
@@ -1155,6 +1152,12 @@ func (ntc *noiseTransportConn) Write(p []byte) (int, error) {
 }
 
 func (ntc *noiseTransportConn) Read(p []byte) (int, error) {
+	if ntc.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	ntc.readMu.Lock()
+	defer ntc.readMu.Unlock()
+
 	ntc.bufMu.Lock()
 	if ntc.readBuf.Len() > 0 {
 		n, err := ntc.readBuf.Read(p)
@@ -1164,9 +1167,12 @@ func (ntc *noiseTransportConn) Read(p []byte) (int, error) {
 	ntc.bufMu.Unlock()
 
 	for {
-		fType, plain, err := ntc.ReadFrame()
+		fType, plain, err := ntc.readFrameLocked()
 		if err != nil {
 			return 0, err
+		}
+		if fType == noiseFrameTypeRekeyInit || fType == noiseFrameTypeRekeyAck || fType == noiseFrameTypeRekeyCommit {
+			continue
 		}
 		if fType == noiseFrameTypeClose {
 			return 0, io.EOF
