@@ -72,6 +72,7 @@ type mockRawIPSocket struct {
 	sw         *mockRawIPSwitch
 	localIP    net.IP
 	inbox      chan mockRawIPPacket
+	closedCh   chan struct{}
 	deadlineMu sync.Mutex
 	readTimer  *time.Timer
 	deadlineCh chan struct{}
@@ -87,6 +88,7 @@ func (sw *mockRawIPSwitch) newSocket(localIP net.IP) *mockRawIPSocket {
 		sw:         sw,
 		localIP:    cloneIP(localIP.To4()),
 		inbox:      make(chan mockRawIPPacket, 512),
+		closedCh:   make(chan struct{}),
 		deadlineCh: make(chan struct{}),
 	}
 	sw.sockets[s.id] = s
@@ -106,18 +108,15 @@ func (s *mockRawIPSocket) WriteToIP(b []byte, addr *net.IPAddr) (int, error) {
 	}
 
 	s.sw.mu.RLock()
-	targets := make([]*mockRawIPSocket, 0, len(s.sw.sockets))
-	for _, sock := range s.sw.sockets {
-		targets = append(targets, sock)
-	}
-	s.sw.mu.RUnlock()
+	defer s.sw.mu.RUnlock()
 
 	// Just like Linux's ip4:tcp raw socket subsystem, every open ip4:tcp socket
 	// receives a copy of incoming IPPROTO_TCP segments and must filter by port/IP/checksum.
-	for _, sock := range targets {
+	for _, sock := range s.sw.sockets {
 		if !sock.closed.Load() {
 			select {
 			case sock.inbox <- mockRawIPPacket{srcIP: cloneIP(srcIP), rawSegment: cp}:
+			case <-sock.closedCh:
 			default:
 			}
 		}
@@ -134,8 +133,10 @@ func (s *mockRawIPSocket) ReadFromIP(b []byte) (int, *net.IPAddr, error) {
 	s.deadlineMu.Unlock()
 
 	select {
-	case pkt, ok := <-s.inbox:
-		if !ok {
+	case <-s.closedCh:
+		return 0, nil, net.ErrClosed
+	case pkt := <-s.inbox:
+		if s.closed.Load() {
 			return 0, nil, net.ErrClosed
 		}
 		n := copy(b, pkt.rawSegment)
@@ -169,8 +170,13 @@ func (s *mockRawIPSocket) SetReadDeadline(t time.Time) error {
 		return nil
 	}
 	s.readTimer = time.AfterFunc(d, func() {
-		defer func() { _ = recover() }()
-		close(ch)
+		s.deadlineMu.Lock()
+		defer s.deadlineMu.Unlock()
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
 	})
 	return nil
 }
@@ -186,7 +192,7 @@ func (s *mockRawIPSocket) Close() error {
 	s.sw.mu.Lock()
 	delete(s.sw.sockets, s.id)
 	s.sw.mu.Unlock()
-	close(s.inbox)
+	close(s.closedCh)
 	return nil
 }
 
@@ -331,10 +337,6 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 	tc.Enabled = true
 	tc.ForwardPorts = strconv.Itoa(targetPort)
 
-	// 1. Simulate an environment where RAW_IP initialization fails:
-	//    - "raw_ip" mode MUST fail with a clear error (never silently falling back to UDP).
-	//    - "auto" mode MUST fall back to UDP_FALLBACK and explicitly report the fallback reason.
-	//    - "udp" mode MUST initialize UDP_FALLBACK directly with no fallback warning.
 	rawIPSkipIPTablesForTest.Store(true)
 	rawIPTestHookMu.Lock()
 	rawIPCustomDialer = func(_ net.IP, _ uint16) (rawIPConnHandle, error) {
@@ -373,9 +375,6 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 	}
 	_ = udpBackend.Close()
 
-	// 2. Now enable the in-memory IPv4 raw socket switch (`ip4:tcp`) and test pure bidirectional RAW_IP mode:
-	//    - No UDP sockets are used; packets travel through `rawIPSocketBackend.SendPacket` & `ReceivePacket`.
-	//    - Verify port filtering (unrelated TCP ports are ignored) and checksum filtering.
 	sw := newMockRawIPSwitch()
 	rawIPTestHookMu.Lock()
 	rawIPCustomDialer = func(listenIP net.IP, _ uint16) (rawIPConnHandle, error) {
@@ -391,8 +390,8 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 		t.Fatalf("startSahandRawServer in raw_ip mode failed: %v", err)
 	}
 	defer func() {
-		_ = pConn.Close()
 		stopSahandRawPeerResources(peer.ID)
+		_ = pConn.Close()
 	}()
 
 	sahandRawMu.RLock()
@@ -402,14 +401,13 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 		t.Fatalf("expected server to run on %q backend, got %v", RawBackendNameRawIP, srvMux)
 	}
 
-	// Inject noise traffic (wrong port & corrupted checksum) into the raw IP switch to verify packet filtering
 	noiseSock := sw.newSocket(net.IPv4(127, 0, 0, 1))
 	defer noiseSock.Close()
 	wrongPortPkt, _ := encodeRawTCPPacket(rawTCPPacket{
 		SrcIP:   net.IPv4(127, 0, 0, 1).To4(),
 		DstIP:   net.IPv4(127, 0, 0, 1).To4(),
 		SrcPort: 55555,
-		DstPort: 9999, // Wrong destination port
+		DstPort: 9999,
 		SeqNum:  1,
 		Flags:   rawTCPFlagPSH | rawTCPFlagACK,
 		Payload: make([]byte, 32),
@@ -425,11 +423,9 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 		Flags:   rawTCPFlagPSH | rawTCPFlagACK,
 		Payload: make([]byte, 32),
 	})
-	// Corrupt checksum
 	binary.BigEndian.PutUint16(badCsumPkt[16:18], 0xDEAD)
 	_, _ = noiseSock.WriteToIP(badCsumPkt, &net.IPAddr{IP: net.IPv4(127, 0, 0, 1)})
 
-	// Probe & open a bidirectional stream strictly over the RAW_IP backend
 	probeRes := probeSahandRaw(peer, tc, "master-node-01")
 	if !probeRes.Success {
 		t.Fatalf("expected probeSahandRaw over RAW_IP backend to succeed, got: %s", probeRes.ErrorReason)
@@ -447,7 +443,6 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream over RAW_IP failed: %v", err)
 	}
-	defer st.Close()
 
 	testData := make([]byte, 16*1024)
 	_, _ = io.ReadFull(rand.Reader, testData)
@@ -458,6 +453,7 @@ func TestSahandRawTransportModeSelectionAndBidirectionalRawIP(t *testing.T) {
 	if _, err := io.ReadFull(st, echoed); err != nil || !bytes.Equal(testData, echoed) {
 		t.Fatalf("bidirectional stream over RAW_IP failed: err=%v", err)
 	}
+	_ = st.Close()
 }
 
 func TestSahandRawTransportLossDuplicationAndReordering(t *testing.T) {
@@ -476,8 +472,8 @@ func TestSahandRawTransportLossDuplicationAndReordering(t *testing.T) {
 		t.Fatalf("startSahandRawServer failed: %v", err)
 	}
 	defer func() {
-		_ = pConn.Close()
 		stopSahandRawPeerResources(peer.ID)
+		_ = pConn.Close()
 	}()
 
 	sess, err := getOrDialSahandRawSession(peer, tc, 4*time.Second)
@@ -576,22 +572,19 @@ func TestSahandRawProbeParitySyncAndMultiStreamIntegration(t *testing.T) {
 		t.Fatalf("startSahandRawServer failed: %v", err)
 	}
 	defer func() {
-		_ = pConn.Close()
 		stopSahandRawPeerResources(peer.ID)
+		_ = pConn.Close()
 	}()
 
-	// 1. Engine 1 Probe
 	probeRes := probeSahandRaw(peer, tc, "master-node-01")
 	if !probeRes.Success {
 		t.Fatalf("expected probeSahandRaw to succeed, got: %s", probeRes.ErrorReason)
 	}
 
-	// 2. Engine 1 Parity Sync (transmits full 30-tunnel SyncPacket over multiplexed ARQ stream)
 	if !pushSahandRawParitySync(peer, tc, probeRes.LatencyMS) {
 		t.Fatalf("expected pushSahandRawParitySync to succeed")
 	}
 
-	// 3. Unauthorized target port rejection
 	sess, err := getOrDialSahandRawSession(peer, tc, 4*time.Second)
 	if err != nil {
 		t.Fatalf("getOrDialSahandRawSession failed: %v", err)
@@ -600,7 +593,6 @@ func TestSahandRawProbeParitySyncAndMultiStreamIntegration(t *testing.T) {
 		t.Fatalf("expected unauthorized target port 65000 to be rejected")
 	}
 
-	// 4. Engine 2 Concurrent Multiplexed TCP Streams across multiple ports
 	entryLn1, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("entryLn1 failed: %v", err)
@@ -656,7 +648,6 @@ func TestSahandRawProbeParitySyncAndMultiStreamIntegration(t *testing.T) {
 		}
 	}
 
-	// 5. Engine 2 Generic UDP Datagram Forwarding
 	sessUDP, err := getOrDialSahandRawSession(peer, tc, 4*time.Second)
 	if err != nil {
 		t.Fatalf("getOrDialSahandRawSession for UDP failed: %v", err)
