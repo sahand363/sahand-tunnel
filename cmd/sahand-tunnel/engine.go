@@ -196,6 +196,7 @@ func stopAllServerListeners(peerID string) {
 	stopWSMultiplexPeerResources(peerID)
 	stopSahandRawPeerResources(peerID)
 	stopGREFRPPeerResources(peerID)
+	stopSpoofWGPeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -224,6 +225,28 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 26 (Spoof + WireGuard): Bidirectional IP-Spoofing Pipe + WireGuard Overlay Engine
+		if tc.ID == 26 {
+			if ln, err := startSpoofWGServerListener(peer, tc); err == nil && ln != nil {
+				bound = append(bound, ln)
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startSpoofWGUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
 			continue
 		}
 
@@ -555,7 +578,7 @@ func syncServerListeners(peer ServerPeer) {
 			continue
 		}
 
-		// Method 10 (Noise TCP Stealth): Noise_IK_25519_ChaChaPoly_BLAKE2s with obfuscated length headers
+		// Method 10 (Noise TCP Stealth): Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s with obfuscated length headers
 		if tc.ID == 10 {
 			if ln, err := startNoiseStealthServerListener(peer, tc); err == nil {
 				bound = append(bound, ln)
@@ -854,6 +877,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardSahandRawTraffic(client, peer, tc, targetPort)
 	case 25:
 		forwardGREFRPTraffic(client, peer, tc, targetPort)
+	case 26:
+		forwardSpoofWGTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -1095,6 +1120,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeSahandRaw(peer, tc, localNodeID)
 	case 25:
 		res = probeGREFRP(peer, tc, localNodeID)
+	case 26:
+		res = probeSpoofWG(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -1105,6 +1132,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 26:
+		return pushSpoofWGParitySync(peer, tc, latencyMS)
 	case 25:
 		return pushGREFRPParitySync(peer, tc, latencyMS)
 	case 24:
@@ -1566,7 +1595,6 @@ func startDiscoveryLoop(peerID string) {
 				}
 			}
 
-			// Silent jittered liveness monitor: keeps the active method locked as long as it works
 			for {
 				jitterWait := time.Duration(65+randomIntN(45)) * time.Second
 				timer := time.NewTimer(jitterWait)
