@@ -159,24 +159,62 @@ type GREFRPConfig struct {
 	Diagnostics        GREFRPDiagnostics   `json:"diagnostics"`
 }
 
+type SpoofWGHealth struct {
+	BinaryInstalled bool   `json:"binary_installed"`
+	CoreActive      bool   `json:"core_active"`
+	WGActive        bool   `json:"wg_active"`
+	PeerPing        bool   `json:"peer_ping"`
+	Handshake       string `json:"handshake,omitempty"`
+	ActivePath      string `json:"active_path,omitempty"` // "WIREGUARD_SPOOF" or "DIRECT_CARRIER"
+	LastError       string `json:"last_error,omitempty"`
+}
+
+type SpoofWGConfig struct {
+	Role            string        `json:"role"`             // "local" (Iran/Master) | "remote" (Foreign/Agent)
+	ServiceEnabled  bool          `json:"service_enabled"`  // whether systemd spoof-core + wg-quick@wg-spoof is enabled
+	PeerPublicIP    string        `json:"peer_public_ip"`   // the other server's real public IPv4
+	LocalPublicIP   string        `json:"local_public_ip"`  // this server's real public IPv4 (for bundle generation)
+	SpoofListenPort int           `json:"spoof_listen_port"` // public port the remote receives on (default 8090)
+	RecvPort        int           `json:"recv_port"`        // local recv port / remote client_port (default 5001)
+	SpoofPort       int           `json:"spoof_port"`       // source port stamped on outgoing packets (default 443 on local)
+	SpoofIPs        []string      `json:"spoof_ips"`        // forged source IPv4 addresses (single inline or round-robin file)
+	SendTransport   string        `json:"send_transport"`   // "tcp" | "udp" | "icmp" | "icmpv6"
+	RecvTransport   string        `json:"recv_transport"`   // "tcp" | "udp" | "icmp" | "icmpv6"
+	WGInterface     string        `json:"wg_interface"`     // default "wg-spoof"
+	WGPrivKey       string        `json:"wg_priv_key,omitempty"`
+	WGPubKey        string        `json:"wg_pub_key"`
+	WGPeerPub       string        `json:"wg_peer_pub"`
+	WGPeerPriv      string        `json:"wg_peer_priv,omitempty"`
+	WGLocalIP       string        `json:"wg_local_ip"` // 10.20.0.1 (local) / 10.20.0.2 (remote)
+	WGPeerIP        string        `json:"wg_peer_ip"`  // 10.20.0.2 (local) / 10.20.0.1 (remote)
+	WGListen        int           `json:"wg_listen"`   // foreign WireGuard listen port (default 51820)
+	CorePort        int           `json:"core_port"`   // local core UDP listen port (default 5000)
+	WGMTU           int           `json:"wg_mtu"`      // default 1280
+	LastBundle      string        `json:"last_bundle,omitempty"`
+	LastError       string        `json:"last_error,omitempty"`
+	UpdatedAt       string        `json:"updated_at,omitempty"`
+	Health          SpoofWGHealth `json:"health"`
+}
+
 type TunnelConfig struct {
-	ID             int           `json:"id"`
-	Name           string        `json:"name"`
-	Security       int           `json:"security"`
-	TrafficType    string        `json:"traffic_type"`
-	Implemented    bool          `json:"implemented"`
-	Enabled        bool          `json:"enabled"`
-	ListenPort     int           `json:"listen_port"`
-	ForwardPorts   string        `json:"forward_ports"`
-	SNI            string        `json:"sni,omitempty"`
-	WSPath         string        `json:"ws_path,omitempty"`
-	CertPin        string        `json:"cert_pin,omitempty"`
-	RawTransport   string        `json:"raw_transport,omitempty"`
-	GREFRP         *GREFRPConfig `json:"gre_frp,omitempty"`
-	HeartbeatSec   int           `json:"heartbeat_sec,omitempty"`
-	StreamLimit    int           `json:"stream_limit,omitempty"`
-	SpeedLimitMBps string        `json:"speed_limit_mbps"`
-	LastDiscovery  MethodResult  `json:"last_discovery"`
+	ID             int            `json:"id"`
+	Name           string         `json:"name"`
+	Security       int            `json:"security"`
+	TrafficType    string         `json:"traffic_type"`
+	Implemented    bool           `json:"implemented"`
+	Enabled        bool           `json:"enabled"`
+	ListenPort     int            `json:"listen_port"`
+	ForwardPorts   string         `json:"forward_ports"`
+	SNI            string         `json:"sni,omitempty"`
+	WSPath         string         `json:"ws_path,omitempty"`
+	CertPin        string         `json:"cert_pin,omitempty"`
+	RawTransport   string         `json:"raw_transport,omitempty"`
+	GREFRP         *GREFRPConfig  `json:"gre_frp,omitempty"`
+	SpoofWG        *SpoofWGConfig `json:"spoof_wg,omitempty"`
+	HeartbeatSec   int            `json:"heartbeat_sec,omitempty"`
+	StreamLimit    int            `json:"stream_limit,omitempty"`
+	SpeedLimitMBps string         `json:"speed_limit_mbps"`
+	LastDiscovery  MethodResult   `json:"last_discovery"`
 }
 
 type ServerPeer struct {
@@ -317,7 +355,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{23, "HTTP Upgrade", 74, "tcp", true, 28023, []string{"listen_port", "forward_ports", "sni", "ws_path", "speed_limit_mbps"}},
 	{24, "SAHAND-RAW", 96, "tcp+udp", true, 28024, []string{"listen_port", "forward_ports", "raw_transport", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{25, "GRE + FRP", 91, "tcp+udp", true, 28025, []string{"listen_port", "forward_ports", "gre_frp", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
-	{26, "Stream Bridge", 80, "tcp+udp", false, 28026, []string{"listen_port", "forward_ports", "stream_limit"}},
+	{26, "Spoof + WireGuard", 94, "tcp+udp", true, 28026, []string{"listen_port", "forward_ports", "spoof_wg", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{27, "Fallback TCP", 42, "tcp", false, 28027, []string{"listen_port", "forward_ports"}},
 	{28, "Custom TLS", 91, "tcp", false, 28028, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
 	{29, "Hybrid Transport", 87, "tcp+udp", false, 28029, []string{"listen_port", "forward_ports", "sni"}},
@@ -790,6 +828,34 @@ func buildGREFRPRulesFromCSV(csvPorts string, enc, comp, ppv2 bool) []GREFRPForw
 	return rules
 }
 
+func defaultSpoofWGConfig() *SpoofWGConfig {
+	role := "local"
+	if atomicIsAgent.Load() {
+		role = "remote"
+	}
+	cfg := &SpoofWGConfig{
+		Role:            role,
+		ServiceEnabled:  false,
+		SpoofListenPort: defaultSpoofPort,
+		RecvPort:        defaultRecvPort,
+		SpoofPort:       443,
+		SpoofIPs:        []string{"8.8.8.8"},
+		SendTransport:   "tcp",
+		RecvTransport:   "udp",
+		WGInterface:     spoofIface,
+		WGLocalIP:       "10.20.0.1",
+		WGPeerIP:        "10.20.0.2",
+		WGListen:        defaultWGListen,
+		CorePort:        defaultCorePort,
+		WGMTU:           defaultWGMTU,
+		Health: SpoofWGHealth{
+			ActivePath: "DIRECT_CARRIER",
+		},
+	}
+	applySpoofWGRoleDefaults(cfg)
+	return cfg
+}
+
 func defaultTunnelsForServer() []TunnelConfig {
 	list := make([]TunnelConfig, 0, len(methodCatalogue))
 	for _, item := range methodCatalogue {
@@ -817,6 +883,8 @@ func defaultTunnelsForServer() []TunnelConfig {
 				tc.RawTransport = "auto"
 			case "gre_frp":
 				tc.GREFRP = defaultGREFRPConfig(tc.ListenPort, tc.ForwardPorts)
+			case "spoof_wg":
+				tc.SpoofWG = defaultSpoofWGConfig()
 			case "heartbeat_sec":
 				tc.HeartbeatSec = 30
 			case "stream_limit":
@@ -870,6 +938,9 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			}
 			if def.ID == 25 {
 				cur.GREFRP = normalizeGREFRPConfig(cur.GREFRP, cur.ListenPort, cur.ForwardPorts)
+			}
+			if def.ID == 26 {
+				cur.SpoofWG = normalizeSpoofWGConfig(cur.SpoofWG)
 			}
 			if cur.HeartbeatSec <= 0 {
 				cur.HeartbeatSec = def.HeartbeatSec
@@ -1090,9 +1161,6 @@ func ensureCryptoMaterial(cfg *Config) (bool, error) {
 // STAGE 1: CANONICAL BINARY SERIALIZATION, ED25519 SIGNING & TRUST ESTABLISHMENT
 // ============================================================================
 
-// Returns the Master's Ed25519 signing and X25519 Noise static keypairs.
-// If a unit test constructs a `Config` struct literal directly without calling `ensureCryptoMaterial`,
-// falls back to deterministic test keys seeded from `cfg.TokenSecret` and `cfg.NodeID`.
 func resolveMasterKeyMaterial(cfg Config) (signPrivHex, signPubHex, noisePrivHex, noisePubHex string, err error) {
 	signPrivHex = strings.ToLower(strings.TrimSpace(cfg.MasterSigningPrivateKey))
 	signPubHex = strings.ToLower(strings.TrimSpace(cfg.MasterSigningPublicKey))
@@ -1446,6 +1514,11 @@ func VerifyAndEstablishInitialTrust(cfg *Config, masterIP, rawToken, expectedFin
 				tunnels[i].GREFRP.GREInterfaceName = "gre-" + tp.AID[:6]
 			}
 			tunnels[i].GREFRP.FRPServerPort = tunnels[i].ListenPort
+		}
+		if tunnels[i].ID == 26 && tunnels[i].SpoofWG != nil {
+			tunnels[i].SpoofWG.Role = "remote"
+			tunnels[i].SpoofWG.PeerPublicIP = ip
+			applySpoofWGRoleDefaults(tunnels[i].SpoofWG)
 		}
 	}
 
