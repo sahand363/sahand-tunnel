@@ -99,6 +99,43 @@ type GREFRPConfig = {
   diagnostics: GREFRPDiagnostics;
 };
 
+type SpoofWGHealth = {
+  binary_installed: boolean;
+  core_active: boolean;
+  wg_active: boolean;
+  peer_ping: boolean;
+  handshake?: string;
+  active_path?: string;
+  last_error?: string;
+};
+
+type SpoofWGConfig = {
+  role: string;
+  service_enabled: boolean;
+  peer_public_ip: string;
+  local_public_ip: string;
+  spoof_listen_port: number;
+  recv_port: number;
+  spoof_port: number;
+  spoof_ips: string[];
+  send_transport: string;
+  recv_transport: string;
+  wg_interface: string;
+  wg_priv_key?: string;
+  wg_pub_key: string;
+  wg_peer_pub: string;
+  wg_peer_priv?: string;
+  wg_local_ip: string;
+  wg_peer_ip: string;
+  wg_listen: number;
+  core_port: number;
+  wg_mtu: number;
+  last_bundle?: string;
+  last_error?: string;
+  updated_at?: string;
+  health: SpoofWGHealth;
+};
+
 type TunnelConfig = {
   id: number;
   name: string;
@@ -113,6 +150,7 @@ type TunnelConfig = {
   cert_pin?: string;
   raw_transport?: string;
   gre_frp?: GREFRPConfig;
+  spoof_wg?: SpoofWGConfig;
   heartbeat_sec?: number;
   stream_limit?: number;
   speed_limit_mbps: string;
@@ -231,6 +269,37 @@ function defaultClientGREFRP(listenPort: number, peerIP: string): GREFRPConfig {
   };
 }
 
+function defaultClientSpoofWG(role: Role, peerIP: string): SpoofWGConfig {
+  const isLocal = role === "master";
+  return {
+    role: isLocal ? "local" : "remote",
+    service_enabled: false,
+    peer_public_ip: peerIP,
+    local_public_ip: "",
+    spoof_listen_port: 8090,
+    recv_port: 5001,
+    spoof_port: isLocal ? 443 : 8090,
+    spoof_ips: ["8.8.8.8"],
+    send_transport: isLocal ? "tcp" : "udp",
+    recv_transport: isLocal ? "udp" : "tcp",
+    wg_interface: "wg-spoof",
+    wg_pub_key: "",
+    wg_peer_pub: "",
+    wg_local_ip: isLocal ? "10.20.0.1" : "10.20.0.2",
+    wg_peer_ip: isLocal ? "10.20.0.2" : "10.20.0.1",
+    wg_listen: 51820,
+    core_port: 5000,
+    wg_mtu: 1280,
+    health: {
+      binary_installed: false,
+      core_active: false,
+      wg_active: false,
+      peer_ping: false,
+      active_path: "DIRECT_CARRIER",
+    },
+  };
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>(() => {
     const saved = localStorage.getItem("sahand_tab");
@@ -265,6 +334,11 @@ export default function App() {
   const [pingingKey, setPingingKey] = useState<string | null>(null);
   const [greActionBusy, setGreActionBusy] = useState<string | null>(null);
   const [greActionNotice, setGreActionNotice] = useState<string>("");
+
+  const [spoofActionBusy, setSpoofActionBusy] = useState<string | null>(null);
+  const [spoofActionNotice, setSpoofActionNotice] = useState<string>("");
+  const [spoofBundleInput, setSpoofBundleInput] = useState<string>("");
+  const [copiedBundle, setCopiedBundle] = useState<boolean>(false);
 
   const [showPortSettings, setShowPortSettings] = useState(false);
   const [portDrafts, setPortDrafts] = useState<PortDraftMap>({});
@@ -466,6 +540,57 @@ export default function App() {
       }
     } finally {
       setGreActionBusy(null);
+    }
+  }
+
+  async function handleSpoofWGAction(
+    serverID: string,
+    action: "bundle" | "import" | "up" | "down" | "restart",
+    currentDraft: TunnelConfig
+  ) {
+    if (spoofActionBusy) return;
+    setSpoofActionBusy(action);
+    setSpoofActionNotice("");
+    try {
+      const res = await fetch("/api/v1/tunnels/spoof-wg", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          server_id: serverID,
+          action,
+          bundle: spoofBundleInput,
+          spoof_wg: currentDraft.spoof_wg,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSpoofActionNotice(data.message || "Operation completed");
+        if (data.spoof_wg) {
+          updateDraftTunnel(serverID, {
+            ...currentDraft,
+            spoof_wg: data.spoof_wg,
+          });
+        }
+        if (action === "import") {
+          setSpoofBundleInput("");
+        }
+        await fetchState();
+      } else {
+        setSpoofActionNotice("Error: " + (await res.text()));
+      }
+    } finally {
+      setSpoofActionBusy(null);
+    }
+  }
+
+  async function copySpoofBundleText(bundleStr: string) {
+    if (!bundleStr) return;
+    try {
+      await navigator.clipboard.writeText(bundleStr);
+      setCopiedBundle(true);
+      setTimeout(() => setCopiedBundle(false), 1800);
+    } catch {
+      // Clipboard fallback ignored
     }
   }
 
@@ -1307,7 +1432,7 @@ export default function App() {
                       id="master-token"
                       value={agentToken}
                       onChange={(event) => setAgentToken(event.target.value)}
-                      placeholder="st1.eyJ2IjoxLC..."
+                      placeholder="st2.eyJ2IjoyLC..."
                       autoComplete="off"
                     />
                   </div>
@@ -1618,6 +1743,24 @@ export default function App() {
                       });
                     };
 
+                    const swgDraft =
+                      tunnel.id === 26
+                        ? draft.spoof_wg ||
+                          defaultClientSpoofWG(role, selectedServer.ip)
+                        : null;
+
+                    const updateSWGDraft = (patch: Partial<SpoofWGConfig>) => {
+                      if (!swgDraft) return;
+                      const merged: SpoofWGConfig = {
+                        ...swgDraft,
+                        ...patch,
+                      };
+                      updateDraftTunnel(selectedServer.id, {
+                        ...draft,
+                        spoof_wg: merged,
+                      });
+                    };
+
                     return (
                       <article
                         className={`tunnel-card ${expanded ? "expanded" : ""}`}
@@ -1703,6 +1846,14 @@ export default function App() {
                               </span>
                             )}
 
+                            {tunnel.id === 26 && tunnel.spoof_wg && (
+                              <span className="proto-badge">
+                                {tunnel.spoof_wg.send_transport.toUpperCase()}/
+                                {tunnel.spoof_wg.recv_transport.toUpperCase()} •{" "}
+                                {tunnel.spoof_wg.wg_local_ip} ↔ {tunnel.spoof_wg.wg_peer_ip}
+                              </span>
+                            )}
+
                             {disc?.tested_at && (
                               <span
                                 className={`disc-pill ${
@@ -1729,7 +1880,7 @@ export default function App() {
                           </button>
                         </div>
 
-                        {expanded && tunnel.id !== 25 && (
+                        {expanded && tunnel.id !== 25 && tunnel.id !== 26 && (
                           <div className="tunnel-settings">
                             <div className="settings-title">
                               <Settings2 size={15} />
@@ -1900,7 +2051,6 @@ export default function App() {
 
                         {expanded && tunnel.id === 25 && gfDraft && (
                           <div className="tunnel-settings">
-                            {/* SECTION A: GRE NETWORK TUNNEL SETTINGS */}
                             <div className="settings-title">
                               <Settings2 size={15} />
                               <span>1. GRE Point-to-Point Network Tunnel Settings</span>
@@ -2086,7 +2236,6 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* SECTION B: FRP PORT FORWARDING SETTINGS */}
                             <div className="settings-title" style={{ marginTop: "18px" }}>
                               <Shield size={15} />
                               <span>
@@ -2215,7 +2364,6 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* SECTION C: PORT FORWARDING RULES */}
                             <div
                               className="settings-title"
                               style={{
@@ -2349,7 +2497,6 @@ export default function App() {
                               ))}
                             </div>
 
-                            {/* SECTION D: LIVE DIAGNOSTICS & SERVICE CONTROLS */}
                             {tunnel.gre_frp?.diagnostics && (
                               <div
                                 style={{
@@ -2414,7 +2561,7 @@ export default function App() {
                                       <span>Restart Engine</span>
                                     </button>
                                   </div>
-                                </div>
+                                </>
 
                                 {greActionNotice && (
                                   <div
@@ -2495,6 +2642,580 @@ export default function App() {
                                   <Save size={14} />
                                   <span>
                                     {isSaving ? "Saving..." : "Save GRE + FRP Settings"}
+                                  </span>
+                                </button>
+
+                                {noticeText && (
+                                  <span className="save-feedback-text">
+                                    ✓ {noticeText}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {expanded && tunnel.id === 26 && swgDraft && (
+                          <div className="tunnel-settings">
+                            {/* SECTION 1: SPOOF PIPE & CARRIER SETTINGS */}
+                            <div className="settings-title">
+                              <Settings2 size={15} />
+                              <span>1. Spoof Tunnel Pipe & Carrier Settings</span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label>SPOOF NODE ROLE</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.role || "local"}
+                                  onChange={(e) => {
+                                    const newRole = e.target.value;
+                                    updateSWGDraft({
+                                      role: newRole,
+                                      wg_local_ip:
+                                        newRole === "local" ? "10.20.0.1" : "10.20.0.2",
+                                      wg_peer_ip:
+                                        newRole === "local" ? "10.20.0.2" : "10.20.0.1",
+                                      spoof_port:
+                                        newRole === "local"
+                                          ? 443
+                                          : swgDraft.spoof_listen_port || 8090,
+                                    });
+                                  }}
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="local">Local (Iran / Initiator)</option>
+                                  <option value="remote">Remote (Foreign / Receiver)</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>PEER PUBLIC IPV4 ADDRESS</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={swgDraft.peer_public_ip || selectedServer.ip}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ peer_public_ip: e.target.value })
+                                  }
+                                  placeholder="198.51.100.12"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>THIS SERVER'S PUBLIC IPV4 (FOR BUNDLE)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={swgDraft.local_public_ip || ""}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ local_public_ip: e.target.value })
+                                  }
+                                  placeholder="Auto-detect or enter Iran IPv4"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>REMOTE LISTEN PORT (DEFAULT 8090)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.spoof_listen_port}
+                                  onChange={(e) =>
+                                    updateSWGDraft({
+                                      spoof_listen_port: Number(e.target.value) || 8090,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>LOCAL RECV / CLIENT PORT (DEFAULT 5001)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.recv_port}
+                                  onChange={(e) =>
+                                    updateSWGDraft({
+                                      recv_port: Number(e.target.value) || 5001,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>OUTGOING SPOOF PORT (DEFAULT 443)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.spoof_port}
+                                  onChange={(e) =>
+                                    updateSWGDraft({
+                                      spoof_port: Number(e.target.value) || 443,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>SEND TRANSPORT CARRIER</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.send_transport || "tcp"}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ send_transport: e.target.value })
+                                  }
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="tcp">TCP</option>
+                                  <option value="udp">UDP</option>
+                                  <option value="icmp">ICMP</option>
+                                  <option value="icmpv6">ICMPv6</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>RECEIVE TRANSPORT CARRIER</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.recv_transport || "udp"}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ recv_transport: e.target.value })
+                                  }
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="udp">UDP</option>
+                                  <option value="tcp">TCP</option>
+                                  <option value="icmp">ICMP</option>
+                                  <option value="icmpv6">ICMPv6</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field" style={{ gridColumn: "1 / -1" }}>
+                                <label>
+                                  FORGED SPOOF SOURCE IPV4 ADDRESSES (CSV — ROUND-ROBIN WHEN MULTIPLE)
+                                </label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={(swgDraft.spoof_ips || []).join(", ")}
+                                  onChange={(e) => {
+                                    const list = e.target.value
+                                      .split(",")
+                                      .map((s) => s.trim())
+                                      .filter(Boolean);
+                                    updateSWGDraft({ spoof_ips: list });
+                                  }}
+                                  placeholder="8.8.8.8, 1.1.1.1"
+                                />
+                              </div>
+                            </div>
+
+                            {/* SECTION 2: WIREGUARD OVERLAY & PORT FORWARDING SETTINGS */}
+                            <div className="settings-title" style={{ marginTop: "18px" }}>
+                              <Shield size={15} />
+                              <span>2. WireGuard Encrypted Overlay (wg-spoof) & Port Forwarding</span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label>LOCAL WIREGUARD IP (/24)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={swgDraft.wg_local_ip}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ wg_local_ip: e.target.value })
+                                  }
+                                  placeholder="10.20.0.1"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>PEER WIREGUARD IP (/32)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={swgDraft.wg_peer_ip}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ wg_peer_ip: e.target.value })
+                                  }
+                                  placeholder="10.20.0.2"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>LOCAL CORE UDP PORT (DEFAULT 5000)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.core_port}
+                                  onChange={(e) =>
+                                    updateSWGDraft({
+                                      core_port: Number(e.target.value) || 5000,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>FOREIGN WG LISTEN PORT (DEFAULT 51820)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.wg_listen}
+                                  onChange={(e) =>
+                                    updateSWGDraft({
+                                      wg_listen: Number(e.target.value) || 51820,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>WIREGUARD MTU (DEFAULT 1280)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={swgDraft.wg_mtu || 1280}
+                                  onChange={(e) =>
+                                    updateSWGDraft({
+                                      wg_mtu: Number(e.target.value) || 1280,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>SAHAND CARRIER PORT (ENGINE 1)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={draft.listen_port}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      listen_port: Number(e.target.value) || 28026,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>FORWARDING PORTS (CSV — ENGINE 2)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={draft.forward_ports}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      forward_ports: e.target.value,
+                                    })
+                                  }
+                                  placeholder="32026"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>SPEED LIMIT (MB/S, 0=UNLIMITED)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={draft.speed_limit_mbps ?? "0"}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      speed_limit_mbps: e.target.value,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>THIS SERVER'S WG PUBLIC KEY</label>
+                                <input
+                                  readOnly
+                                  value={swgDraft.wg_pub_key || "Generated automatically"}
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>PEER WG PUBLIC KEY</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={swgDraft.wg_peer_pub || ""}
+                                  onChange={(e) =>
+                                    updateSWGDraft({ wg_peer_pub: e.target.value })
+                                  }
+                                  placeholder="Auto-filled via Bundle"
+                                />
+                              </div>
+                            </div>
+
+                            {/* SECTION 3: ONE-STRING BUNDLE EXCHANGE (spf1_...) */}
+                            <div className="settings-title" style={{ marginTop: "18px" }}>
+                              <Copy size={15} />
+                              <span>3. Spoof + WireGuard Bundle Exchange (spf1_...)</span>
+                            </div>
+
+                            <div
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "10px",
+                                marginTop: "8px",
+                                padding: "12px",
+                                borderRadius: "10px",
+                                border: "1px solid rgba(148, 163, 184, 0.22)",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  gap: "8px",
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  className="next-method-btn"
+                                  disabled={spoofActionBusy !== null}
+                                  onClick={() =>
+                                    handleSpoofWGAction(
+                                      selectedServer.id,
+                                      "bundle",
+                                      draft
+                                    )
+                                  }
+                                >
+                                  <Plus size={13} />
+                                  <span>
+                                    {spoofActionBusy === "bundle"
+                                      ? "Generating..."
+                                      : "Generate Bundle (Iran Side)"}
+                                  </span>
+                                </button>
+
+                                {swgDraft.last_bundle && (
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    onClick={() =>
+                                      copySpoofBundleText(swgDraft.last_bundle || "")
+                                    }
+                                  >
+                                    {copiedBundle ? (
+                                      <Check size={13} />
+                                    ) : (
+                                      <Copy size={13} />
+                                    )}
+                                    <span>
+                                      {copiedBundle ? "Bundle Copied" : "Copy Bundle"}
+                                    </span>
+                                  </button>
+                                )}
+                              </div>
+
+                              {swgDraft.last_bundle && (
+                                <input
+                                  readOnly
+                                  value={swgDraft.last_bundle}
+                                  style={{ fontSize: "12px", fontFamily: "monospace" }}
+                                />
+                              )}
+
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "1fr auto",
+                                  gap: "8px",
+                                  alignItems: "center",
+                                }}
+                              >
+                                <input
+                                  value={spoofBundleInput}
+                                  onChange={(e) => setSpoofBundleInput(e.target.value)}
+                                  placeholder="Paste spf1_... bundle here to import on Foreign server"
+                                />
+                                <button
+                                  type="button"
+                                  className="next-method-btn"
+                                  disabled={
+                                    spoofActionBusy !== null ||
+                                    !spoofBundleInput.trim()
+                                  }
+                                  onClick={() =>
+                                    handleSpoofWGAction(
+                                      selectedServer.id,
+                                      "import",
+                                      draft
+                                    )
+                                  }
+                                >
+                                  <span>
+                                    {spoofActionBusy === "import"
+                                      ? "Importing..."
+                                      : "Import Bundle"}
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* SECTION 4: LIVE HEALTH & SERVICE MANAGEMENT */}
+                            <div
+                              style={{
+                                marginTop: "18px",
+                                padding: "12px 14px",
+                                borderRadius: "10px",
+                                border: "1px solid rgba(56, 189, 248, 0.25)",
+                                background: "rgba(15, 23, 42, 0.35)",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
+                                  gap: "8px",
+                                  marginBottom: "10px",
+                                }}
+                              >
+                                <span style={{ fontWeight: 700, fontSize: "13px" }}>
+                                  4. Live Spoof + WireGuard Health & Service Controls
+                                </span>
+                                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={spoofActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofWGAction(
+                                        selectedServer.id,
+                                        "up",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Play size={12} />
+                                    <span>Apply & Start</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={spoofActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofWGAction(
+                                        selectedServer.id,
+                                        "down",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Pause size={12} />
+                                    <span>Stop Services</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={spoofActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofWGAction(
+                                        selectedServer.id,
+                                        "restart",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <RefreshCw size={12} />
+                                    <span>Restart Carrier</span>
+                                  </button>
+                                </div>
+                              </div>
+
+                              {spoofActionNotice && (
+                                <div
+                                  style={{
+                                    fontSize: "12px",
+                                    color: "#38bdf8",
+                                    marginBottom: "8px",
+                                  }}
+                                >
+                                  {spoofActionNotice}
+                                </div>
+                              )}
+
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))",
+                                  gap: "8px",
+                                  fontSize: "12px",
+                                }}
+                              >
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>ACTIVE PATH: </span>
+                                  <strong>
+                                    {tunnel.spoof_wg?.health?.active_path ||
+                                      "DIRECT_CARRIER"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>SPOOF BINARY: </span>
+                                  <strong>
+                                    {tunnel.spoof_wg?.health?.binary_installed
+                                      ? "INSTALLED"
+                                      : "BUILT-IN FALLBACK"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>SPOOF-CORE SVC: </span>
+                                  <strong>
+                                    {tunnel.spoof_wg?.health?.core_active
+                                      ? "ACTIVE"
+                                      : "STANDBY"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>WG-SPOOF SVC: </span>
+                                  <strong>
+                                    {tunnel.spoof_wg?.health?.wg_active
+                                      ? "ACTIVE"
+                                      : "STANDBY"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>WG HANDSHAKE: </span>
+                                  <strong>
+                                    {tunnel.spoof_wg?.health?.handshake ||
+                                      (tunnel.spoof_wg?.health?.peer_ping
+                                        ? "FRESH"
+                                        : "STANDBY")}
+                                  </strong>
+                                </div>
+                              </div>
+                            </div>
+
+                            {errBanner && (
+                              <div className="form-error-banner" style={{ marginTop: "10px" }}>
+                                {errBanner}
+                              </div>
+                            )}
+
+                            {role === "master" && (
+                              <div className="settings-actions-row">
+                                <button
+                                  type="button"
+                                  className="save-tunnel-btn"
+                                  disabled={isSaving}
+                                  onClick={() =>
+                                    commitTunnelConfig(selectedServer.id, draft)
+                                  }
+                                >
+                                  <Save size={14} />
+                                  <span>
+                                    {isSaving
+                                      ? "Saving..."
+                                      : "Save Spoof + WireGuard Settings"}
                                   </span>
                                 </button>
 
