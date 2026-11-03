@@ -201,6 +201,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/tunnels/ports", requireAuth(handleBatchPortsUpdate))
 	mux.HandleFunc("/api/v1/tunnels/ping", requireAuth(handleTunnelPing))
 	mux.HandleFunc("/api/v1/tunnels/gre-frp", requireAuth(handleGREFRPAction))
+	mux.HandleFunc("/api/v1/tunnels/spoof-wg", requireAuth(handleSpoofWGAction))
 	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
 
 	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +276,14 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 					gf.Diagnostics = diag
 				}
 				tunnelsCopy[j].GREFRP = gf
+			}
+			if tunnelsCopy[j].ID == 26 {
+				swg := normalizeSpoofWGConfig(tunnelsCopy[j].SpoofWG)
+				if swg.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					swg.PeerPublicIP = srv.IP
+				}
+				swg.Health = querySpoofWGRuntimeHealth(swg)
+				tunnelsCopy[j].SpoofWG = swg
 			}
 		}
 		srvCopy.Tunnels = tunnelsCopy
@@ -368,6 +377,11 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 				tunnels[i].GREFRP.GREInterfaceName = "gre-" + peerID[:6]
 				tunnels[i].GREFRP.RouteConfig = fmt.Sprintf("%s via %s", cidr, tunnels[i].GREFRP.GREInterfaceName)
 			}
+			if tunnels[i].ID == 26 && tunnels[i].SpoofWG != nil {
+				tunnels[i].SpoofWG.Role = "local"
+				tunnels[i].SpoofWG.PeerPublicIP = ip
+				tunnels[i].SpoofWG = normalizeSpoofWGConfig(tunnels[i].SpoofWG)
+			}
 		}
 
 		peer := ServerPeer{
@@ -401,7 +415,6 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Agent pairing: verify out-of-band Master signing-key fingerprint before establishing or persisting trust
 	ip := strings.TrimSpace(req.IP)
 	rawToken := strings.TrimSpace(req.Token)
 	if ip == "" || rawToken == "" {
@@ -653,6 +666,152 @@ func handleGREFRPAction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string         `json:"server_id"`
+		Action   string         `json:"action"` // "bundle" | "import" | "up" | "down" | "restart"
+		Bundle   string         `json:"bundle,omitempty"`
+		SpoofWG  *SpoofWGConfig `json:"spoof_wg,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.Lock()
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	tIdx := -1
+	for i := range srv.Tunnels {
+		if srv.Tunnels[i].ID == 26 {
+			tIdx = i
+			break
+		}
+	}
+	if tIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "Method 26 (Spoof + WireGuard) not found", http.StatusNotFound)
+		return
+	}
+
+	cur := normalizeSpoofWGConfig(srv.Tunnels[tIdx].SpoofWG)
+	if req.SpoofWG != nil {
+		// Merge user-edited fields while preserving existing private keys if omitted
+		edited := *req.SpoofWG
+		if edited.WGPrivKey == "" {
+			edited.WGPrivKey = cur.WGPrivKey
+		}
+		if edited.WGPubKey == "" {
+			edited.WGPubKey = cur.WGPubKey
+		}
+		if edited.WGPeerPriv == "" {
+			edited.WGPeerPriv = cur.WGPeerPriv
+		}
+		if edited.WGPeerPub == "" {
+			edited.WGPeerPub = cur.WGPeerPub
+		}
+		cur = normalizeSpoofWGConfig(&edited)
+	}
+	if cur.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+		cur.PeerPublicIP = srv.IP
+	}
+
+	var msg string
+	var bundleOut string
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	switch action {
+	case "bundle":
+		bStr, err := makeSpoofWGBundle(cur, "")
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bundleOut = bStr
+		msg = "Generated spf1_ bundle for foreign server"
+
+	case "import":
+		imported, err := importSpoofWGBundle(req.Bundle, cur)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur = imported
+		bundleOut = cur.LastBundle
+		msg = fmt.Sprintf("Imported bundle (%s/%s, %s ↔ %s)",
+			cur.SendTransport, cur.RecvTransport, cur.WGLocalIP, cur.WGPeerIP)
+
+	case "up", "apply":
+		outMsg, err := applyLinuxSpoofAndWGServices(cur)
+		if err != nil {
+			cur.LastError = err.Error()
+			srv.Tunnels[tIdx].SpoofWG = cur
+			_ = saveConfig(configPath(), appCfg)
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur.LastError = ""
+		msg = outMsg
+
+	case "down", "stop":
+		stopLinuxSpoofAndWGServices(cur)
+		cur.LastError = ""
+		msg = "Spoof + WireGuard services stopped"
+
+	case "restart":
+		msg = "Spoof + WireGuard carrier listener restarted"
+
+	default:
+		stateMu.Unlock()
+		http.Error(w, "unknown action (expected bundle, import, up, down, or restart)", http.StatusBadRequest)
+		return
+	}
+
+	cur.Health = querySpoofWGRuntimeHealth(cur)
+	srv.Tunnels[tIdx].SpoofWG = cur
+	peerCopy := *srv
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	if action == "up" || action == "apply" || action == "import" || action == "restart" {
+		syncServerListeners(peerCopy)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK      bool           `json:"ok"`
+		Message string         `json:"message"`
+		Bundle  string         `json:"bundle,omitempty"`
+		SpoofWG *SpoofWGConfig `json:"spoof_wg"`
+		Health  SpoofWGHealth  `json:"health"`
+	}{
+		OK:      true,
+		Message: msg,
+		Bundle:  bundleOut,
+		SpoofWG: cur,
+		Health:  cur.Health,
+	})
+}
+
 func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -708,6 +867,22 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 				}
 				updated.ForwardPorts = syncForwardPortsCSVFromRules(updated.GREFRP)
 				updated.GREFRP = normalizeGREFRPConfig(updated.GREFRP, updated.ListenPort, updated.ForwardPorts)
+			}
+			if updated.ID == 26 {
+				prevSpoof := normalizeSpoofWGConfig(srv.Tunnels[i].SpoofWG)
+				if updated.SpoofWG != nil {
+					if updated.SpoofWG.WGPrivKey == "" {
+						updated.SpoofWG.WGPrivKey = prevSpoof.WGPrivKey
+					}
+					if updated.SpoofWG.WGPeerPriv == "" {
+						updated.SpoofWG.WGPeerPriv = prevSpoof.WGPeerPriv
+					}
+				}
+				updated.SpoofWG = normalizeSpoofWGConfig(updated.SpoofWG)
+				if updated.SpoofWG.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					updated.SpoofWG.PeerPublicIP = srv.IP
+				}
+				updated.SpoofWG.Health = querySpoofWGRuntimeHealth(updated.SpoofWG)
 			}
 			if strings.TrimSpace(updated.SpeedLimitMBps) == "" {
 				updated.SpeedLimitMBps = "0"
