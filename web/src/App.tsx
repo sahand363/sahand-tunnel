@@ -607,14 +607,61 @@ export default function App() {
     }
   }
 
-  async function copySpoofBundleText(bundleStr: string) {
-    if (!bundleStr) return;
+  async function copyTextUniversal(text: string): Promise<boolean> {
+    if (!text) return false;
     try {
-      await navigator.clipboard.writeText(bundleStr);
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // Fall through to textarea fallback
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "-9999px";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) return true;
+    } catch {
+      // Fall through to prompt fallback
+    }
+    window.prompt("Copy text to clipboard:", text);
+    return true;
+  }
+
+  async function copySpoofBundleText(bundleStr: string) {
+    if (await copyTextUniversal(bundleStr)) {
       setCopiedBundle(true);
       setTimeout(() => setCopiedBundle(false), 1800);
-    } catch {
-      // Clipboard fallback ignored
+    }
+  }
+
+  async function copyToken(id: string, token: string) {
+    let tok = token;
+    if (!tok) {
+      try {
+        const res = await fetch("/api/v1/state");
+        if (res.ok) {
+          const data = await res.json();
+          const srv = (data.servers || []).find((s: ServerPeer) => s.id === id);
+          if (srv?.token) tok = srv.token;
+        }
+      } catch {
+        // Ignore fetch fallback errors
+      }
+    }
+    if (await copyTextUniversal(tok)) {
+      setCopiedID(id);
+      setTimeout(() => setCopiedID(null), 1800);
     }
   }
 
@@ -693,16 +740,6 @@ export default function App() {
       }
     } finally {
       setSwitchingServerID(null);
-    }
-  }
-
-  async function copyToken(id: string, token: string) {
-    try {
-      await navigator.clipboard.writeText(token);
-      setCopiedID(id);
-      setTimeout(() => setCopiedID(null), 1800);
-    } catch {
-      // Clipboard fallback ignored
     }
   }
 
