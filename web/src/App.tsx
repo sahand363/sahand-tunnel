@@ -300,6 +300,13 @@ function defaultClientSpoofWG(role: Role, peerIP: string): SpoofWGConfig {
   };
 }
 
+function parseSpoofIPsCSV(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>(() => {
     const saved = localStorage.getItem("sahand_tab");
@@ -328,6 +335,7 @@ export default function App() {
 
   const [expandedTunnel, setExpandedTunnel] = useState<number | null>(null);
   const [draftTunnels, setDraftTunnels] = useState<Record<string, TunnelConfig>>({});
+  const [spoofIPsRawDraft, setSpoofIPsRawDraft] = useState<Record<string, string>>({});
   const [savingTunnelKey, setSavingTunnelKey] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState<Record<string, string>>({});
   const [tunnelError, setTunnelError] = useState<Record<string, string>>({});
@@ -551,6 +559,18 @@ export default function App() {
     if (spoofActionBusy) return;
     setSpoofActionBusy(action);
     setSpoofActionNotice("");
+    const key = `${serverID}:26`;
+    const rawIPs = spoofIPsRawDraft[key];
+    const effectiveSpoofWG = currentDraft.spoof_wg
+      ? {
+          ...currentDraft.spoof_wg,
+          spoof_ips:
+            rawIPs !== undefined
+              ? parseSpoofIPsCSV(rawIPs)
+              : currentDraft.spoof_wg.spoof_ips,
+        }
+      : undefined;
+
     try {
       const res = await fetch("/api/v1/tunnels/spoof-wg", {
         method: "POST",
@@ -559,7 +579,7 @@ export default function App() {
           server_id: serverID,
           action,
           bundle: spoofBundleInput,
-          spoof_wg: currentDraft.spoof_wg,
+          spoof_wg: effectiveSpoofWG,
         }),
       });
       if (res.ok) {
@@ -570,6 +590,10 @@ export default function App() {
             ...currentDraft,
             spoof_wg: data.spoof_wg,
           });
+          setSpoofIPsRawDraft((prev) => ({
+            ...prev,
+            [key]: (data.spoof_wg.spoof_ips || []).join(", "),
+          }));
         }
         if (action === "import") {
           setSpoofBundleInput("");
@@ -711,9 +735,22 @@ export default function App() {
         ? updated.speed_limit_mbps.trim()
         : "0";
 
-    const payload = {
+    const rawSpoofIPs = spoofIPsRawDraft[key];
+    const finalSpoofWG =
+      updated.id === 26 && updated.spoof_wg
+        ? {
+            ...updated.spoof_wg,
+            spoof_ips:
+              rawSpoofIPs !== undefined
+                ? parseSpoofIPsCSV(rawSpoofIPs)
+                : updated.spoof_wg.spoof_ips,
+          }
+        : updated.spoof_wg;
+
+    const payload: TunnelConfig = {
       ...updated,
       speed_limit_mbps: safeSpeed,
+      spoof_wg: finalSpoofWG,
     };
 
     try {
@@ -725,6 +762,11 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setDraftTunnels((prev) => {
+          const next = { ...prev };
+          delete next[key];
+          return next;
+        });
+        setSpoofIPsRawDraft((prev) => {
           const next = { ...prev };
           delete next[key];
           return next;
@@ -1760,6 +1802,11 @@ export default function App() {
                         spoof_wg: merged,
                       });
                     };
+
+                    const spoofIPsInputValue =
+                      spoofIPsRawDraft[tunnelKey] !== undefined
+                        ? spoofIPsRawDraft[tunnelKey]
+                        : (swgDraft?.spoof_ips || []).join(", ");
 
                     return (
                       <article
@@ -2799,15 +2846,18 @@ export default function App() {
                                 </label>
                                 <input
                                   disabled={role === "agent"}
-                                  value={(swgDraft.spoof_ips || []).join(", ")}
+                                  value={spoofIPsInputValue}
                                   onChange={(e) => {
-                                    const list = e.target.value
-                                      .split(",")
-                                      .map((s) => s.trim())
-                                      .filter(Boolean);
-                                    updateSWGDraft({ spoof_ips: list });
+                                    const raw = e.target.value;
+                                    setSpoofIPsRawDraft((prev) => ({
+                                      ...prev,
+                                      [tunnelKey]: raw,
+                                    }));
+                                    updateSWGDraft({
+                                      spoof_ips: parseSpoofIPsCSV(raw),
+                                    });
                                   }}
-                                  placeholder="8.8.8.8, 1.1.1.1"
+                                  placeholder="8.8.8.8, 1.1.1.1, 9.9.9.9"
                                 />
                               </div>
                             </div>
