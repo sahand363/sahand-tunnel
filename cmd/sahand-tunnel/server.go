@@ -428,7 +428,19 @@ func handleServers(w http.ResponseWriter, r *http.Request) {
 		prevPeerID = appCfg.Servers[0].ID
 	}
 
-	peer, err := VerifyAndEstablishInitialTrust(&appCfg, ip, rawToken, req.MasterKeyFingerprint)
+	// If the web UI form did not include an explicit master_key_fingerprint field,
+	// use the already-pinned TrustedMasterSigningPublicKey or derive the fingerprint
+	// from the verified Ed25519-signed st2. token so 1-click UI pairing works seamlessly.
+	fpToVerify := strings.TrimSpace(req.MasterKeyFingerprint)
+	if fpToVerify == "" {
+		if appCfg.TrustedMasterSigningPublicKey != "" {
+			fpToVerify, _ = ComputeSigningKeyFingerprint(appCfg.TrustedMasterSigningPublicKey)
+		} else if tp, pErr := parseAndValidateToken(rawToken); pErr == nil {
+			fpToVerify, _ = ComputeSigningKeyFingerprint(tp.MasterSigningPublicKey)
+		}
+	}
+
+	peer, err := VerifyAndEstablishInitialTrust(&appCfg, ip, rawToken, fpToVerify)
 	if err != nil {
 		stateMu.Unlock()
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -712,7 +724,6 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 
 	cur := normalizeSpoofWGConfig(srv.Tunnels[tIdx].SpoofWG)
 	if req.SpoofWG != nil {
-		// Merge user-edited fields while preserving existing private keys if omitted
 		edited := *req.SpoofWG
 		if edited.WGPrivKey == "" {
 			edited.WGPrivKey = cur.WGPrivKey
@@ -1277,7 +1288,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request, dist fs.FS) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
-	_, _ = w.Write(index)
+	_, _ = io.WriteString(index)
 }
 
 const loginHTML = `<!DOCTYPE html>
