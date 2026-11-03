@@ -2561,7 +2561,7 @@ export default function App() {
                                       <span>Restart Engine</span>
                                     </button>
                                   </div>
-                                </>
+                                </div>
 
                                 {greActionNotice && (
                                   <div
