@@ -129,12 +129,6 @@ func sampleAnalyticsTick() {
 	}
 }
 
-// Allocates a non-colliding set of Engine 1 (`ListenPort`) and Engine 2 (`ForwardPorts`)
-// defaults when adding a new server on the Master node so multiple servers never
-// collide on local listener sockets:
-//   - Server 1 (slot 0): Engine 1 = 28001..28030, Engine 2 = 32001..32030
-//   - Server 2 (slot 1): Engine 1 = 29001..29030, Engine 2 = 33001..33030
-//   - Server 3 (slot 2): Engine 1 = 30001..30030, Engine 2 = 34001..34030
 func allocateNonCollidingTunnelsForNewPeer(existing []ServerPeer, peerID, remoteIP string) []TunnelConfig {
 	usedListenPorts := make(map[int]bool)
 	usedForwardPorts := make(map[int]bool)
@@ -355,6 +349,8 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mTime := formatMasterClock(masterNow())
+	testerView := getSpoofTesterStatusView()
+
 	stateMu.RLock()
 	serversCopy := make([]ServerPeer, len(appCfg.Servers))
 	for i, srv := range appCfg.Servers {
@@ -375,6 +371,7 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 					swg.PeerPublicIP = srv.IP
 				}
 				swg.Health = querySpoofWGRuntimeHealth(swg)
+				swg.Tester = testerView
 				tunnelsCopy[j].SpoofWG = swg
 			}
 		}
@@ -757,14 +754,28 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ServerID string         `json:"server_id"`
-		Action   string         `json:"action"` // "bundle" | "import" | "up" | "down" | "restart"
-		Bundle   string         `json:"bundle,omitempty"`
-		SpoofWG  *SpoofWGConfig `json:"spoof_wg,omitempty"`
+		ServerID  string              `json:"server_id"`
+		Action    string              `json:"action"` // "bundle" | "import" | "up" | "down" | "restart" | "install_binary" | "tester_start" | "tester_stop" | "tester_clear"
+		Bundle    string              `json:"bundle,omitempty"`
+		SpoofWG   *SpoofWGConfig      `json:"spoof_wg,omitempty"`
+		TesterReq *SpoofTesterRequest `json:"tester_req,omitempty"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128*1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
+	}
+
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	// Run potentially slow network download outside stateMu lock
+	var installedMsg string
+	if action == "install_binary" {
+		m, err := installOfficialSpoofBinary()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		installedMsg = m
 	}
 
 	stateMu.Lock()
@@ -818,9 +829,11 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 
 	var msg string
 	var bundleOut string
-	action := strings.ToLower(strings.TrimSpace(req.Action))
 
 	switch action {
+	case "install_binary":
+		msg = installedMsg
+
 	case "bundle":
 		bStr, err := makeSpoofWGBundle(cur, "")
 		if err != nil {
@@ -864,13 +877,39 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 	case "restart":
 		msg = "Spoof + WireGuard carrier listener restarted"
 
+	case "tester_start":
+		if req.TesterReq == nil {
+			stateMu.Unlock()
+			http.Error(w, "tester_req is required", http.StatusBadRequest)
+			return
+		}
+		tReq := *req.TesterReq
+		if tReq.DstIP == "" {
+			tReq.DstIP = cur.PeerPublicIP
+		}
+		if err := startSpoofTesterProcess(tReq); err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msg = fmt.Sprintf("Spoof IP Tester started in %s mode (%s)", tReq.Mode, strings.ToUpper(tReq.Protocol))
+
+	case "tester_stop":
+		stopSpoofTesterProcess()
+		msg = "Spoof IP Tester stopped"
+
+	case "tester_clear":
+		clearSpoofTesterStatus()
+		msg = "Spoof IP Tester results cleared"
+
 	default:
 		stateMu.Unlock()
-		http.Error(w, "unknown action (expected bundle, import, up, down, or restart)", http.StatusBadRequest)
+		http.Error(w, "unknown action", http.StatusBadRequest)
 		return
 	}
 
 	cur.Health = querySpoofWGRuntimeHealth(cur)
+	cur.Tester = getSpoofTesterStatusView()
 	srv.Tunnels[tIdx].SpoofWG = cur
 	peerCopy := *srv
 	_ = saveConfig(configPath(), appCfg)
@@ -882,17 +921,19 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
-		OK      bool           `json:"ok"`
-		Message string         `json:"message"`
-		Bundle  string         `json:"bundle,omitempty"`
-		SpoofWG *SpoofWGConfig `json:"spoof_wg"`
-		Health  SpoofWGHealth  `json:"health"`
+		OK      bool              `json:"ok"`
+		Message string            `json:"message"`
+		Bundle  string            `json:"bundle,omitempty"`
+		SpoofWG *SpoofWGConfig    `json:"spoof_wg"`
+		Health  SpoofWGHealth     `json:"health"`
+		Tester  SpoofTesterStatus `json:"tester"`
 	}{
 		OK:      true,
 		Message: msg,
 		Bundle:  bundleOut,
 		SpoofWG: cur,
 		Health:  cur.Health,
+		Tester:  cur.Tester,
 	})
 }
 
@@ -967,6 +1008,7 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 					updated.SpoofWG.PeerPublicIP = srv.IP
 				}
 				updated.SpoofWG.Health = querySpoofWGRuntimeHealth(updated.SpoofWG)
+				updated.SpoofWG.Tester = getSpoofTesterStatusView()
 			}
 			if strings.TrimSpace(updated.SpeedLimitMBps) == "" {
 				updated.SpeedLimitMBps = "0"
