@@ -307,6 +307,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/tunnels/gre-frp", requireAuth(handleGREFRPAction))
 	mux.HandleFunc("/api/v1/tunnels/spoof-wg", requireAuth(handleSpoofWGAction))
 	mux.HandleFunc("/api/v1/tunnels/spoof-native", requireAuth(handleSpoofNativeAction))
+	mux.HandleFunc("/api/v1/tunnels/spoof-capability", requireAuth(handleSpoofCapabilityVerify))
 	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
 
 	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -373,8 +374,10 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 
 	stateMu.RLock()
 	serversCopy := make([]ServerPeer, len(appCfg.Servers))
+	spoofCapMap := make(map[string]SpoofCapabilityReport, len(appCfg.Servers))
 	for i, srv := range appCfg.Servers {
 		srvCopy := srv
+		spoofCapMap[srv.ID] = getSpoofCapabilityReport(srv.ID)
 		tunnelsCopy := make([]TunnelConfig, len(srv.Tunnels))
 		copy(tunnelsCopy, srv.Tunnels)
 		for j := range tunnelsCopy {
@@ -422,17 +425,18 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := struct {
-		AppVersion                  string                `json:"app_version"`
-		Role                        string                `json:"role"`
-		NodeID                      string                `json:"node_id"`
-		ServerTime                  string                `json:"server_time"`
-		MasterSigningPublicKey      string                `json:"master_signing_public_key,omitempty"`
-		MasterNoiseStaticPublicKey  string                `json:"master_noise_static_public_key,omitempty"`
-		MasterSigningKeyFingerprint string                `json:"master_signing_key_fingerprint,omitempty"`
-		AgentSigningPublicKey       string                `json:"agent_signing_public_key,omitempty"`
-		AgentNoiseStaticPublicKey   string                `json:"agent_noise_static_public_key,omitempty"`
-		Servers                     []ServerPeer          `json:"servers"`
-		Catalogue                   []MethodCatalogueItem `json:"catalogue"`
+		AppVersion                  string                           `json:"app_version"`
+		Role                        string                           `json:"role"`
+		NodeID                      string                           `json:"node_id"`
+		ServerTime                  string                           `json:"server_time"`
+		MasterSigningPublicKey      string                           `json:"master_signing_public_key,omitempty"`
+		MasterNoiseStaticPublicKey  string                           `json:"master_noise_static_public_key,omitempty"`
+		MasterSigningKeyFingerprint string                           `json:"master_signing_key_fingerprint,omitempty"`
+		AgentSigningPublicKey       string                           `json:"agent_signing_public_key,omitempty"`
+		AgentNoiseStaticPublicKey   string                           `json:"agent_noise_static_public_key,omitempty"`
+		Servers                     []ServerPeer                     `json:"servers"`
+		SpoofCapabilities           map[string]SpoofCapabilityReport `json:"spoof_capabilities"`
+		Catalogue                   []MethodCatalogueItem            `json:"catalogue"`
 	}{
 		AppVersion:                  AppVersion,
 		Role:                        role,
@@ -444,11 +448,74 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 		AgentSigningPublicKey:       aSignPub,
 		AgentNoiseStaticPublicKey:   aNoisePub,
 		Servers:                     serversCopy,
+		SpoofCapabilities:           spoofCapMap,
 		Catalogue:                   methodCatalogue,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func handleSpoofCapabilityVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string `json:"server_id"`
+		SpoofIP  string `json:"spoof_ip,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.RLock()
+	var peerSnapshot *ServerPeer
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			cp := appCfg.Servers[i]
+			peerSnapshot = &cp
+			break
+		}
+	}
+	stateMu.RUnlock()
+
+	if peerSnapshot == nil {
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	spoofIP := cleanSpoofHost(req.SpoofIP)
+	if !isValidIPv4String(spoofIP) {
+		for _, tc := range peerSnapshot.Tunnels {
+			if tc.ID == 27 && tc.SpoofNative != nil && len(tc.SpoofNative.SpoofIPs) > 0 {
+				spoofIP = tc.SpoofNative.SpoofIPs[0]
+				break
+			}
+			if tc.ID == 26 && tc.SpoofWG != nil && len(tc.SpoofWG.SpoofIPs) > 0 {
+				spoofIP = tc.SpoofWG.SpoofIPs[0]
+			}
+		}
+	}
+	if !isValidIPv4String(spoofIP) {
+		spoofIP = "8.8.8.8"
+	}
+
+	rep, err := RunBidirectionalSpoofCapabilityVerify(*peerSnapshot, spoofIP)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK     bool                  `json:"ok"`
+		Report SpoofCapabilityReport `json:"report"`
+	}{
+		OK:     true,
+		Report: rep,
+	})
 }
 
 func handleServers(w http.ResponseWriter, r *http.Request) {
@@ -784,7 +851,7 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		ServerID  string              `json:"server_id"`
-		Action    string              `json:"action"` // "bundle" | "import" | "up" | "down" | "restart" | "install_binary" | "tester_start" | "tester_stop" | "tester_clear"
+		Action    string              `json:"action"`
 		Bundle    string              `json:"bundle,omitempty"`
 		SpoofWG   *SpoofWGConfig      `json:"spoof_wg,omitempty"`
 		TesterReq *SpoofTesterRequest `json:"tester_req,omitempty"`
@@ -972,7 +1039,7 @@ func handleSpoofNativeAction(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		ServerID    string              `json:"server_id"`
-		Action      string              `json:"action"` // "save" | "bundle" | "import" | "up" | "down" | "restart" | "verify_pipe" | "install_binary" | "tester_start" | "tester_stop" | "tester_clear"
+		Action      string              `json:"action"`
 		Bundle      string              `json:"bundle,omitempty"`
 		SpoofNative *SpoofNativeConfig  `json:"spoof_native,omitempty"`
 		TesterReq   *SpoofTesterRequest `json:"tester_req,omitempty"`
