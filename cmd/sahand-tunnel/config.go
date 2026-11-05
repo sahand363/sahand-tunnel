@@ -222,25 +222,86 @@ type SpoofWGConfig struct {
 	Tester           SpoofTesterStatus `json:"tester"`
 }
 
+type SpoofNativeHealth struct {
+	BinaryInstalled  bool   `json:"binary_installed"`
+	BinaryVersion    string `json:"binary_version,omitempty"`
+	BinarySHA256OK   bool   `json:"binary_sha256_ok"`
+	WGToolsPresent   bool   `json:"wg_tools_present"`
+	CoreActive       bool   `json:"core_active"`
+	WGActive         bool   `json:"wg_active"`
+	EndToEndVerified bool   `json:"end_to_end_verified"`
+	RealSpoofActive  bool   `json:"real_spoof_active"`
+	ConnectionState  string `json:"connection_state"` // "REAL SPOOF ACTIVE" | "SPOOF CONNECTING" | "SPOOF FAILED" | "DISCONNECTED" | "DIRECT FALLBACK"
+	StatusBadge      string `json:"status_badge"`
+	ActiveAdapter    string `json:"active_adapter"`
+	ActivePath       string `json:"active_path,omitempty"`
+	Handshake        string `json:"handshake,omitempty"`
+	LastVerifiedAt   string `json:"last_verified_at,omitempty"`
+	LastRTTMS        int64  `json:"last_rtt_ms,omitempty"`
+	PacketLossPct    int    `json:"packet_loss_pct,omitempty"`
+	WarningBanner    string `json:"warning_banner,omitempty"`
+	SecurityNote     string `json:"security_note,omitempty"`
+	LastError        string `json:"last_error,omitempty"`
+}
+
+type SpoofNativeConfig struct {
+	Role            string            `json:"role"`              // "local" (Master) | "remote" (Agent)
+	Mode            string            `json:"mode"`              // "pure" | "wireguard" | "quic" | "noise"
+	ServiceEnabled  bool              `json:"service_enabled"`   // whether spoof-core-m27 (+ wg-spoof27) is enabled
+	StrictRealSpoof bool              `json:"strict_real_spoof"` // when true, no direct fallback is permitted
+	PeerPublicIP    string            `json:"peer_public_ip"`
+	LocalPublicIP   string            `json:"local_public_ip"`
+	SpoofListenPort int               `json:"spoof_listen_port"` // default 8091
+	RecvPort        int               `json:"recv_port"`         // default 5011
+	SpoofPort       int               `json:"spoof_port"`        // default 443 on local
+	SpoofIPs        []string          `json:"spoof_ips"`         // user-configured / tester-verified spoof IPs
+	SendTransport   string            `json:"send_transport"`    // "tcp" | "udp" | "icmp" | "icmpv6"
+	RecvTransport   string            `json:"recv_transport"`    // "tcp" | "udp" | "icmp" | "icmpv6"
+	CorePort        int               `json:"core_port"`         // default 5010 (local spoof UDP listen)
+	AdapterPort     int               `json:"adapter_port"`      // default 51827 (remote spoof UDP forward target)
+	MTU             int               `json:"mtu"`               // default 1280
+	KeepaliveSec    int               `json:"keepalive_sec"`     // default 25
+	TimeoutSec      int               `json:"timeout_sec"`       // default 30
+	PacketCount     int               `json:"packet_count"`      // default 10
+	MaxLossPct      float64           `json:"max_loss_pct"`      // default 20
+	WGInterface     string            `json:"wg_interface"`      // default "wg-spoof27"
+	WGPrivKey       string            `json:"wg_priv_key,omitempty"`
+	WGPubKey        string            `json:"wg_pub_key,omitempty"`
+	WGPeerPub       string            `json:"wg_peer_pub,omitempty"`
+	WGPeerPriv      string            `json:"wg_peer_priv,omitempty"`
+	WGLocalIP       string            `json:"wg_local_ip,omitempty"` // default 10.27.0.1 / 10.27.0.2
+	WGPeerIP        string            `json:"wg_peer_ip,omitempty"`  // default 10.27.0.2 / 10.27.0.1
+	NoisePrivKey    string            `json:"noise_priv_key,omitempty"`
+	NoisePubKey     string            `json:"noise_pub_key,omitempty"`
+	NoisePeerPub    string            `json:"noise_peer_pub,omitempty"`
+	NoisePeerPriv   string            `json:"noise_peer_priv,omitempty"`
+	LastBundle      string            `json:"last_bundle,omitempty"`
+	LastError       string            `json:"last_error,omitempty"`
+	UpdatedAt       string            `json:"updated_at,omitempty"`
+	Health          SpoofNativeHealth `json:"health"`
+	Tester          SpoofTesterStatus `json:"tester"`
+}
+
 type TunnelConfig struct {
-	ID             int            `json:"id"`
-	Name           string         `json:"name"`
-	Security       int            `json:"security"`
-	TrafficType    string         `json:"traffic_type"`
-	Implemented    bool           `json:"implemented"`
-	Enabled        bool           `json:"enabled"`
-	ListenPort     int            `json:"listen_port"`
-	ForwardPorts   string         `json:"forward_ports"`
-	SNI            string         `json:"sni,omitempty"`
-	WSPath         string         `json:"ws_path,omitempty"`
-	CertPin        string         `json:"cert_pin,omitempty"`
-	RawTransport   string         `json:"raw_transport,omitempty"`
-	GREFRP         *GREFRPConfig  `json:"gre_frp,omitempty"`
-	SpoofWG        *SpoofWGConfig `json:"spoof_wg,omitempty"`
-	HeartbeatSec   int            `json:"heartbeat_sec,omitempty"`
-	StreamLimit    int            `json:"stream_limit,omitempty"`
-	SpeedLimitMBps string         `json:"speed_limit_mbps"`
-	LastDiscovery  MethodResult   `json:"last_discovery"`
+	ID             int                `json:"id"`
+	Name           string             `json:"name"`
+	Security       int                `json:"security"`
+	TrafficType    string             `json:"traffic_type"`
+	Implemented    bool               `json:"implemented"`
+	Enabled        bool               `json:"enabled"`
+	ListenPort     int                `json:"listen_port"`
+	ForwardPorts   string             `json:"forward_ports"`
+	SNI            string             `json:"sni,omitempty"`
+	WSPath         string             `json:"ws_path,omitempty"`
+	CertPin        string             `json:"cert_pin,omitempty"`
+	RawTransport   string             `json:"raw_transport,omitempty"`
+	GREFRP         *GREFRPConfig      `json:"gre_frp,omitempty"`
+	SpoofWG        *SpoofWGConfig     `json:"spoof_wg,omitempty"`
+	SpoofNative    *SpoofNativeConfig `json:"spoof_native,omitempty"`
+	HeartbeatSec   int                `json:"heartbeat_sec,omitempty"`
+	StreamLimit    int                `json:"stream_limit,omitempty"`
+	SpeedLimitMBps string             `json:"speed_limit_mbps"`
+	LastDiscovery  MethodResult       `json:"last_discovery"`
 }
 
 type ServerPeer struct {
@@ -382,7 +443,7 @@ var methodCatalogue = []MethodCatalogueItem{
 	{24, "SAHAND-RAW", 96, "tcp+udp", true, 28024, []string{"listen_port", "forward_ports", "raw_transport", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{25, "GRE + FRP", 91, "tcp+udp", true, 28025, []string{"listen_port", "forward_ports", "gre_frp", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{26, "Spoof + WireGuard", 94, "tcp+udp", true, 28026, []string{"listen_port", "forward_ports", "spoof_wg", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
-	{27, "Fallback TCP", 42, "tcp", false, 28027, []string{"listen_port", "forward_ports"}},
+	{27, "Native Spoof Engine", 96, "tcp+udp", true, 28027, []string{"listen_port", "forward_ports", "spoof_native", "heartbeat_sec", "stream_limit", "speed_limit_mbps"}},
 	{28, "Custom TLS", 91, "tcp", false, 28028, []string{"listen_port", "forward_ports", "sni", "cert_pin"}},
 	{29, "Hybrid Transport", 87, "tcp+udp", false, 28029, []string{"listen_port", "forward_ports", "sni"}},
 	{30, "Experimental", 62, "tcp+udp", false, 28030, []string{"listen_port", "forward_ports"}},
@@ -917,6 +978,8 @@ func defaultTunnelsForServer() []TunnelConfig {
 				tc.GREFRP = defaultGREFRPConfig(tc.ListenPort, tc.ForwardPorts)
 			case "spoof_wg":
 				tc.SpoofWG = defaultSpoofWGConfig()
+			case "spoof_native":
+				tc.SpoofNative = defaultSpoofNativeConfig()
 			case "heartbeat_sec":
 				tc.HeartbeatSec = 30
 			case "stream_limit":
@@ -973,6 +1036,9 @@ func normalizeTunnels(existing []TunnelConfig) []TunnelConfig {
 			}
 			if def.ID == 26 {
 				cur.SpoofWG = normalizeSpoofWGConfig(cur.SpoofWG)
+			}
+			if def.ID == 27 {
+				cur.SpoofNative = normalizeSpoofNativeConfig(cur.SpoofNative)
 			}
 			if cur.HeartbeatSec <= 0 {
 				cur.HeartbeatSec = def.HeartbeatSec
@@ -1551,6 +1617,11 @@ func VerifyAndEstablishInitialTrust(cfg *Config, masterIP, rawToken, expectedFin
 			tunnels[i].SpoofWG.Role = "remote"
 			tunnels[i].SpoofWG.PeerPublicIP = ip
 			applySpoofWGRoleDefaults(tunnels[i].SpoofWG)
+		}
+		if tunnels[i].ID == 27 && tunnels[i].SpoofNative != nil {
+			tunnels[i].SpoofNative.Role = "remote"
+			tunnels[i].SpoofNative.PeerPublicIP = ip
+			applySpoofNativeRoleDefaults(tunnels[i].SpoofNative)
 		}
 	}
 
