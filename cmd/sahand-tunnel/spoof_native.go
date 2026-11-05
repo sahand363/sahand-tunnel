@@ -108,6 +108,44 @@ func (rw *m27ReplayWindow) CheckAndAccept(seq uint64) bool {
 	return true
 }
 
+// Per-stream sequence reorder buffer guaranteeing strict in-order TCP byte delivery
+type m27StreamReorderBuffer struct {
+	mu      sync.Mutex
+	nextSeq uint32
+	pending map[uint32][]byte
+}
+
+func newM27StreamReorderBuffer() *m27StreamReorderBuffer {
+	return &m27StreamReorderBuffer{
+		nextSeq: 1,
+		pending: make(map[uint32][]byte),
+	}
+}
+
+func (rb *m27StreamReorderBuffer) InsertAndDrain(seq uint32, payload []byte) [][]byte {
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+
+	if seq < rb.nextSeq {
+		return nil
+	}
+	rb.pending[seq] = cp
+	var ready [][]byte
+	for {
+		chunk, ok := rb.pending[rb.nextSeq]
+		if !ok {
+			break
+		}
+		delete(rb.pending, rb.nextSeq)
+		rb.nextSeq++
+		ready = append(ready, chunk)
+	}
+	return ready
+}
+
 func spoofM27ModeOK(mode string) bool {
 	m := strings.ToLower(strings.TrimSpace(mode))
 	for _, valid := range spoofM27Modes {
@@ -997,8 +1035,6 @@ func querySpoofNativeRuntimeHealth(peerID string, s *SpoofNativeConfig) SpoofNat
 
 	freshPipeVerify := lastUnix > 0 && time.Since(time.Unix(lastUnix, 0)) < 3*time.Minute
 
-	// Strict verification rule: Never declare REAL SPOOF ACTIVE merely because processes/interfaces exist.
-	// It requires end-to-end verification across the spoof pipe (`lastPath == "SPOOF_PIPE"`).
 	switch {
 	case freshPipeVerify && lastPath == "SPOOF_PIPE":
 		h.EndToEndVerified = true
@@ -1058,14 +1094,33 @@ type spoofM27Stream struct {
 	targetPort uint16
 	remoteAddr *net.UDPAddr
 	rxCh       chan []byte
+	reorder    *m27StreamReorderBuffer
+	closeMu    sync.Mutex
 	closed     atomic.Bool
 	closeOnce  sync.Once
 }
 
+func (s *spoofM27Stream) deliverInOrder(seq uint32, payload []byte) {
+	chunks := s.reorder.InsertAndDrain(seq, payload)
+	if len(chunks) == 0 {
+		return
+	}
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	if s.closed.Load() {
+		return
+	}
+	for _, ch := range chunks {
+		s.rxCh <- ch
+	}
+}
+
 func (s *spoofM27Stream) close() {
 	s.closeOnce.Do(func() {
+		s.closeMu.Lock()
 		s.closed.Store(true)
 		close(s.rxCh)
+		s.closeMu.Unlock()
 	})
 }
 
@@ -1253,9 +1308,6 @@ func startSpoofNativeServer(peer ServerPeer, tc TunnelConfig) (net.Listener, net
 
 	mode := tc.SpoofNative.Mode
 
-	// 1. Always bind the Direct Fallback / Test Carrier UDP socket on tc.ListenPort (e.g. :28027)
-	// so non-strict fallback or local unit tests can reach the adapter when explicitly allowed,
-	// while tagging every packet by which socket received it ("SPOOF_PIPE" vs "DIRECT_FALLBACK").
 	if fbAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort("0.0.0.0", strconv.Itoa(tc.ListenPort))); err == nil {
 		if fbConn, err := net.ListenUDP("udp", fbAddr); err == nil {
 			configureUDPSocketBuffers(fbConn)
@@ -1264,7 +1316,6 @@ func startSpoofNativeServer(peer ServerPeer, tc TunnelConfig) (net.Listener, net
 		}
 	}
 
-	// 2. Bind the Adapter's Spoof Pipe endpoint (`127.0.0.1:AdapterPort` on remote/agent)
 	switch mode {
 	case "pure", "noise":
 		pipeBindHost := "127.0.0.1"
@@ -1278,9 +1329,6 @@ func startSpoofNativeServer(peer ServerPeer, tc TunnelConfig) (net.Listener, net
 		}
 
 	case "wireguard":
-		// In WireGuard mode, `spoof` forwards to `127.0.0.1:AdapterPort` where `wg-spoof27` listens.
-		// Our TCP/UDP stream forwarder binds on the WireGuard overlay IP (or 0.0.0.0:ListenPort) using
-		// a lightweight authenticated binary header (NO TLS carrier!).
 		lnAddr := net.JoinHostPort("0.0.0.0", strconv.Itoa(tc.ListenPort))
 		if ln, err := net.Listen("tcp", lnAddr); err == nil {
 			rt.wgOverlayLn = ln
@@ -1288,7 +1336,6 @@ func startSpoofNativeServer(peer ServerPeer, tc TunnelConfig) (net.Listener, net
 		}
 
 	case "quic":
-		// In QUIC mode, bind the Spoof Pipe UDP port (`127.0.0.1:AdapterPort`).
 		pipeAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(tc.SpoofNative.AdapterPort))
 		if uAddr, err := net.ResolveUDPAddr("udp", pipeAddr); err == nil {
 			if uConn, err := net.ListenUDP("udp", uAddr); err == nil {
@@ -1319,7 +1366,8 @@ func (rt *spoofNativeRuntime) readDatagramLoop(conn *net.UDPConn, pathTag string
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 		addrCopy := cloneUDPAddr(rAddr)
-		go rt.handleIncomingDatagram(conn, addrCopy, pkt, pathTag)
+		// Process inline for ordering; blocking dial operations spawn their own goroutine inside handleIncomingDatagram
+		rt.handleIncomingDatagram(conn, addrCopy, pkt, pathTag)
 	}
 }
 
@@ -1334,11 +1382,9 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 		strict = rt.tunnel.SpoofNative.StrictRealSpoof
 	}
 	if strict && pathTag == "DIRECT_FALLBACK" {
-		// Strictly reject unspoofed fallback packets when StrictRealSpoof is enabled
 		return
 	}
 
-	// Unwrap Noise AEAD envelope if running in "noise" mode (or if packet starts with Noise header)
 	var activeNoise *spoofM27NoiseSession
 	if raw[0] == m27NoiseInit && len(raw) >= 1+4+32+8+32 {
 		sid := binary.BigEndian.Uint32(raw[1:5])
@@ -1398,7 +1444,6 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 		raw = plain
 		activeNoise = sess
 	} else if mode == "noise" {
-		// Reject unencrypted frames when Noise mode is configured
 		return
 	}
 
@@ -1425,8 +1470,6 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 
 	switch pktType {
 	case m27FrameTypePing:
-		// Reply with Pong containing the pathTag ("SPOOF_PIPE" or "DIRECT_FALLBACK")
-		// and the echoed challenge bytes so the caller cryptographically proves real spoof delivery.
 		replyPayload := append([]byte(pathTag+"|"), payload...)
 		pong := encodeM27Datagram(rt.subKey, m27FrameTypePong, streamID, seq, port, replyPayload)
 		sendReply(pong)
@@ -1467,7 +1510,8 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 			id:         streamID,
 			targetPort: port,
 			remoteAddr: rAddr,
-			rxCh:       make(chan []byte, 256),
+			rxCh:       make(chan []byte, 1024),
+			reorder:    newM27StreamReorderBuffer(),
 		}
 		rt.streamsMu.Lock()
 		rt.streams[streamID] = st
@@ -1486,12 +1530,7 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 			return
 		}
 		atomic.AddUint64(&appRxBytes, uint64(len(payload)))
-		select {
-		case st.rxCh <- payload:
-		default:
-		}
-		ack := encodeM27Datagram(rt.subKey, m27FrameTypeAck, streamID, seq, port, nil)
-		sendReply(ack)
+		st.deliverInOrder(seq, payload)
 
 	case m27FrameTypeFin:
 		rt.streamsMu.Lock()
@@ -1512,23 +1551,27 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 		if err != nil {
 			return
 		}
-		atomic.AddUint64(&appRxBytes, uint64(len(payload)))
-		uConn, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", authorizedPort), 3*time.Second)
-		if err != nil {
-			return
-		}
-		defer uConn.Close()
-		_ = uConn.SetDeadline(time.Now().Add(3 * time.Second))
-		if _, err := uConn.Write(payload); err != nil {
-			return
-		}
-		repBuf := make([]byte, 16384)
-		n, err := uConn.Read(repBuf)
-		if err == nil && n > 0 {
-			atomic.AddUint64(&appTxBytes, uint64(n))
-			repFrame := encodeM27Datagram(rt.subKey, m27FrameTypeUDP, streamID, seq, port, repBuf[:n])
-			sendReply(repFrame)
-		}
+		dgramCopy := make([]byte, len(payload))
+		copy(dgramCopy, payload)
+		go func() {
+			atomic.AddUint64(&appRxBytes, uint64(len(dgramCopy)))
+			uConn, err := net.DialTimeout("udp", net.JoinHostPort("127.0.0.1", authorizedPort), 3*time.Second)
+			if err != nil {
+				return
+			}
+			defer uConn.Close()
+			_ = uConn.SetDeadline(time.Now().Add(3 * time.Second))
+			if _, err := uConn.Write(dgramCopy); err != nil {
+				return
+			}
+			repBuf := make([]byte, 16384)
+			n, err := uConn.Read(repBuf)
+			if err == nil && n > 0 {
+				atomic.AddUint64(&appTxBytes, uint64(n))
+				repFrame := encodeM27Datagram(rt.subKey, m27FrameTypeUDP, streamID, seq, port, repBuf[:n])
+				sendReply(repFrame)
+			}
+		}()
 	}
 }
 
@@ -1599,12 +1642,10 @@ func dialM27UDPPipeSocket(peer ServerPeer, tc TunnelConfig, timeout time.Duratio
 	}
 
 	var candidates []candidateTarget
-	// Primary path: the local `spoof` v3.0.2 core UDP pipe (`127.0.0.1:CorePort`)
 	candidates = append(candidates, candidateTarget{
 		addr:    net.JoinHostPort("127.0.0.1", strconv.Itoa(s.CorePort)),
 		pathTag: "SPOOF_PIPE",
 	})
-	// Only if StrictRealSpoof is explicitly disabled may we try the direct UDP fallback port
 	if !strict && strings.TrimSpace(peer.IP) != "" {
 		candidates = append(candidates, candidateTarget{
 			addr:    net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)),
@@ -1741,7 +1782,6 @@ func readM27FrameFromConn(uConn *net.UDPConn, sess *spoofM27NoiseSession, subKey
 	return decodeM27Datagram(subKey, raw)
 }
 
-// Mode 2 (WireGuard Overlay) lightweight binary stream framing (NO TLS Carrier!)
 type m27WGOverlayHeader struct {
 	Magic      string `json:"m"`
 	Cmd        byte   `json:"c"`
@@ -1965,7 +2005,6 @@ func probeSpoofNative(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 		return res
 	}
 
-	// Modes: "pure", "noise", and "quic" (datagram verification over Spoof Pipe)
 	stateMu.RLock()
 	cfgSnapshot := appCfg
 	stateMu.RUnlock()
@@ -2017,7 +2056,6 @@ func probeSpoofNative(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 		}
 	}
 
-	// If primary SPOOF_PIPE timed out, try direct UDP fallback ONLY if StrictRealSpoof is false.
 	if !s.StrictRealSpoof && dialPathTag == "SPOOF_PIPE" && strings.TrimSpace(peer.IP) != "" {
 		if fbAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort))); err == nil {
 			if fbConn, err := net.DialUDP("udp", nil, fbAddr); err == nil {
@@ -2302,6 +2340,8 @@ func forwardSpoofNativeTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig
 	defer uConn.Close()
 	_ = uConn.SetDeadline(time.Time{})
 
+	clientReorder := newM27StreamReorderBuffer()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -2330,7 +2370,7 @@ func forwardSpoofNativeTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig
 	go func() {
 		defer wg.Done()
 		for {
-			pType, rID, _, _, payload, err := readM27FrameFromConn(uConn, sess, subKey)
+			pType, rID, rSeq, _, payload, err := readM27FrameFromConn(uConn, sess, subKey)
 			if err != nil {
 				closeWriteTCP(client)
 				return
@@ -2340,8 +2380,10 @@ func forwardSpoofNativeTraffic(client net.Conn, peer ServerPeer, tc TunnelConfig
 			}
 			if pType == m27FrameTypeData && len(payload) > 0 {
 				atomic.AddUint64(&appRxBytes, uint64(len(payload)))
-				if _, wErr := client.Write(payload); wErr != nil {
-					return
+				for _, chunk := range clientReorder.InsertAndDrain(rSeq, payload) {
+					if _, wErr := client.Write(chunk); wErr != nil {
+						return
+					}
 				}
 			} else if pType == m27FrameTypeFin {
 				closeWriteTCP(client)
