@@ -99,6 +99,26 @@ type GREFRPConfig = {
   diagnostics: GREFRPDiagnostics;
 };
 
+type SpoofDirectionCheck = {
+  supported: boolean;
+  status_badge: string;
+  spoof_ip_tested: string;
+  observed_source_ip?: string;
+  packets_sent: number;
+  packets_received: number;
+  detail: string;
+};
+
+type SpoofCapabilityReport = {
+  tested: boolean;
+  overall_supported: boolean;
+  overall_badge: string;
+  summary: string;
+  master_to_agent: SpoofDirectionCheck;
+  agent_to_master: SpoofDirectionCheck;
+  tested_at?: string;
+};
+
 type SpoofTesterResult = {
   ip: string;
   received: number;
@@ -486,6 +506,15 @@ export default function App() {
   const [greActionBusy, setGreActionBusy] = useState<string | null>(null);
   const [greActionNotice, setGreActionNotice] = useState<string>("");
 
+  // Bidirectional Spoof Capability states (shared on top of Method 26 & Method 27)
+  const [spoofCapabilities, setSpoofCapabilities] = useState<
+    Record<string, SpoofCapabilityReport>
+  >({});
+  const [verifyingSpoofCapID, setVerifyingSpoofCapID] = useState<string | null>(
+    null
+  );
+  const [spoofCapError, setSpoofCapError] = useState<Record<string, string>>({});
+
   // Method 26 states
   const [spoofActionBusy, setSpoofActionBusy] = useState<string | null>(null);
   const [spoofActionNotice, setSpoofActionNotice] = useState<string>("");
@@ -558,6 +587,9 @@ export default function App() {
       }
       if (data.server_time) {
         setMasterTime(data.server_time);
+      }
+      if (data.spoof_capabilities && typeof data.spoof_capabilities === "object") {
+        setSpoofCapabilities(data.spoof_capabilities);
       }
       const list: ServerPeer[] = Array.isArray(data.servers) ? data.servers : [];
       setServers(list);
@@ -694,6 +726,52 @@ export default function App() {
       }
     } finally {
       setPingingKey(null);
+    }
+  }
+
+  async function handleVerifySpoofCapability(
+    serverID: string,
+    candidateSpoofIP?: string
+  ) {
+    if (verifyingSpoofCapID) return;
+    setVerifyingSpoofCapID(serverID);
+    setSpoofCapError((prev) => {
+      const next = { ...prev };
+      delete next[serverID];
+      return next;
+    });
+    try {
+      const res = await fetch("/api/v1/tunnels/spoof-capability", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          server_id: serverID,
+          spoof_ip: candidateSpoofIP || "8.8.8.8",
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.report) {
+          setSpoofCapabilities((prev) => ({
+            ...prev,
+            [serverID]: data.report,
+          }));
+        }
+        await fetchState();
+      } else {
+        const errText = await res.text();
+        setSpoofCapError((prev) => ({
+          ...prev,
+          [serverID]: errText.trim() || "Verification failed",
+        }));
+      }
+    } catch (e) {
+      setSpoofCapError((prev) => ({
+        ...prev,
+        [serverID]: String(e),
+      }));
+    } finally {
+      setVerifyingSpoofCapID(null);
     }
   }
 
@@ -1137,6 +1215,173 @@ export default function App() {
     } finally {
       setSavingTunnelKey(null);
     }
+  }
+
+  // Renders the shared Bidirectional Spoof Capability Verifier box at the top of Method 26 & Method 27
+  function renderSpoofCapabilityPrecheckBox(
+    serverID: string,
+    candidateSpoofIP: string
+  ) {
+    const cap = spoofCapabilities[serverID];
+    const isBusy = verifyingSpoofCapID === serverID;
+    const errMsg = spoofCapError[serverID];
+
+    const borderCol = !cap?.tested
+      ? "rgba(56, 189, 248, 0.35)"
+      : cap.overall_supported
+      ? "rgba(16, 185, 129, 0.55)"
+      : "rgba(239, 68, 68, 0.55)";
+
+    const bgCol = !cap?.tested
+      ? "rgba(15, 23, 42, 0.4)"
+      : cap.overall_supported
+      ? "rgba(16, 185, 129, 0.1)"
+      : "rgba(239, 68, 68, 0.1)";
+
+    return (
+      <div
+        style={{
+          marginBottom: "14px",
+          padding: "12px 14px",
+          borderRadius: "10px",
+          border: `1px solid ${borderCol}`,
+          background: bgCol,
+          display: "flex",
+          flexDirection: "column",
+          gap: "8px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: "8px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+            <Shield size={15} />
+            <strong style={{ fontSize: "13px" }}>
+              Pre-Flight Server Spoof Capability Check (Master ↔ Agent)
+            </strong>
+            {cap?.tested && (
+              <span
+                className={`disc-pill ${
+                  cap.overall_supported ? "disc-ok" : "disc-fail"
+                }`}
+              >
+                {cap.overall_supported
+                  ? "✓ BOTH SERVERS SUPPORT SPOOFING"
+                  : `✕ ${cap.overall_badge}`}
+              </span>
+            )}
+          </div>
+
+          <button
+            type="button"
+            className="next-method-btn"
+            disabled={isBusy}
+            onClick={() =>
+              handleVerifySpoofCapability(serverID, candidateSpoofIP)
+            }
+            title="Automatically test whether both Master (Iran) and Agent (Foreign) can transmit and receive spoofed-source packets (raw IP_HDRINCL + temporary iptables SNAT probe)"
+          >
+            <Activity size={13} />
+            <span>
+              {isBusy
+                ? "Testing Both Sides (~4s)..."
+                : "Verify Spoof Support (Both Sides)"}
+            </span>
+          </button>
+        </div>
+
+        <div style={{ fontSize: "12px", opacity: 0.9 }}>
+          {errMsg ? (
+            <span style={{ color: "#ef4444" }}>
+              Verification error: {errMsg}
+            </span>
+          ) : cap?.tested ? (
+            cap.summary
+          ) : (
+            "Before configuring or starting Method 26 / Method 27, click 'Verify Spoof Support (Both Sides)' to test if your Iran and Foreign datacenters allow sending spoofed-source packets."
+          )}
+        </div>
+
+        {cap?.tested && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+              gap: "8px",
+              marginTop: "2px",
+            }}
+          >
+            <div
+              style={{
+                padding: "8px 10px",
+                borderRadius: "8px",
+                background: "rgba(15, 23, 42, 0.45)",
+                border: "1px solid rgba(148, 163, 184, 0.18)",
+                fontSize: "11.5px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "4px",
+                }}
+              >
+                <strong>1. Master (Iran) → Agent (Foreign)</strong>
+                <span
+                  className={`disc-pill ${
+                    cap.master_to_agent.supported ? "disc-ok" : "disc-fail"
+                  }`}
+                >
+                  {cap.master_to_agent.supported
+                    ? "✓ SUPPORTED"
+                    : cap.master_to_agent.status_badge}
+                </span>
+              </div>
+              <div style={{ opacity: 0.85 }}>{cap.master_to_agent.detail}</div>
+            </div>
+
+            <div
+              style={{
+                padding: "8px 10px",
+                borderRadius: "8px",
+                background: "rgba(15, 23, 42, 0.45)",
+                border: "1px solid rgba(148, 163, 184, 0.18)",
+                fontSize: "11.5px",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  marginBottom: "4px",
+                }}
+              >
+                <strong>2. Agent (Foreign) → Master (Iran)</strong>
+                <span
+                  className={`disc-pill ${
+                    cap.agent_to_master.supported ? "disc-ok" : "disc-fail"
+                  }`}
+                >
+                  {cap.agent_to_master.supported
+                    ? "✓ SUPPORTED"
+                    : cap.agent_to_master.status_badge}
+                </span>
+              </div>
+              <div style={{ opacity: 0.85 }}>{cap.agent_to_master.detail}</div>
+            </div>
+          </div>
+        )}
+      </div>
+    );
   }
 
   const visibleAnalytics = daysUsage.slice(-analyticsRange);
@@ -2204,6 +2449,10 @@ export default function App() {
                     const m27Health = tunnel.spoof_native?.health;
                     const m27Tester = tunnel.spoof_native?.tester;
 
+                    const srvCap = spoofCapabilities[selectedServer.id];
+                    const isVerifyingCap =
+                      verifyingSpoofCapID === selectedServer.id;
+
                     return (
                       <article
                         className={`tunnel-card ${expanded ? "expanded" : ""}`}
@@ -2332,6 +2581,22 @@ export default function App() {
                               </>
                             )}
 
+                            {(tunnel.id === 26 || tunnel.id === 27) &&
+                              srvCap?.tested && (
+                                <span
+                                  className={`disc-pill ${
+                                    srvCap.overall_supported
+                                      ? "disc-ok"
+                                      : "disc-fail"
+                                  }`}
+                                  title={srvCap.summary}
+                                >
+                                  {srvCap.overall_supported
+                                    ? "✓ SPOOF SUPPORTED"
+                                    : `✕ ${srvCap.overall_badge}`}
+                                </span>
+                              )}
+
                             {disc?.tested_at && (
                               <span
                                 className={`disc-pill ${
@@ -2345,17 +2610,42 @@ export default function App() {
                             )}
                           </div>
 
-                          <button
-                            type="button"
-                            className="next-method-btn"
-                            style={{ padding: "4px 10px", fontSize: "11.5px" }}
-                            disabled={isPinging || !tunnel.implemented}
-                            onClick={() => handlePingTunnel(selectedServer.id, tunnel.id)}
-                            title={`Test ping on ${tunnel.name} (:${tunnel.listen_port})`}
-                          >
-                            <Activity size={12} />
-                            <span>{isPinging ? "Pinging..." : "Ping"}</span>
-                          </button>
+                          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                            {(tunnel.id === 26 || tunnel.id === 27) && (
+                              <button
+                                type="button"
+                                className="next-method-btn"
+                                style={{ padding: "4px 10px", fontSize: "11.5px" }}
+                                disabled={isVerifyingCap}
+                                onClick={() =>
+                                  handleVerifySpoofCapability(
+                                    selectedServer.id,
+                                    (tunnel.id === 27
+                                      ? snDraft?.spoof_ips?.[0]
+                                      : swgDraft?.spoof_ips?.[0]) || "8.8.8.8"
+                                  )
+                                }
+                                title="Test if both Master and Agent servers allow sending spoofed-source packets"
+                              >
+                                <Shield size={12} />
+                                <span>
+                                  {isVerifyingCap ? "Verifying..." : "Verify Spoof"}
+                                </span>
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              className="next-method-btn"
+                              style={{ padding: "4px 10px", fontSize: "11.5px" }}
+                              disabled={isPinging || !tunnel.implemented}
+                              onClick={() => handlePingTunnel(selectedServer.id, tunnel.id)}
+                              title={`Test ping on ${tunnel.name} (:${tunnel.listen_port})`}
+                            >
+                              <Activity size={12} />
+                              <span>{isPinging ? "Pinging..." : "Ping"}</span>
+                            </button>
+                          </div>
                         </div>
 
                         {expanded &&
@@ -3151,6 +3441,12 @@ export default function App() {
 
                         {expanded && tunnel.id === 26 && swgDraft && (
                           <div className="tunnel-settings">
+                            {/* TOP PRE-FLIGHT CAPABILITY CHECK BOX */}
+                            {renderSpoofCapabilityPrecheckBox(
+                              selectedServer.id,
+                              swgDraft.spoof_ips?.[0] || "8.8.8.8"
+                            )}
+
                             {/* REAL SPOOF VS FALLBACK STATUS BANNER */}
                             <div
                               style={{
@@ -4126,6 +4422,12 @@ export default function App() {
                            ========================================================== */}
                         {expanded && tunnel.id === 27 && snDraft && (
                           <div className="tunnel-settings">
+                            {/* TOP PRE-FLIGHT CAPABILITY CHECK BOX */}
+                            {renderSpoofCapabilityPrecheckBox(
+                              selectedServer.id,
+                              snDraft.spoof_ips?.[0] || "8.8.8.8"
+                            )}
+
                             {/* STATUS & STRICT MODE BANNER */}
                             <div
                               style={{
