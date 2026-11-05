@@ -99,11 +99,35 @@ type GREFRPConfig = {
   diagnostics: GREFRPDiagnostics;
 };
 
+type SpoofTesterResult = {
+  ip: string;
+  received: number;
+  sent: number;
+  loss_pct: number;
+};
+
+type SpoofTesterStatus = {
+  status: string;
+  mode: string;
+  protocol: string;
+  error?: string;
+  progress: number;
+  passed: SpoofTesterResult[];
+  started?: string;
+  finished?: string;
+};
+
 type SpoofWGHealth = {
   binary_installed: boolean;
+  binary_version?: string;
+  binary_sha256_ok?: boolean;
+  wg_tools_present?: boolean;
   core_active: boolean;
   wg_active: boolean;
   peer_ping: boolean;
+  real_spoof_active?: boolean;
+  spoof_mode_badge?: string;
+  warning_banner?: string;
   handshake?: string;
   active_path?: string;
   last_error?: string;
@@ -112,6 +136,7 @@ type SpoofWGHealth = {
 type SpoofWGConfig = {
   role: string;
   service_enabled: boolean;
+  require_real_spoof?: boolean;
   peer_public_ip: string;
   local_public_ip: string;
   spoof_listen_port: number;
@@ -134,6 +159,7 @@ type SpoofWGConfig = {
   last_error?: string;
   updated_at?: string;
   health: SpoofWGHealth;
+  tester?: SpoofTesterStatus;
 };
 
 type TunnelConfig = {
@@ -274,6 +300,7 @@ function defaultClientSpoofWG(role: Role, peerIP: string): SpoofWGConfig {
   return {
     role: isLocal ? "local" : "remote",
     service_enabled: false,
+    require_real_spoof: false,
     peer_public_ip: peerIP,
     local_public_ip: "",
     spoof_listen_port: 8090,
@@ -295,7 +322,16 @@ function defaultClientSpoofWG(role: Role, peerIP: string): SpoofWGConfig {
       core_active: false,
       wg_active: false,
       peer_ping: false,
-      active_path: "DIRECT_CARRIER",
+      real_spoof_active: false,
+      spoof_mode_badge: "FALLBACK ONLY (NO IP SPOOFING)",
+      active_path: "DIRECT_CARRIER_FALLBACK",
+    },
+    tester: {
+      status: "idle",
+      mode: isLocal ? "sender" : "receiver",
+      protocol: "icmp",
+      progress: 0,
+      passed: [],
     },
   };
 }
@@ -347,6 +383,18 @@ export default function App() {
   const [spoofActionNotice, setSpoofActionNotice] = useState<string>("");
   const [spoofBundleInput, setSpoofBundleInput] = useState<string>("");
   const [copiedBundle, setCopiedBundle] = useState<boolean>(false);
+
+  // Spoof IP Tester form states
+  const [testerMode, setTesterMode] = useState<"receiver" | "sender">("receiver");
+  const [testerProto, setTesterProto] = useState<"icmp" | "tcp">("icmp");
+  const [testerSourcesRaw, setTesterSourcesRaw] = useState<string>(
+    "8.8.8.8, 1.1.1.1, 9.9.9.9, 208.67.222.222"
+  );
+  const [testerDstIP, setTesterDstIP] = useState<string>("");
+  const [testerDstPort, setTesterDstPort] = useState<number>(80);
+  const [testerTimeout, setTesterTimeout] = useState<number>(30);
+  const [testerPacketCount, setTesterPacketCount] = useState<number>(10);
+  const [testerMaxLoss, setTesterMaxLoss] = useState<number>(20);
 
   const [showPortSettings, setShowPortSettings] = useState(false);
   const [portDrafts, setPortDrafts] = useState<PortDraftMap>({});
@@ -553,7 +601,16 @@ export default function App() {
 
   async function handleSpoofWGAction(
     serverID: string,
-    action: "bundle" | "import" | "up" | "down" | "restart",
+    action:
+      | "bundle"
+      | "import"
+      | "up"
+      | "down"
+      | "restart"
+      | "install_binary"
+      | "tester_start"
+      | "tester_stop"
+      | "tester_clear",
     currentDraft: TunnelConfig
   ) {
     if (spoofActionBusy) return;
@@ -571,6 +628,28 @@ export default function App() {
         }
       : undefined;
 
+    const testerReq =
+      action === "tester_start"
+        ? {
+            action: "start",
+            mode: testerMode,
+            protocol: testerProto,
+            sources: testerSourcesRaw
+              .split(/[\n,]+/)
+              .map((s) => s.trim())
+              .filter(Boolean),
+            dst_ip:
+              testerDstIP.trim() ||
+              effectiveSpoofWG?.peer_public_ip ||
+              selectedServer?.ip ||
+              "",
+            dst_port: testerDstPort || 80,
+            timeout: testerTimeout || 30,
+            packet_count: testerPacketCount || 10,
+            max_loss: testerMaxLoss,
+          }
+        : undefined;
+
     try {
       const res = await fetch("/api/v1/tunnels/spoof-wg", {
         method: "POST",
@@ -580,6 +659,7 @@ export default function App() {
           action,
           bundle: spoofBundleInput,
           spoof_wg: effectiveSpoofWG,
+          tester_req: testerReq,
         }),
       });
       if (res.ok) {
@@ -1389,7 +1469,11 @@ export default function App() {
                   }}
                 >
                   <div style={{ fontSize: "13px", color: "#10b981", fontWeight: 600 }}>
-                    {batchPortNotice && `✓ ${batchPortNotice}`}
+                    {batchPortNotice
+                      ? `✓ ${batchPortNotice}`
+                      : copiedID === selectedServer.id
+                      ? "✓ Connection Token Copied to Clipboard!"
+                      : ""}
                   </div>
 
                   <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
@@ -1397,6 +1481,14 @@ export default function App() {
                       <button
                         type="button"
                         className="next-method-btn"
+                        style={
+                          copiedID === selectedServer.id
+                            ? {
+                                borderColor: "#10b981",
+                                color: "#10b981",
+                              }
+                            : undefined
+                        }
                         onClick={() => copyToken(selectedServer.id, selectedServer.token)}
                       >
                         {copiedID === selectedServer.id ? (
@@ -1405,7 +1497,9 @@ export default function App() {
                           <Copy size={14} />
                         )}
                         <span>
-                          {copiedID === selectedServer.id ? "Token Copied" : "Copy Token"}
+                          {copiedID === selectedServer.id
+                            ? "✓ Token Copied!"
+                            : "Copy Token"}
                         </span>
                       </button>
                     )}
@@ -1546,6 +1640,7 @@ export default function App() {
                   const historyOpen = expandedHistoryID === server.id;
                   const isSwitching = switchingServerID === server.id;
                   const switchMsg = switchNotice[server.id];
+                  const isCopied = copiedID === server.id;
                   const whoConnected = formatInitiatorFallback(
                     role,
                     server.active_direction,
@@ -1616,16 +1711,22 @@ export default function App() {
 
                             {role === "master" && (
                               <button
-                                className="icon-button"
+                                className="next-method-btn"
                                 onClick={() => copyToken(server.id, server.token)}
                                 title="Copy connection token (includes current ports)"
                                 aria-label="Copy connection token"
+                                style={
+                                  isCopied
+                                    ? {
+                                        borderColor: "#10b981",
+                                        color: "#10b981",
+                                        padding: "5px 10px",
+                                      }
+                                    : { padding: "5px 10px" }
+                                }
                               >
-                                {copiedID === server.id ? (
-                                  <Check size={15} />
-                                ) : (
-                                  <Copy size={15} />
-                                )}
+                                {isCopied ? <Check size={14} /> : <Copy size={14} />}
+                                <span>{isCopied ? "Copied!" : "Copy Token"}</span>
                               </button>
                             )}
 
@@ -1685,11 +1786,14 @@ export default function App() {
                           )}
                         </button>
 
-                        <span className="sync-badge">
+                        <span
+                          className="sync-badge"
+                          style={isCopied ? { color: "#10b981", fontWeight: 700 } : undefined}
+                        >
                           {switchMsg
                             ? switchMsg
-                            : copiedID === server.id
-                            ? "✓ Token Copied"
+                            : isCopied
+                            ? "✓ Token Copied to Clipboard!"
                             : server.sync_state === "synced"
                             ? `Token Ready (v${server.config_version})`
                             : `Token Updated (v${server.config_version})`}
@@ -1845,6 +1949,9 @@ export default function App() {
                         ? spoofIPsRawDraft[tunnelKey]
                         : (swgDraft?.spoof_ips || []).join(", ");
 
+                    const liveHealth = tunnel.spoof_wg?.health;
+                    const liveTester = tunnel.spoof_wg?.tester;
+
                     return (
                       <article
                         className={`tunnel-card ${expanded ? "expanded" : ""}`}
@@ -1931,11 +2038,32 @@ export default function App() {
                             )}
 
                             {tunnel.id === 26 && tunnel.spoof_wg && (
-                              <span className="proto-badge">
-                                {tunnel.spoof_wg.send_transport.toUpperCase()}/
-                                {tunnel.spoof_wg.recv_transport.toUpperCase()} •{" "}
-                                {tunnel.spoof_wg.wg_local_ip} ↔ {tunnel.spoof_wg.wg_peer_ip}
-                              </span>
+                              <>
+                                <span className="proto-badge">
+                                  {tunnel.spoof_wg.send_transport.toUpperCase()}/
+                                  {tunnel.spoof_wg.recv_transport.toUpperCase()} •{" "}
+                                  {tunnel.spoof_wg.wg_local_ip} ↔ {tunnel.spoof_wg.wg_peer_ip}
+                                </span>
+
+                                <span
+                                  className={`disc-pill ${
+                                    liveHealth?.real_spoof_active
+                                      ? "disc-ok"
+                                      : "disc-fail"
+                                  }`}
+                                  title={
+                                    liveHealth?.real_spoof_active
+                                      ? "External spoof binary and WireGuard wg-spoof are active and spoofing packets"
+                                      : liveHealth?.warning_banner ||
+                                        "Not using the external spoof binary; running in fallback mode"
+                                  }
+                                >
+                                  {liveHealth?.real_spoof_active
+                                    ? "REAL SPOOF ACTIVE"
+                                    : liveHealth?.spoof_mode_badge ||
+                                      "FALLBACK ONLY (NOT SPOOFING)"}
+                                </span>
+                              </>
                             )}
 
                             {disc?.tested_at && (
@@ -2741,6 +2869,80 @@ export default function App() {
 
                         {expanded && tunnel.id === 26 && swgDraft && (
                           <div className="tunnel-settings">
+                            {/* REAL SPOOF VS FALLBACK STATUS BANNER */}
+                            <div
+                              style={{
+                                marginBottom: "16px",
+                                padding: "12px 14px",
+                                borderRadius: "10px",
+                                border: liveHealth?.real_spoof_active
+                                  ? "1px solid rgba(16, 185, 129, 0.45)"
+                                  : "1px solid rgba(245, 158, 11, 0.55)",
+                                background: liveHealth?.real_spoof_active
+                                  ? "rgba(16, 185, 129, 0.12)"
+                                  : "rgba(245, 158, 11, 0.12)",
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "6px",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  flexWrap: "wrap",
+                                  gap: "8px",
+                                }}
+                              >
+                                <strong
+                                  style={{
+                                    fontSize: "13px",
+                                    color: liveHealth?.real_spoof_active
+                                      ? "#10b981"
+                                      : "#f59e0b",
+                                  }}
+                                >
+                                  {liveHealth?.real_spoof_active
+                                    ? "✓ REAL LAYER-3 IP SPOOFING + WIREGUARD PIPE IS ACTIVE"
+                                    : `⚠️ ${
+                                        liveHealth?.spoof_mode_badge ||
+                                        "NOT USING REAL SPOOF BINARY (FALLBACK MODE)"
+                                      }`}
+                                </strong>
+
+                                <label
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "6px",
+                                    fontSize: "12px",
+                                    cursor: "pointer",
+                                  }}
+                                  title="When checked, Method 26 refuses to use the unspoofed fallback carrier and only operates when the real spoof binary + wg-spoof interface are active"
+                                >
+                                  <input
+                                    type="checkbox"
+                                    disabled={role === "agent"}
+                                    checked={Boolean(swgDraft.require_real_spoof)}
+                                    onChange={(e) =>
+                                      updateSWGDraft({
+                                        require_real_spoof: e.target.checked,
+                                      })
+                                    }
+                                  />
+                                  <span>Strict Real Spoof Only (Disable Fallback)</span>
+                                </label>
+                              </div>
+
+                              {!liveHealth?.real_spoof_active &&
+                                liveHealth?.warning_banner && (
+                                  <div style={{ fontSize: "12px", opacity: 0.9 }}>
+                                    {liveHealth.warning_banner}
+                                  </div>
+                                )}
+                            </div>
+
                             {/* SECTION 1: SPOOF PIPE & CARRIER SETTINGS */}
                             <div className="settings-title">
                               <Settings2 size={15} />
@@ -3086,6 +3288,14 @@ export default function App() {
                                   <button
                                     type="button"
                                     className="next-method-btn"
+                                    style={
+                                      copiedBundle
+                                        ? {
+                                            borderColor: "#10b981",
+                                            color: "#10b981",
+                                          }
+                                        : undefined
+                                    }
                                     onClick={() =>
                                       copySpoofBundleText(swgDraft.last_bundle || "")
                                     }
@@ -3096,7 +3306,9 @@ export default function App() {
                                       <Copy size={13} />
                                     )}
                                     <span>
-                                      {copiedBundle ? "Bundle Copied" : "Copy Bundle"}
+                                      {copiedBundle
+                                        ? "✓ Bundle Copied!"
+                                        : "Copy Bundle"}
                                     </span>
                                   </button>
                                 )}
@@ -3147,7 +3359,7 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* SECTION 4: LIVE HEALTH & SERVICE MANAGEMENT */}
+                            {/* SECTION 4: LIVE HEALTH, BINARY INSTALLER & SERVICE MANAGEMENT */}
                             <div
                               style={{
                                 marginTop: "18px",
@@ -3168,9 +3380,32 @@ export default function App() {
                                 }}
                               >
                                 <span style={{ fontWeight: 700, fontSize: "13px" }}>
-                                  4. Live Spoof + WireGuard Health & Service Controls
+                                  4. Live Spoof + WireGuard Health & Binary Controls
                                 </span>
                                 <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={spoofActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofWGAction(
+                                        selectedServer.id,
+                                        "install_binary",
+                                        draft
+                                      )
+                                    }
+                                    title="Download official ParsaKSH/spoof-tunnel v3.0.2 binary (with Iran mirrors & SHA-256 verification) and install wireguard-tools"
+                                  >
+                                    <ArrowDown size={12} />
+                                    <span>
+                                      {spoofActionBusy === "install_binary"
+                                        ? "Installing Binary..."
+                                        : liveHealth?.binary_installed
+                                        ? "Re-Verify Spoof Binary"
+                                        : "Install Spoof Binary (v3.0.2)"}
+                                    </span>
+                                  </button>
+
                                   <button
                                     type="button"
                                     className="next-method-btn"
@@ -3186,6 +3421,7 @@ export default function App() {
                                     <Play size={12} />
                                     <span>Apply & Start</span>
                                   </button>
+
                                   <button
                                     type="button"
                                     className="next-method-btn"
@@ -3201,6 +3437,7 @@ export default function App() {
                                     <Pause size={12} />
                                     <span>Stop Services</span>
                                   </button>
+
                                   <button
                                     type="button"
                                     className="next-method-btn"
@@ -3240,46 +3477,334 @@ export default function App() {
                                 }}
                               >
                                 <div>
-                                  <span style={{ opacity: 0.7 }}>ACTIVE PATH: </span>
-                                  <strong>
-                                    {tunnel.spoof_wg?.health?.active_path ||
-                                      "DIRECT_CARRIER"}
+                                  <span style={{ opacity: 0.7 }}>SPOOF ENGINE: </span>
+                                  <strong
+                                    style={{
+                                      color: liveHealth?.real_spoof_active
+                                        ? "#10b981"
+                                        : "#f59e0b",
+                                    }}
+                                  >
+                                    {liveHealth?.real_spoof_active
+                                      ? "REAL SPOOFING"
+                                      : "FALLBACK (UNSPOOFED)"}
                                   </strong>
                                 </div>
                                 <div>
                                   <span style={{ opacity: 0.7 }}>SPOOF BINARY: </span>
+                                  <strong
+                                    style={{
+                                      color: liveHealth?.binary_installed
+                                        ? "#10b981"
+                                        : "#ef4444",
+                                    }}
+                                  >
+                                    {liveHealth?.binary_installed
+                                      ? `INSTALLED (${
+                                          liveHealth.binary_version || "v3.0.2"
+                                        }${
+                                          liveHealth.binary_sha256_ok ? " ✓ SHA256" : ""
+                                        })`
+                                      : "MISSING (NOT INSTALLED)"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>WIREGUARD TOOLS: </span>
                                   <strong>
-                                    {tunnel.spoof_wg?.health?.binary_installed
+                                    {liveHealth?.wg_tools_present
                                       ? "INSTALLED"
-                                      : "BUILT-IN FALLBACK"}
+                                      : "MISSING"}
                                   </strong>
                                 </div>
                                 <div>
                                   <span style={{ opacity: 0.7 }}>SPOOF-CORE SVC: </span>
                                   <strong>
-                                    {tunnel.spoof_wg?.health?.core_active
-                                      ? "ACTIVE"
-                                      : "STANDBY"}
+                                    {liveHealth?.core_active ? "ACTIVE" : "STANDBY"}
                                   </strong>
                                 </div>
                                 <div>
                                   <span style={{ opacity: 0.7 }}>WG-SPOOF SVC: </span>
                                   <strong>
-                                    {tunnel.spoof_wg?.health?.wg_active
-                                      ? "ACTIVE"
-                                      : "STANDBY"}
+                                    {liveHealth?.wg_active ? "ACTIVE" : "STANDBY"}
                                   </strong>
                                 </div>
                                 <div>
                                   <span style={{ opacity: 0.7 }}>WG HANDSHAKE: </span>
                                   <strong>
-                                    {tunnel.spoof_wg?.health?.handshake ||
-                                      (tunnel.spoof_wg?.health?.peer_ping
-                                        ? "FRESH"
-                                        : "STANDBY")}
+                                    {liveHealth?.handshake ||
+                                      (liveHealth?.peer_ping ? "FRESH" : "STANDBY")}
                                   </strong>
                                 </div>
                               </div>
+                            </div>
+
+                            {/* SECTION 5: SPOOF IP TESTER (FROM spoof_tester.go) */}
+                            <div
+                              style={{
+                                marginTop: "18px",
+                                padding: "12px 14px",
+                                borderRadius: "10px",
+                                border: "1px solid rgba(148, 163, 184, 0.22)",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
+                                  gap: "8px",
+                                  marginBottom: "10px",
+                                }}
+                              >
+                                <span style={{ fontWeight: 700, fontSize: "13px" }}>
+                                  5. Spoof IP Tester (Find Whitelisted Source IPs That Cross the Firewall)
+                                </span>
+                                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={
+                                      spoofActionBusy !== null ||
+                                      liveTester?.status === "running"
+                                    }
+                                    onClick={() =>
+                                      handleSpoofWGAction(
+                                        selectedServer.id,
+                                        "tester_start",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Play size={12} />
+                                    <span>
+                                      {liveTester?.status === "running"
+                                        ? `Running (${liveTester.progress || 0}%)...`
+                                        : "Start Tester"}
+                                    </span>
+                                  </button>
+
+                                  {liveTester?.status === "running" && (
+                                    <button
+                                      type="button"
+                                      className="next-method-btn"
+                                      disabled={spoofActionBusy !== null}
+                                      onClick={() =>
+                                        handleSpoofWGAction(
+                                          selectedServer.id,
+                                          "tester_stop",
+                                          draft
+                                        )
+                                      }
+                                    >
+                                      <Pause size={12} />
+                                      <span>Stop Tester</span>
+                                    </button>
+                                  )}
+
+                                  {liveTester?.passed &&
+                                    liveTester.passed.length > 0 && (
+                                      <button
+                                        type="button"
+                                        className="next-method-btn"
+                                        style={{
+                                          borderColor: "#10b981",
+                                          color: "#10b981",
+                                        }}
+                                        onClick={() => {
+                                          const ips = liveTester.passed.map(
+                                            (p) => p.ip
+                                          );
+                                          setSpoofIPsRawDraft((prev) => ({
+                                            ...prev,
+                                            [tunnelKey]: ips.join(", "),
+                                          }));
+                                          updateSWGDraft({ spoof_ips: ips });
+                                        }}
+                                      >
+                                        <Check size={12} />
+                                        <span>
+                                          Use {liveTester.passed.length} Passing IP(s)
+                                        </span>
+                                      </button>
+                                    )}
+                                </div>
+                              </div>
+
+                              <div className="settings-grid">
+                                <div className="form-field">
+                                  <label>TESTER MODE</label>
+                                  <select
+                                    className="server-select"
+                                    value={testerMode}
+                                    onChange={(e) =>
+                                      setTesterMode(
+                                        e.target.value as "receiver" | "sender"
+                                      )
+                                    }
+                                    style={{ width: "100%", padding: "10px 12px" }}
+                                  >
+                                    <option value="receiver">
+                                      Receiver (Run First on Receiving Server)
+                                    </option>
+                                    <option value="sender">
+                                      Sender (Run Second on Sending Server)
+                                    </option>
+                                  </select>
+                                </div>
+
+                                <div className="form-field">
+                                  <label>PROBE PROTOCOL</label>
+                                  <select
+                                    className="server-select"
+                                    value={testerProto}
+                                    onChange={(e) =>
+                                      setTesterProto(
+                                        e.target.value as "icmp" | "tcp"
+                                      )
+                                    }
+                                    style={{ width: "100%", padding: "10px 12px" }}
+                                  >
+                                    <option value="icmp">ICMP</option>
+                                    <option value="tcp">TCP</option>
+                                  </select>
+                                </div>
+
+                                {testerMode === "sender" && (
+                                  <>
+                                    <div className="form-field">
+                                      <label>RECEIVER SERVER PUBLIC IPV4</label>
+                                      <input
+                                        value={
+                                          testerDstIP ||
+                                          swgDraft.peer_public_ip ||
+                                          selectedServer.ip
+                                        }
+                                        onChange={(e) =>
+                                          setTesterDstIP(e.target.value)
+                                        }
+                                        placeholder={selectedServer.ip}
+                                      />
+                                    </div>
+
+                                    <div className="form-field">
+                                      <label>DESTINATION PORT (TCP MODE)</label>
+                                      <input
+                                        type="number"
+                                        value={testerDstPort}
+                                        onChange={(e) =>
+                                          setTesterDstPort(
+                                            Number(e.target.value) || 80
+                                          )
+                                        }
+                                      />
+                                    </div>
+                                  </>
+                                )}
+
+                                <div className="form-field">
+                                  <label>TIMEOUT (SEC) / PACKETS PER IP / MAX LOSS %</label>
+                                  <div style={{ display: "flex", gap: "6px" }}>
+                                    <input
+                                      type="number"
+                                      value={testerTimeout}
+                                      title="Receiver Timeout (seconds)"
+                                      onChange={(e) =>
+                                        setTesterTimeout(
+                                          Number(e.target.value) || 30
+                                        )
+                                      }
+                                    />
+                                    <input
+                                      type="number"
+                                      value={testerPacketCount}
+                                      title="Packets per source IP"
+                                      onChange={(e) =>
+                                        setTesterPacketCount(
+                                          Number(e.target.value) || 10
+                                        )
+                                      }
+                                    />
+                                    <input
+                                      type="number"
+                                      value={testerMaxLoss}
+                                      title="Max accepted packet loss %"
+                                      onChange={(e) =>
+                                        setTesterMaxLoss(
+                                          Number(e.target.value) || 0
+                                        )
+                                      }
+                                    />
+                                  </div>
+                                </div>
+
+                                <div className="form-field" style={{ gridColumn: "1 / -1" }}>
+                                  <label>
+                                    SOURCE IPS / RANGES / CIDRS TO TEST (COMMA OR NEWLINE SEPARATED)
+                                  </label>
+                                  <input
+                                    value={testerSourcesRaw}
+                                    onChange={(e) =>
+                                      setTesterSourcesRaw(e.target.value)
+                                    }
+                                    placeholder="8.8.8.8, 1.1.1.1, 9.9.9.9, 198.51.100.0/24"
+                                  />
+                                </div>
+                              </div>
+
+                              {liveTester && liveTester.status !== "idle" && (
+                                <div
+                                  style={{
+                                    marginTop: "10px",
+                                    fontSize: "12px",
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: "6px",
+                                  }}
+                                >
+                                  <div>
+                                    <span>
+                                      Tester Status:{" "}
+                                      <strong>
+                                        {liveTester.status.toUpperCase()}
+                                      </strong>{" "}
+                                      ({liveTester.mode} /{" "}
+                                      {liveTester.protocol?.toUpperCase()})
+                                    </span>
+                                    {liveTester.error && (
+                                      <span
+                                        style={{
+                                          color: "#ef4444",
+                                          marginLeft: "8px",
+                                        }}
+                                      >
+                                        — {liveTester.error}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {liveTester.passed &&
+                                    liveTester.passed.length > 0 && (
+                                      <div
+                                        style={{
+                                          display: "flex",
+                                          flexWrap: "wrap",
+                                          gap: "6px",
+                                        }}
+                                      >
+                                        {liveTester.passed.map((item, idx) => (
+                                          <span
+                                            key={idx}
+                                            className="disc-pill disc-ok"
+                                          >
+                                            {item.ip} ({item.received}/
+                                            {item.sent} • {item.loss_pct}% loss)
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                </div>
+                              )}
                             </div>
 
                             {errBanner && (
