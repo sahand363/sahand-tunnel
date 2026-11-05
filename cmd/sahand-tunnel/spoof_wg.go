@@ -55,11 +55,12 @@ const (
 	spoofSHA256AMD64    = "a8dfe9e838ad5655b467765eae6f374e5f63af31bf2dded9aab295815fbcabf8"
 	spoofSHA256ARM64    = "caf08b3960d4eea72910fb0613a8893560a41f5b2f2e18f9a6c595c9ad7ea16c"
 
-	spoofWGMagic         = "SPFWG1"
-	spoofWGCmdProbe byte = 0x01
-	spoofWGCmdSync  byte = 0x02
-	spoofWGCmdTCP   byte = 0x03
-	spoofWGCmdUDP   byte = 0x04
+	spoofWGMagic             = "SPFWG1"
+	spoofWGCmdProbe     byte = 0x01
+	spoofWGCmdSync      byte = 0x02
+	spoofWGCmdTCP       byte = 0x03
+	spoofWGCmdUDP       byte = 0x04
+	spoofWGCmdVerifyCap byte = 0x05
 )
 
 var spoofTransports = []string{"tcp", "udp", "icmp", "icmpv6"}
@@ -457,10 +458,6 @@ func ensureWireGuardToolsInstalled() {
 	}
 }
 
-// Downloads the official ParsaKSH/spoof-tunnel v3.0.2 binary (trying direct GitHub
-// first and Iran proxy mirrors if blocked), verifies its SHA-256 against the
-// pinned digest from hashem.sh, installs it to /usr/local/bin/spoof, and installs
-// wireguard-tools if missing.
 func installOfficialSpoofBinary() (string, error) {
 	ensureWireGuardToolsInstalled()
 
@@ -752,7 +749,6 @@ func querySpoofWGRuntimeHealth(s *SpoofWGConfig) SpoofWGHealth {
 		}
 	}
 
-	// Determine whether REAL IP Spoofing + WireGuard is actively carrying traffic
 	if h.BinaryInstalled && h.CoreActive && h.WGActive && (h.PeerPing || (s != nil && isLocalIPAddressBound(s.WGLocalIP))) {
 		h.RealSpoofActive = true
 		h.SpoofModeBadge = "REAL SPOOF ACTIVE (wg-spoof)"
@@ -1307,6 +1303,12 @@ func (rt *spoofWGRuntime) handleIncomingConn(conn net.Conn) {
 			return
 		}
 		handleWebTransportParitySyncStream(conn, rt.peer.ID, remoteHost)
+
+	case spoofWGCmdVerifyCap:
+		if _, err := conn.Write([]byte{0x00}); err != nil {
+			return
+		}
+		handleSpoofCapAgentSession(conn, remoteHost, rt)
 
 	case spoofWGCmdTCP:
 		if !rt.tunnel.Enabled {
