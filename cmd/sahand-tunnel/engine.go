@@ -197,6 +197,7 @@ func stopAllServerListeners(peerID string) {
 	stopSahandRawPeerResources(peerID)
 	stopGREFRPPeerResources(peerID)
 	stopSpoofWGPeerResources(peerID)
+	stopSpoofNativePeerResources(peerID)
 
 	engineMu.Lock()
 	defer engineMu.Unlock()
@@ -225,6 +226,34 @@ func syncServerListeners(peer ServerPeer) {
 	for _, tun := range tunnels {
 		tc := tun
 		if !tc.Implemented {
+			continue
+		}
+
+		// Method 27 (Native Spoof Engine): Independent Native Spoof Pipe + Selectable Adapter (Pure, WireGuard, QUIC, Noise)
+		if tc.ID == 27 {
+			tLn, uConn, err := startSpoofNativeServer(peer, tc)
+			if err == nil {
+				if tLn != nil {
+					bound = append(bound, tLn)
+				}
+				if uConn != nil {
+					boundUDP = append(boundUDP, uConn)
+				}
+			}
+			if tc.Enabled && peer.IP != "" && bindEntries {
+				forwardPorts := parsePortList(tc.ForwardPorts)
+				for _, fp := range forwardPorts {
+					targetPort := fp
+					entryLn, err := net.Listen("tcp", "0.0.0.0:"+targetPort)
+					if err == nil {
+						bound = append(bound, entryLn)
+						go acceptTrafficEntryLoop(entryLn, peer, tc, targetPort)
+						if udpEntry := startSpoofNativeUDPEntryForwarder(peer, tc, targetPort); udpEntry != nil {
+							boundUDP = append(boundUDP, udpEntry)
+						}
+					}
+				}
+			}
 			continue
 		}
 
@@ -879,6 +908,8 @@ func handleTrafficEntryClient(client net.Conn, peer ServerPeer, tc TunnelConfig,
 		forwardGREFRPTraffic(client, peer, tc, targetPort)
 	case 26:
 		forwardSpoofWGTraffic(client, peer, tc, targetPort)
+	case 27:
+		forwardSpoofNativeTraffic(client, peer, tc, targetPort)
 	default:
 		forwardWSSTraffic(client, peer, tc, targetPort)
 	}
@@ -1122,6 +1153,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 		res = probeGREFRP(peer, tc, localNodeID)
 	case 26:
 		res = probeSpoofWG(peer, tc, localNodeID)
+	case 27:
+		res = probeSpoofNative(peer, tc, localNodeID)
 	default:
 		res.Success = false
 		res.ErrorReason = "Driver not implemented"
@@ -1132,6 +1165,8 @@ func probeSingleMethod(peer ServerPeer, tc TunnelConfig) MethodResult {
 
 func pushParitySyncOverMethod(peer ServerPeer, tc TunnelConfig, latencyMS int64) bool {
 	switch tc.ID {
+	case 27:
+		return pushSpoofNativeParitySync(peer, tc, latencyMS)
 	case 26:
 		return pushSpoofWGParitySync(peer, tc, latencyMS)
 	case 25:
