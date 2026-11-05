@@ -162,6 +162,66 @@ type SpoofWGConfig = {
   tester?: SpoofTesterStatus;
 };
 
+type SpoofNativeHealth = {
+  binary_installed: boolean;
+  binary_version?: string;
+  binary_sha256_ok?: boolean;
+  wg_tools_present?: boolean;
+  core_active: boolean;
+  wg_active: boolean;
+  end_to_end_verified: boolean;
+  real_spoof_active: boolean;
+  connection_state: string;
+  status_badge: string;
+  active_adapter: string;
+  active_path?: string;
+  handshake?: string;
+  last_verified_at?: string;
+  last_rtt_ms?: number;
+  packet_loss_pct?: number;
+  warning_banner?: string;
+  security_note?: string;
+  last_error?: string;
+};
+
+type SpoofNativeConfig = {
+  role: string;
+  mode: string; // "pure" | "wireguard" | "quic" | "noise"
+  service_enabled: boolean;
+  strict_real_spoof: boolean;
+  peer_public_ip: string;
+  local_public_ip: string;
+  spoof_listen_port: number;
+  recv_port: number;
+  spoof_port: number;
+  spoof_ips: string[];
+  send_transport: string;
+  recv_transport: string;
+  core_port: number;
+  adapter_port: number;
+  mtu: number;
+  keepalive_sec: number;
+  timeout_sec: number;
+  packet_count: number;
+  max_loss_pct: number;
+  wg_interface: string;
+  wg_priv_key?: string;
+  wg_pub_key?: string;
+  wg_peer_pub?: string;
+  wg_peer_priv?: string;
+  wg_local_ip?: string;
+  wg_peer_ip?: string;
+  noise_priv_key?: string;
+  noise_pub_key?: string;
+  noise_peer_pub?: string;
+  noise_peer_priv?: string;
+  last_bundle?: string;
+  last_error?: string;
+  updated_at?: string;
+  health: SpoofNativeHealth;
+  tester?: SpoofTesterStatus;
+};
+
 type TunnelConfig = {
   id: number;
   name: string;
@@ -177,6 +237,7 @@ type TunnelConfig = {
   raw_transport?: string;
   gre_frp?: GREFRPConfig;
   spoof_wg?: SpoofWGConfig;
+  spoof_native?: SpoofNativeConfig;
   heartbeat_sec?: number;
   stream_limit?: number;
   speed_limit_mbps: string;
@@ -336,6 +397,52 @@ function defaultClientSpoofWG(role: Role, peerIP: string): SpoofWGConfig {
   };
 }
 
+function defaultClientSpoofNative(role: Role, peerIP: string): SpoofNativeConfig {
+  const isLocal = role === "master";
+  return {
+    role: isLocal ? "local" : "remote",
+    mode: "pure",
+    service_enabled: false,
+    strict_real_spoof: true,
+    peer_public_ip: peerIP,
+    local_public_ip: "",
+    spoof_listen_port: 8091,
+    recv_port: 5011,
+    spoof_port: isLocal ? 443 : 8091,
+    spoof_ips: [],
+    send_transport: isLocal ? "tcp" : "udp",
+    recv_transport: isLocal ? "udp" : "tcp",
+    core_port: 5010,
+    adapter_port: 51827,
+    mtu: 1280,
+    keepalive_sec: 25,
+    timeout_sec: 30,
+    packet_count: 10,
+    max_loss_pct: 20,
+    wg_interface: "wg-spoof27",
+    wg_local_ip: isLocal ? "10.27.0.1" : "10.27.0.2",
+    wg_peer_ip: isLocal ? "10.27.0.2" : "10.27.0.1",
+    health: {
+      binary_installed: false,
+      core_active: false,
+      wg_active: false,
+      end_to_end_verified: false,
+      real_spoof_active: false,
+      connection_state: "DISCONNECTED",
+      status_badge: "DISCONNECTED",
+      active_adapter: "pure",
+      active_path: "NONE",
+    },
+    tester: {
+      status: "idle",
+      mode: isLocal ? "sender" : "receiver",
+      protocol: "icmp",
+      progress: 0,
+      passed: [],
+    },
+  };
+}
+
 function parseSpoofIPsCSV(raw: string): string[] {
   return raw
     .split(",")
@@ -379,12 +486,12 @@ export default function App() {
   const [greActionBusy, setGreActionBusy] = useState<string | null>(null);
   const [greActionNotice, setGreActionNotice] = useState<string>("");
 
+  // Method 26 states
   const [spoofActionBusy, setSpoofActionBusy] = useState<string | null>(null);
   const [spoofActionNotice, setSpoofActionNotice] = useState<string>("");
   const [spoofBundleInput, setSpoofBundleInput] = useState<string>("");
   const [copiedBundle, setCopiedBundle] = useState<boolean>(false);
 
-  // Spoof IP Tester form states
   const [testerMode, setTesterMode] = useState<"receiver" | "sender">("receiver");
   const [testerProto, setTesterProto] = useState<"icmp" | "tcp">("icmp");
   const [testerSourcesRaw, setTesterSourcesRaw] = useState<string>(
@@ -395,6 +502,19 @@ export default function App() {
   const [testerTimeout, setTesterTimeout] = useState<number>(30);
   const [testerPacketCount, setTesterPacketCount] = useState<number>(10);
   const [testerMaxLoss, setTesterMaxLoss] = useState<number>(20);
+
+  // Method 27 (Independent Native Spoof Engine) states
+  const [m27ActionBusy, setM27ActionBusy] = useState<string | null>(null);
+  const [m27ActionNotice, setM27ActionNotice] = useState<string>("");
+  const [m27BundleInput, setM27BundleInput] = useState<string>("");
+  const [copiedM27Bundle, setCopiedM27Bundle] = useState<boolean>(false);
+  const [m27TesterMode, setM27TesterMode] = useState<"receiver" | "sender">("receiver");
+  const [m27TesterProto, setM27TesterProto] = useState<"icmp" | "tcp">("icmp");
+  const [m27TesterSourcesRaw, setM27TesterSourcesRaw] = useState<string>(
+    "8.8.8.8, 1.1.1.1, 9.9.9.9, 208.67.222.222"
+  );
+  const [m27TesterDstIP, setM27TesterDstIP] = useState<string>("");
+  const [m27TesterDstPort, setM27TesterDstPort] = useState<number>(80);
 
   const [showPortSettings, setShowPortSettings] = useState(false);
   const [portDrafts, setPortDrafts] = useState<PortDraftMap>({});
@@ -687,6 +807,96 @@ export default function App() {
     }
   }
 
+  async function handleSpoofNativeAction(
+    serverID: string,
+    action:
+      | "save"
+      | "bundle"
+      | "import"
+      | "up"
+      | "down"
+      | "restart"
+      | "verify_pipe"
+      | "install_binary"
+      | "tester_start"
+      | "tester_stop"
+      | "tester_clear",
+    currentDraft: TunnelConfig
+  ) {
+    if (m27ActionBusy) return;
+    setM27ActionBusy(action);
+    setM27ActionNotice("");
+    const key = `${serverID}:27`;
+    const rawIPs = spoofIPsRawDraft[key];
+    const effectiveNative = currentDraft.spoof_native
+      ? {
+          ...currentDraft.spoof_native,
+          spoof_ips:
+            rawIPs !== undefined
+              ? parseSpoofIPsCSV(rawIPs)
+              : currentDraft.spoof_native.spoof_ips,
+        }
+      : undefined;
+
+    const testerReq =
+      action === "tester_start"
+        ? {
+            action: "start",
+            mode: m27TesterMode,
+            protocol: m27TesterProto,
+            sources: m27TesterSourcesRaw
+              .split(/[\n,]+/)
+              .map((s) => s.trim())
+              .filter(Boolean),
+            dst_ip:
+              m27TesterDstIP.trim() ||
+              effectiveNative?.peer_public_ip ||
+              selectedServer?.ip ||
+              "",
+            dst_port: m27TesterDstPort || 80,
+            timeout: effectiveNative?.timeout_sec || 30,
+            packet_count: effectiveNative?.packet_count || 10,
+            max_loss: effectiveNative?.max_loss_pct ?? 20,
+          }
+        : undefined;
+
+    try {
+      const res = await fetch("/api/v1/tunnels/spoof-native", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          server_id: serverID,
+          action,
+          bundle: m27BundleInput,
+          spoof_native: effectiveNative,
+          tester_req: testerReq,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setM27ActionNotice(data.message || "Operation completed");
+        if (data.spoof_native) {
+          updateDraftTunnel(serverID, {
+            ...currentDraft,
+            spoof_native: data.spoof_native,
+          });
+          setSpoofIPsRawDraft((prev) => ({
+            ...prev,
+            [key]: (data.spoof_native.spoof_ips || []).join(", "),
+          }));
+        }
+        if (action === "import") {
+          setM27BundleInput("");
+        }
+        await fetchState();
+      } else {
+        setM27ActionNotice("Error: " + (await res.text()));
+      }
+    } finally {
+      setM27ActionBusy(null);
+    }
+  }
+
   async function copyTextUniversal(text: string): Promise<boolean> {
     if (!text) return false;
     try {
@@ -722,6 +932,13 @@ export default function App() {
     if (await copyTextUniversal(bundleStr)) {
       setCopiedBundle(true);
       setTimeout(() => setCopiedBundle(false), 1800);
+    }
+  }
+
+  async function copyM27BundleText(bundleStr: string) {
+    if (await copyTextUniversal(bundleStr)) {
+      setCopiedM27Bundle(true);
+      setTimeout(() => setCopiedM27Bundle(false), 1800);
     }
   }
 
@@ -864,10 +1081,22 @@ export default function App() {
           }
         : updated.spoof_wg;
 
+    const finalSpoofNative =
+      updated.id === 27 && updated.spoof_native
+        ? {
+            ...updated.spoof_native,
+            spoof_ips:
+              rawSpoofIPs !== undefined
+                ? parseSpoofIPsCSV(rawSpoofIPs)
+                : updated.spoof_native.spoof_ips,
+          }
+        : updated.spoof_native;
+
     const payload: TunnelConfig = {
       ...updated,
       speed_limit_mbps: safeSpeed,
       spoof_wg: finalSpoofWG,
+      spoof_native: finalSpoofNative,
     };
 
     try {
@@ -1944,13 +2173,36 @@ export default function App() {
                       });
                     };
 
+                    const snDraft =
+                      tunnel.id === 27
+                        ? draft.spoof_native ||
+                          defaultClientSpoofNative(role, selectedServer.ip)
+                        : null;
+
+                    const updateSNDraft = (patch: Partial<SpoofNativeConfig>) => {
+                      if (!snDraft) return;
+                      const merged: SpoofNativeConfig = {
+                        ...snDraft,
+                        ...patch,
+                      };
+                      updateDraftTunnel(selectedServer.id, {
+                        ...draft,
+                        spoof_native: merged,
+                      });
+                    };
+
                     const spoofIPsInputValue =
                       spoofIPsRawDraft[tunnelKey] !== undefined
                         ? spoofIPsRawDraft[tunnelKey]
+                        : tunnel.id === 27
+                        ? (snDraft?.spoof_ips || []).join(", ")
                         : (swgDraft?.spoof_ips || []).join(", ");
 
                     const liveHealth = tunnel.spoof_wg?.health;
                     const liveTester = tunnel.spoof_wg?.tester;
+
+                    const m27Health = tunnel.spoof_native?.health;
+                    const m27Tester = tunnel.spoof_native?.tester;
 
                     return (
                       <article
@@ -2051,17 +2303,31 @@ export default function App() {
                                       ? "disc-ok"
                                       : "disc-fail"
                                   }`}
-                                  title={
-                                    liveHealth?.real_spoof_active
-                                      ? "External spoof binary and WireGuard wg-spoof are active and spoofing packets"
-                                      : liveHealth?.warning_banner ||
-                                        "Not using the external spoof binary; running in fallback mode"
-                                  }
                                 >
                                   {liveHealth?.real_spoof_active
                                     ? "REAL SPOOF ACTIVE"
                                     : liveHealth?.spoof_mode_badge ||
                                       "FALLBACK ONLY (NOT SPOOFING)"}
+                                </span>
+                              </>
+                            )}
+
+                            {tunnel.id === 27 && tunnel.spoof_native && (
+                              <>
+                                <span className="proto-badge">
+                                  MODE: {(tunnel.spoof_native.mode || "pure").toUpperCase()} •{" "}
+                                  {tunnel.spoof_native.send_transport.toUpperCase()}/
+                                  {tunnel.spoof_native.recv_transport.toUpperCase()}
+                                </span>
+
+                                <span
+                                  className={`disc-pill ${
+                                    m27Health?.connection_state === "REAL SPOOF ACTIVE"
+                                      ? "disc-ok"
+                                      : "disc-fail"
+                                  }`}
+                                >
+                                  {m27Health?.connection_state || "DISCONNECTED"}
                                 </span>
                               </>
                             )}
@@ -2092,174 +2358,190 @@ export default function App() {
                           </button>
                         </div>
 
-                        {expanded && tunnel.id !== 25 && tunnel.id !== 26 && (
-                          <div className="tunnel-settings">
-                            <div className="settings-title">
-                              <Settings2 size={15} />
-                              <span>
-                                {tunnel.name} Configuration ({tunnel.traffic_type.toUpperCase()})
-                              </span>
-                            </div>
-
-                            <div className="settings-grid">
-                              <div className="form-field">
-                                <label htmlFor={`lport-${tunnel.id}`}>
-                                  TUNNEL LISTEN PORT
-                                </label>
-                                <input
-                                  id={`lport-${tunnel.id}`}
-                                  type="number"
-                                  disabled={role === "agent"}
-                                  value={draft.listen_port}
-                                  onChange={(e) =>
-                                    updateDraftTunnel(selectedServer.id, {
-                                      ...draft,
-                                      listen_port: Number(e.target.value) || 0,
-                                    })
-                                  }
-                                />
+                        {expanded &&
+                          tunnel.id !== 25 &&
+                          tunnel.id !== 26 &&
+                          tunnel.id !== 27 && (
+                            <div className="tunnel-settings">
+                              <div className="settings-title">
+                                <Settings2 size={15} />
+                                <span>
+                                  {tunnel.name} Configuration ({tunnel.traffic_type.toUpperCase()})
+                                </span>
                               </div>
 
-                              <div className="form-field">
-                                <label htmlFor={`fport-${tunnel.id}`}>
-                                  FORWARDING PORTS (CSV)
-                                </label>
-                                <input
-                                  id={`fport-${tunnel.id}`}
-                                  disabled={role === "agent"}
-                                  placeholder="32001, 32002"
-                                  value={draft.forward_ports}
-                                  onChange={(e) =>
-                                    updateDraftTunnel(selectedServer.id, {
-                                      ...draft,
-                                      forward_ports: e.target.value,
-                                    })
-                                  }
-                                />
-                              </div>
-
-                              {tunnel.id === 24 ? (
+                              <div className="settings-grid">
                                 <div className="form-field">
-                                  <label htmlFor={`rawmode-${tunnel.id}`}>
-                                    RAW TRANSPORT MODE
+                                  <label htmlFor={`lport-${tunnel.id}`}>
+                                    TUNNEL LISTEN PORT
                                   </label>
-                                  <select
-                                    id={`rawmode-${tunnel.id}`}
-                                    className="server-select"
+                                  <input
+                                    id={`lport-${tunnel.id}`}
+                                    type="number"
                                     disabled={role === "agent"}
-                                    value={draft.raw_transport || "auto"}
+                                    value={draft.listen_port}
                                     onChange={(e) =>
                                       updateDraftTunnel(selectedServer.id, {
                                         ...draft,
-                                        raw_transport: e.target.value,
+                                        listen_port: Number(e.target.value) || 0,
                                       })
                                     }
-                                    style={{ width: "100%", padding: "10px 12px" }}
-                                  >
-                                    <option value="auto">Auto (Prefer RAW_IP, Fallback UDP)</option>
-                                    <option value="raw_ip">Strict RAW_IP (Linux ip4:tcp Socket)</option>
-                                    <option value="udp">UDP_FALLBACK (Encrypted UDP Carrier)</option>
-                                  </select>
+                                  />
                                 </div>
-                              ) : (
-                                <>
-                                  {draft.sni !== undefined && (
-                                    <div className="form-field">
-                                      <label htmlFor={`sni-${tunnel.id}`}>TLS SNI</label>
-                                      <input
-                                        id={`sni-${tunnel.id}`}
-                                        disabled={role === "agent"}
-                                        placeholder="www.speedtest.net"
-                                        value={draft.sni}
-                                        onChange={(e) =>
-                                          updateDraftTunnel(selectedServer.id, {
-                                            ...draft,
-                                            sni: e.target.value,
-                                          })
-                                        }
-                                      />
-                                    </div>
-                                  )}
 
-                                  {draft.ws_path !== undefined && (
-                                    <div className="form-field">
-                                      <label htmlFor={`path-${tunnel.id}`}>HTTP / WS PATH</label>
-                                      <input
-                                        id={`path-${tunnel.id}`}
-                                        disabled={role === "agent"}
-                                        placeholder="/ws"
-                                        value={draft.ws_path}
-                                        onChange={(e) =>
-                                          updateDraftTunnel(selectedServer.id, {
-                                            ...draft,
-                                            ws_path: e.target.value,
-                                          })
-                                        }
-                                      />
-                                    </div>
-                                  )}
-                                </>
+                                <div className="form-field">
+                                  <label htmlFor={`fport-${tunnel.id}`}>
+                                    FORWARDING PORTS (CSV)
+                                  </label>
+                                  <input
+                                    id={`fport-${tunnel.id}`}
+                                    disabled={role === "agent"}
+                                    placeholder="32001, 32002"
+                                    value={draft.forward_ports}
+                                    onChange={(e) =>
+                                      updateDraftTunnel(selectedServer.id, {
+                                        ...draft,
+                                        forward_ports: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </div>
+
+                                {tunnel.id === 24 ? (
+                                  <div className="form-field">
+                                    <label htmlFor={`rawmode-${tunnel.id}`}>
+                                      RAW TRANSPORT MODE
+                                    </label>
+                                    <select
+                                      id={`rawmode-${tunnel.id}`}
+                                      className="server-select"
+                                      disabled={role === "agent"}
+                                      value={draft.raw_transport || "auto"}
+                                      onChange={(e) =>
+                                        updateDraftTunnel(selectedServer.id, {
+                                          ...draft,
+                                          raw_transport: e.target.value,
+                                        })
+                                      }
+                                      style={{ width: "100%", padding: "10px 12px" }}
+                                    >
+                                      <option value="auto">
+                                        Auto (Prefer RAW_IP, Fallback UDP)
+                                      </option>
+                                      <option value="raw_ip">
+                                        Strict RAW_IP (Linux ip4:tcp Socket)
+                                      </option>
+                                      <option value="udp">
+                                        UDP_FALLBACK (Encrypted UDP Carrier)
+                                      </option>
+                                    </select>
+                                  </div>
+                                ) : (
+                                  <>
+                                    {draft.sni !== undefined && (
+                                      <div className="form-field">
+                                        <label htmlFor={`sni-${tunnel.id}`}>TLS SNI</label>
+                                        <input
+                                          id={`sni-${tunnel.id}`}
+                                          disabled={role === "agent"}
+                                          placeholder="www.speedtest.net"
+                                          value={draft.sni}
+                                          onChange={(e) =>
+                                            updateDraftTunnel(selectedServer.id, {
+                                              ...draft,
+                                              sni: e.target.value,
+                                            })
+                                          }
+                                        />
+                                      </div>
+                                    )}
+
+                                    {draft.ws_path !== undefined && (
+                                      <div className="form-field">
+                                        <label htmlFor={`path-${tunnel.id}`}>
+                                          HTTP / WS PATH
+                                        </label>
+                                        <input
+                                          id={`path-${tunnel.id}`}
+                                          disabled={role === "agent"}
+                                          placeholder="/ws"
+                                          value={draft.ws_path}
+                                          onChange={(e) =>
+                                            updateDraftTunnel(selectedServer.id, {
+                                              ...draft,
+                                              ws_path: e.target.value,
+                                            })
+                                          }
+                                        />
+                                      </div>
+                                    )}
+                                  </>
+                                )}
+
+                                <div className="form-field">
+                                  <label htmlFor={`spd-${tunnel.id}`}>
+                                    SPEED LIMIT (MB/S, 0=UNLIMITED)
+                                  </label>
+                                  <input
+                                    id={`spd-${tunnel.id}`}
+                                    disabled={role === "agent"}
+                                    placeholder="0"
+                                    value={draft.speed_limit_mbps ?? "0"}
+                                    onChange={(e) =>
+                                      updateDraftTunnel(selectedServer.id, {
+                                        ...draft,
+                                        speed_limit_mbps: e.target.value,
+                                      })
+                                    }
+                                  />
+                                </div>
+
+                                <div className="setting-status">
+                                  <span className="setting-label">TRAFFIC TUNNEL</span>
+                                  <span
+                                    className={`setting-value ${
+                                      tunnel.enabled ? "enabled-text" : ""
+                                    }`}
+                                  >
+                                    {tunnel.enabled ? "Enabled" : "Disabled"}
+                                  </span>
+                                </div>
+                              </div>
+
+                              {errBanner && (
+                                <div
+                                  className="form-error-banner"
+                                  style={{ marginTop: "10px" }}
+                                >
+                                  {errBanner}
+                                </div>
                               )}
 
-                              <div className="form-field">
-                                <label htmlFor={`spd-${tunnel.id}`}>
-                                  SPEED LIMIT (MB/S, 0=UNLIMITED)
-                                </label>
-                                <input
-                                  id={`spd-${tunnel.id}`}
-                                  disabled={role === "agent"}
-                                  placeholder="0"
-                                  value={draft.speed_limit_mbps ?? "0"}
-                                  onChange={(e) =>
-                                    updateDraftTunnel(selectedServer.id, {
-                                      ...draft,
-                                      speed_limit_mbps: e.target.value,
-                                    })
-                                  }
-                                />
-                              </div>
+                              {role === "master" && (
+                                <div className="settings-actions-row">
+                                  <button
+                                    type="button"
+                                    className="save-tunnel-btn"
+                                    disabled={isSaving}
+                                    onClick={() =>
+                                      commitTunnelConfig(selectedServer.id, draft)
+                                    }
+                                  >
+                                    <Save size={14} />
+                                    <span>
+                                      {isSaving ? "Saving..." : "Save Settings"}
+                                    </span>
+                                  </button>
 
-                              <div className="setting-status">
-                                <span className="setting-label">TRAFFIC TUNNEL</span>
-                                <span
-                                  className={`setting-value ${
-                                    tunnel.enabled ? "enabled-text" : ""
-                                  }`}
-                                >
-                                  {tunnel.enabled ? "Enabled" : "Disabled"}
-                                </span>
-                              </div>
+                                  {noticeText && (
+                                    <span className="save-feedback-text">
+                                      ✓ {noticeText}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </div>
-
-                            {errBanner && (
-                              <div className="form-error-banner" style={{ marginTop: "10px" }}>
-                                {errBanner}
-                              </div>
-                            )}
-
-                            {role === "master" && (
-                              <div className="settings-actions-row">
-                                <button
-                                  type="button"
-                                  className="save-tunnel-btn"
-                                  disabled={isSaving}
-                                  onClick={() =>
-                                    commitTunnelConfig(selectedServer.id, draft)
-                                  }
-                                >
-                                  <Save size={14} />
-                                  <span>{isSaving ? "Saving..." : "Save Settings"}</span>
-                                </button>
-
-                                {noticeText && (
-                                  <span className="save-feedback-text">
-                                    ✓ {noticeText}
-                                  </span>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        )}
+                          )}
 
                         {expanded && tunnel.id === 25 && gfDraft && (
                           <div className="tunnel-settings">
@@ -2919,7 +3201,6 @@ export default function App() {
                                     fontSize: "12px",
                                     cursor: "pointer",
                                   }}
-                                  title="When checked, Method 26 refuses to use the unspoofed fallback carrier and only operates when the real spoof binary + wg-spoof interface are active"
                                 >
                                   <input
                                     type="checkbox"
@@ -3394,7 +3675,6 @@ export default function App() {
                                         draft
                                       )
                                     }
-                                    title="Download official ParsaKSH/spoof-tunnel v3.0.2 binary (with Iran mirrors & SHA-256 verification) and install wireguard-tools"
                                   >
                                     <ArrowDown size={12} />
                                     <span>
@@ -3538,7 +3818,7 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* SECTION 5: SPOOF IP TESTER (FROM spoof_tester.go) */}
+                            {/* SECTION 5: SPOOF IP TESTER */}
                             <div
                               style={{
                                 marginTop: "18px",
@@ -3828,6 +4108,1070 @@ export default function App() {
                                     {isSaving
                                       ? "Saving..."
                                       : "Save Spoof + WireGuard Settings"}
+                                  </span>
+                                </button>
+
+                                {noticeText && (
+                                  <span className="save-feedback-text">
+                                    ✓ {noticeText}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* ==========================================================
+                            METHOD 27: INDEPENDENT NATIVE SPOOF ENGINE UI
+                           ========================================================== */}
+                        {expanded && tunnel.id === 27 && snDraft && (
+                          <div className="tunnel-settings">
+                            {/* STATUS & STRICT MODE BANNER */}
+                            <div
+                              style={{
+                                marginBottom: "16px",
+                                padding: "12px 14px",
+                                borderRadius: "10px",
+                                border:
+                                  m27Health?.connection_state === "REAL SPOOF ACTIVE"
+                                    ? "1px solid rgba(16, 185, 129, 0.45)"
+                                    : m27Health?.connection_state === "SPOOF FAILED"
+                                    ? "1px solid rgba(239, 68, 68, 0.55)"
+                                    : "1px solid rgba(245, 158, 11, 0.55)",
+                                background:
+                                  m27Health?.connection_state === "REAL SPOOF ACTIVE"
+                                    ? "rgba(16, 185, 129, 0.12)"
+                                    : m27Health?.connection_state === "SPOOF FAILED"
+                                    ? "rgba(239, 68, 68, 0.12)"
+                                    : "rgba(245, 158, 11, 0.12)",
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "6px",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  alignItems: "center",
+                                  justifyContent: "space-between",
+                                  flexWrap: "wrap",
+                                  gap: "8px",
+                                }}
+                              >
+                                <strong
+                                  style={{
+                                    fontSize: "13px",
+                                    color:
+                                      m27Health?.connection_state === "REAL SPOOF ACTIVE"
+                                        ? "#10b981"
+                                        : m27Health?.connection_state === "SPOOF FAILED"
+                                        ? "#ef4444"
+                                        : "#f59e0b",
+                                  }}
+                                >
+                                  STATUS: {m27Health?.status_badge || "DISCONNECTED"}
+                                </strong>
+
+                                <label
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "6px",
+                                    fontSize: "12px",
+                                    cursor: "pointer",
+                                  }}
+                                  title="When enabled, no direct fallback is permitted. If the real Spoof Pipe fails, the tunnel remains disconnected."
+                                >
+                                  <input
+                                    type="checkbox"
+                                    disabled={role === "agent"}
+                                    checked={Boolean(snDraft.strict_real_spoof)}
+                                    onChange={(e) =>
+                                      updateSNDraft({
+                                        strict_real_spoof: e.target.checked,
+                                      })
+                                    }
+                                  />
+                                  <span>Strict Real Spoof (No Direct Fallback)</span>
+                                </label>
+                              </div>
+
+                              {m27Health?.warning_banner && (
+                                <div style={{ fontSize: "12px", opacity: 0.92 }}>
+                                  {m27Health.warning_banner}
+                                </div>
+                              )}
+
+                              {snDraft.mode === "pure" && (
+                                <div
+                                  style={{
+                                    fontSize: "11.5px",
+                                    opacity: 0.85,
+                                    borderTop: "1px solid rgba(148,163,184,0.2)",
+                                    paddingTop: "6px",
+                                  }}
+                                >
+                                  <strong>Security Note (Pure Spoof):</strong> Pure Spoof
+                                  transports raw datagrams over the native Spoof UDP pipe
+                                  without WireGuard or TLS encryption overhead. Ensure your
+                                  forwarded inbound traffic (e.g. TLS / Xray / SSH) is
+                                  already encrypted, or select Spoof + WireGuard / QUIC /
+                                  Noise below.
+                                </div>
+                              )}
+                            </div>
+
+                            {/* SECTION 1: PROTOCOL / SECURITY ADAPTER SELECTOR & SPOOF CORE */}
+                            <div className="settings-title">
+                              <Settings2 size={15} />
+                              <span>
+                                1. Method 27 Architecture: Transport Adapter & Spoof Core (/etc/spoof-m27)
+                              </span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label>TRANSPORT / SECURITY ADAPTER</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={snDraft.mode || "pure"}
+                                  onChange={(e) =>
+                                    updateSNDraft({ mode: e.target.value })
+                                  }
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="pure">
+                                    1. Pure Spoof (Native UDP Pipe — No WG/TLS)
+                                  </option>
+                                  <option value="wireguard">
+                                    2. Spoof + WireGuard (Isolated wg-spoof27)
+                                  </option>
+                                  <option value="quic">
+                                    3. Spoof + QUIC (TLS 1.3 Multiplexed over Spoof Pipe)
+                                  </option>
+                                  <option value="noise">
+                                    4. Spoof + Noise (Noise_IKpsk2 ChaCha20-Poly1305)
+                                  </option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>SPOOF NODE ROLE</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={snDraft.role || "local"}
+                                  onChange={(e) => {
+                                    const newRole = e.target.value;
+                                    updateSNDraft({
+                                      role: newRole,
+                                      wg_local_ip:
+                                        newRole === "local" ? "10.27.0.1" : "10.27.0.2",
+                                      wg_peer_ip:
+                                        newRole === "local" ? "10.27.0.2" : "10.27.0.1",
+                                      spoof_port:
+                                        newRole === "local"
+                                          ? 443
+                                          : snDraft.spoof_listen_port || 8091,
+                                    });
+                                  }}
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="local">Local (Master / Iran)</option>
+                                  <option value="remote">Remote (Agent / Foreign)</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>PEER PUBLIC IPV4 ADDRESS</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={snDraft.peer_public_ip || selectedServer.ip}
+                                  onChange={(e) =>
+                                    updateSNDraft({ peer_public_ip: e.target.value })
+                                  }
+                                  placeholder="198.51.100.12"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>THIS SERVER'S PUBLIC IPV4 (FOR BUNDLE)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={snDraft.local_public_ip || ""}
+                                  onChange={(e) =>
+                                    updateSNDraft({ local_public_ip: e.target.value })
+                                  }
+                                  placeholder="Auto-detect or enter Master IPv4"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>SEND TRANSPORT CARRIER</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={snDraft.send_transport || "tcp"}
+                                  onChange={(e) =>
+                                    updateSNDraft({ send_transport: e.target.value })
+                                  }
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="tcp">TCP</option>
+                                  <option value="udp">UDP</option>
+                                  <option value="icmp">ICMP</option>
+                                  <option value="icmpv6">ICMPv6</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>RECEIVE TRANSPORT CARRIER</label>
+                                <select
+                                  className="server-select"
+                                  disabled={role === "agent"}
+                                  value={snDraft.recv_transport || "udp"}
+                                  onChange={(e) =>
+                                    updateSNDraft({ recv_transport: e.target.value })
+                                  }
+                                  style={{ width: "100%", padding: "10px 12px" }}
+                                >
+                                  <option value="udp">UDP</option>
+                                  <option value="tcp">TCP</option>
+                                  <option value="icmp">ICMP</option>
+                                  <option value="icmpv6">ICMPv6</option>
+                                </select>
+                              </div>
+
+                              <div className="form-field">
+                                <label>REMOTE LISTEN PORT (DEFAULT 8091)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={snDraft.spoof_listen_port}
+                                  onChange={(e) =>
+                                    updateSNDraft({
+                                      spoof_listen_port: Number(e.target.value) || 8091,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>LOCAL RECV / CLIENT PORT (DEFAULT 5011)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={snDraft.recv_port}
+                                  onChange={(e) =>
+                                    updateSNDraft({
+                                      recv_port: Number(e.target.value) || 5011,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>OUTGOING SPOOF PORT (DEFAULT 443)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={snDraft.spoof_port}
+                                  onChange={(e) =>
+                                    updateSNDraft({
+                                      spoof_port: Number(e.target.value) || 443,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>LOCAL CORE UDP PORT (DEFAULT 5010)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={snDraft.core_port}
+                                  onChange={(e) =>
+                                    updateSNDraft({
+                                      core_port: Number(e.target.value) || 5010,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>REMOTE ADAPTER UDP PORT (DEFAULT 51827)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={snDraft.adapter_port}
+                                  onChange={(e) =>
+                                    updateSNDraft({
+                                      adapter_port: Number(e.target.value) || 51827,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>MTU / KEEPALIVE (SEC)</label>
+                                <div style={{ display: "flex", gap: "6px" }}>
+                                  <input
+                                    type="number"
+                                    disabled={role === "agent"}
+                                    value={snDraft.mtu || 1280}
+                                    title="MTU"
+                                    onChange={(e) =>
+                                      updateSNDraft({
+                                        mtu: Number(e.target.value) || 1280,
+                                      })
+                                    }
+                                  />
+                                  <input
+                                    type="number"
+                                    disabled={role === "agent"}
+                                    value={snDraft.keepalive_sec || 25}
+                                    title="Keepalive Seconds"
+                                    onChange={(e) =>
+                                      updateSNDraft({
+                                        keepalive_sec: Number(e.target.value) || 25,
+                                      })
+                                    }
+                                  />
+                                </div>
+                              </div>
+
+                              <div className="form-field" style={{ gridColumn: "1 / -1" }}>
+                                <label>
+                                  CANDIDATE / WORKING SPOOF SOURCE IPV4 ADDRESSES (CSV — ROUND-ROBIN WHEN MULTIPLE)
+                                </label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={spoofIPsInputValue}
+                                  onChange={(e) => {
+                                    const raw = e.target.value;
+                                    setSpoofIPsRawDraft((prev) => ({
+                                      ...prev,
+                                      [tunnelKey]: raw,
+                                    }));
+                                    updateSNDraft({
+                                      spoof_ips: parseSpoofIPsCSV(raw),
+                                    });
+                                  }}
+                                  placeholder="Enter verified Spoof IPs (e.g. 8.8.8.8, 1.1.1.1) or run the Tester below"
+                                />
+                              </div>
+                            </div>
+
+                            {/* SECTION 2: MODE-SPECIFIC ADAPTER & FORWARDING FIELDS */}
+                            <div className="settings-title" style={{ marginTop: "18px" }}>
+                              <Shield size={15} />
+                              <span>
+                                2. Adapter Parameters ({(snDraft.mode || "pure").toUpperCase()}) & Port Forwarding
+                              </span>
+                            </div>
+
+                            <div className="settings-grid">
+                              <div className="form-field">
+                                <label>ENGINE 1 ADAPTER PORT (DEFAULT 28027)</label>
+                                <input
+                                  type="number"
+                                  disabled={role === "agent"}
+                                  value={draft.listen_port}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      listen_port: Number(e.target.value) || 28027,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>FORWARDING PORTS (CSV — ENGINE 2)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={draft.forward_ports}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      forward_ports: e.target.value,
+                                    })
+                                  }
+                                  placeholder="32027"
+                                />
+                              </div>
+
+                              <div className="form-field">
+                                <label>SPEED LIMIT (MB/S, 0=UNLIMITED)</label>
+                                <input
+                                  disabled={role === "agent"}
+                                  value={draft.speed_limit_mbps ?? "0"}
+                                  onChange={(e) =>
+                                    updateDraftTunnel(selectedServer.id, {
+                                      ...draft,
+                                      speed_limit_mbps: e.target.value,
+                                    })
+                                  }
+                                />
+                              </div>
+
+                              {snDraft.mode === "wireguard" && (
+                                <>
+                                  <div className="form-field">
+                                    <label>WG INTERFACE (ISOLATED)</label>
+                                    <input
+                                      disabled={role === "agent"}
+                                      value={snDraft.wg_interface || "wg-spoof27"}
+                                      onChange={(e) =>
+                                        updateSNDraft({ wg_interface: e.target.value })
+                                      }
+                                    />
+                                  </div>
+
+                                  <div className="form-field">
+                                    <label>LOCAL WG IP (/24)</label>
+                                    <input
+                                      disabled={role === "agent"}
+                                      value={snDraft.wg_local_ip || "10.27.0.1"}
+                                      onChange={(e) =>
+                                        updateSNDraft({ wg_local_ip: e.target.value })
+                                      }
+                                    />
+                                  </div>
+
+                                  <div className="form-field">
+                                    <label>PEER WG IP (/32)</label>
+                                    <input
+                                      disabled={role === "agent"}
+                                      value={snDraft.wg_peer_ip || "10.27.0.2"}
+                                      onChange={(e) =>
+                                        updateSNDraft({ wg_peer_ip: e.target.value })
+                                      }
+                                    />
+                                  </div>
+
+                                  <div className="form-field">
+                                    <label>THIS SERVER'S WG PUBLIC KEY</label>
+                                    <input
+                                      readOnly
+                                      value={snDraft.wg_pub_key || "Auto-generated"}
+                                    />
+                                  </div>
+
+                                  <div className="form-field">
+                                    <label>PEER WG PUBLIC KEY</label>
+                                    <input
+                                      disabled={role === "agent"}
+                                      value={snDraft.wg_peer_pub || ""}
+                                      onChange={(e) =>
+                                        updateSNDraft({ wg_peer_pub: e.target.value })
+                                      }
+                                      placeholder="Auto-filled via Bundle"
+                                    />
+                                  </div>
+                                </>
+                              )}
+
+                              {snDraft.mode === "noise" && (
+                                <>
+                                  <div className="form-field">
+                                    <label>THIS SERVER'S NOISE X25519 PUBLIC KEY</label>
+                                    <input
+                                      readOnly
+                                      value={snDraft.noise_pub_key || "Auto-generated"}
+                                    />
+                                  </div>
+
+                                  <div className="form-field">
+                                    <label>PEER NOISE X25519 PUBLIC KEY</label>
+                                    <input
+                                      disabled={role === "agent"}
+                                      value={snDraft.noise_peer_pub || ""}
+                                      onChange={(e) =>
+                                        updateSNDraft({
+                                          noise_peer_pub: e.target.value,
+                                        })
+                                      }
+                                      placeholder="Auto-filled via Bundle"
+                                    />
+                                  </div>
+                                </>
+                              )}
+                            </div>
+
+                            {/* SECTION 3: INDEPENDENT METHOD 27 BUNDLE (m27spf1_...) */}
+                            <div className="settings-title" style={{ marginTop: "18px" }}>
+                              <Copy size={15} />
+                              <span>3. Method 27 Configuration Export / Import (m27spf1_...)</span>
+                            </div>
+
+                            <div
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "10px",
+                                marginTop: "8px",
+                                padding: "12px",
+                                borderRadius: "10px",
+                                border: "1px solid rgba(148, 163, 184, 0.22)",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  gap: "8px",
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  className="next-method-btn"
+                                  disabled={m27ActionBusy !== null}
+                                  onClick={() =>
+                                    handleSpoofNativeAction(
+                                      selectedServer.id,
+                                      "bundle",
+                                      draft
+                                    )
+                                  }
+                                >
+                                  <Plus size={13} />
+                                  <span>
+                                    {m27ActionBusy === "bundle"
+                                      ? "Generating..."
+                                      : "Generate Method 27 Bundle (Master)"}
+                                  </span>
+                                </button>
+
+                                {snDraft.last_bundle && (
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    style={
+                                      copiedM27Bundle
+                                        ? {
+                                            borderColor: "#10b981",
+                                            color: "#10b981",
+                                          }
+                                        : undefined
+                                    }
+                                    onClick={() =>
+                                      copyM27BundleText(snDraft.last_bundle || "")
+                                    }
+                                  >
+                                    {copiedM27Bundle ? (
+                                      <Check size={13} />
+                                    ) : (
+                                      <Copy size={13} />
+                                    )}
+                                    <span>
+                                      {copiedM27Bundle
+                                        ? "✓ Bundle Copied!"
+                                        : "Copy Bundle"}
+                                    </span>
+                                  </button>
+                                )}
+                              </div>
+
+                              {snDraft.last_bundle && (
+                                <input
+                                  readOnly
+                                  value={snDraft.last_bundle}
+                                  style={{ fontSize: "12px", fontFamily: "monospace" }}
+                                />
+                              )}
+
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "1fr auto",
+                                  gap: "8px",
+                                  alignItems: "center",
+                                }}
+                              >
+                                <input
+                                  value={m27BundleInput}
+                                  onChange={(e) => setM27BundleInput(e.target.value)}
+                                  placeholder="Paste m27spf1_... bundle here to import on Agent server"
+                                />
+                                <button
+                                  type="button"
+                                  className="next-method-btn"
+                                  disabled={
+                                    m27ActionBusy !== null ||
+                                    !m27BundleInput.trim()
+                                  }
+                                  onClick={() =>
+                                    handleSpoofNativeAction(
+                                      selectedServer.id,
+                                      "import",
+                                      draft
+                                    )
+                                  }
+                                >
+                                  <span>
+                                    {m27ActionBusy === "import"
+                                      ? "Importing..."
+                                      : "Import Bundle"}
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* SECTION 4: LIVE HEALTH, END-TO-END VERIFICATION & SERVICE CONTROLS */}
+                            <div
+                              style={{
+                                marginTop: "18px",
+                                padding: "12px 14px",
+                                borderRadius: "10px",
+                                border: "1px solid rgba(56, 189, 248, 0.25)",
+                                background: "rgba(15, 23, 42, 0.35)",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
+                                  gap: "8px",
+                                  marginBottom: "10px",
+                                }}
+                              >
+                                <span style={{ fontWeight: 700, fontSize: "13px" }}>
+                                  4. Method 27 Service Controls & End-to-End Pipe Verification
+                                </span>
+                                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={m27ActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofNativeAction(
+                                        selectedServer.id,
+                                        "install_binary",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <ArrowDown size={12} />
+                                    <span>
+                                      {m27ActionBusy === "install_binary"
+                                        ? "Installing..."
+                                        : m27Health?.binary_installed
+                                        ? "Verify Spoof Binary"
+                                        : "Install Spoof v3.0.2"}
+                                    </span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={m27ActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofNativeAction(
+                                        selectedServer.id,
+                                        "up",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Play size={12} />
+                                    <span>Apply & Start (spoof-core-m27)</span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={m27ActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofNativeAction(
+                                        selectedServer.id,
+                                        "verify_pipe",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Activity size={12} />
+                                    <span>Verify Spoof Pipe</span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={m27ActionBusy !== null}
+                                    onClick={() =>
+                                      handleSpoofNativeAction(
+                                        selectedServer.id,
+                                        "down",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Pause size={12} />
+                                    <span>Stop Services</span>
+                                  </button>
+                                </div>
+                              </div>
+
+                              {m27ActionNotice && (
+                                <div
+                                  style={{
+                                    fontSize: "12px",
+                                    color: "#38bdf8",
+                                    marginBottom: "8px",
+                                  }}
+                                >
+                                  {m27ActionNotice}
+                                </div>
+                              )}
+
+                              <div
+                                style={{
+                                  display: "grid",
+                                  gridTemplateColumns: "repeat(auto-fit, minmax(175px, 1fr))",
+                                  gap: "8px",
+                                  fontSize: "12px",
+                                }}
+                              >
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>CONNECTION STATE: </span>
+                                  <strong
+                                    style={{
+                                      color:
+                                        m27Health?.connection_state ===
+                                        "REAL SPOOF ACTIVE"
+                                          ? "#10b981"
+                                          : "#f59e0b",
+                                    }}
+                                  >
+                                    {m27Health?.connection_state || "DISCONNECTED"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>ACTIVE ADAPTER: </span>
+                                  <strong>
+                                    {(m27Health?.active_adapter || snDraft.mode).toUpperCase()}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>SPOOF BINARY: </span>
+                                  <strong>
+                                    {m27Health?.binary_installed
+                                      ? `v3.0.2${
+                                          m27Health.binary_sha256_ok ? " ✓ SHA256" : ""
+                                        }`
+                                      : "MISSING"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>SPOOF-CORE-M27: </span>
+                                  <strong>
+                                    {m27Health?.core_active ? "ACTIVE" : "STANDBY"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>E2E PIPE VERIFIED: </span>
+                                  <strong>
+                                    {m27Health?.end_to_end_verified
+                                      ? `YES (${m27Health.last_rtt_ms || 1}ms)`
+                                      : "NO"}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span style={{ opacity: 0.7 }}>VERIFIED PATH: </span>
+                                  <strong>{m27Health?.active_path || "NONE"}</strong>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* SECTION 5: INDEPENDENT METHOD 27 SPOOF IP TESTER */}
+                            <div
+                              style={{
+                                marginTop: "18px",
+                                padding: "12px 14px",
+                                borderRadius: "10px",
+                                border: "1px solid rgba(148, 163, 184, 0.22)",
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  flexWrap: "wrap",
+                                  gap: "8px",
+                                  marginBottom: "10px",
+                                }}
+                              >
+                                <span style={{ fontWeight: 700, fontSize: "13px" }}>
+                                  5. Method 27 Candidate Spoof IP Tester (/etc/spoof-m27)
+                                </span>
+                                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                                  <button
+                                    type="button"
+                                    className="next-method-btn"
+                                    disabled={
+                                      m27ActionBusy !== null ||
+                                      m27Tester?.status === "running"
+                                    }
+                                    onClick={() =>
+                                      handleSpoofNativeAction(
+                                        selectedServer.id,
+                                        "tester_start",
+                                        draft
+                                      )
+                                    }
+                                  >
+                                    <Play size={12} />
+                                    <span>
+                                      {m27Tester?.status === "running"
+                                        ? `Testing (${m27Tester.progress || 0}%)...`
+                                        : "Start IP Tester"}
+                                    </span>
+                                  </button>
+
+                                  {m27Tester?.status === "running" && (
+                                    <button
+                                      type="button"
+                                      className="next-method-btn"
+                                      disabled={m27ActionBusy !== null}
+                                      onClick={() =>
+                                        handleSpoofNativeAction(
+                                          selectedServer.id,
+                                          "tester_stop",
+                                          draft
+                                        )
+                                      }
+                                    >
+                                      <Pause size={12} />
+                                      <span>Stop</span>
+                                    </button>
+                                  )}
+
+                                  {m27Tester?.passed &&
+                                    m27Tester.passed.length > 0 && (
+                                      <button
+                                        type="button"
+                                        className="next-method-btn"
+                                        style={{
+                                          borderColor: "#10b981",
+                                          color: "#10b981",
+                                        }}
+                                        onClick={() => {
+                                          const ips = m27Tester.passed.map(
+                                            (p) => p.ip
+                                          );
+                                          setSpoofIPsRawDraft((prev) => ({
+                                            ...prev,
+                                            [tunnelKey]: ips.join(", "),
+                                          }));
+                                          updateSNDraft({ spoof_ips: ips });
+                                        }}
+                                      >
+                                        <Check size={12} />
+                                        <span>
+                                          Select {m27Tester.passed.length} Working IP(s)
+                                        </span>
+                                      </button>
+                                    )}
+                                </div>
+                              </div>
+
+                              <div className="settings-grid">
+                                <div className="form-field">
+                                  <label>TESTER ROLE</label>
+                                  <select
+                                    className="server-select"
+                                    value={m27TesterMode}
+                                    onChange={(e) =>
+                                      setM27TesterMode(
+                                        e.target.value as "receiver" | "sender"
+                                      )
+                                    }
+                                    style={{ width: "100%", padding: "10px 12px" }}
+                                  >
+                                    <option value="receiver">
+                                      Receiver (Start First on Receiving Node)
+                                    </option>
+                                    <option value="sender">
+                                      Sender (Start Second on Sending Node)
+                                    </option>
+                                  </select>
+                                </div>
+
+                                <div className="form-field">
+                                  <label>TEST CARRIER</label>
+                                  <select
+                                    className="server-select"
+                                    value={m27TesterProto}
+                                    onChange={(e) =>
+                                      setM27TesterProto(
+                                        e.target.value as "icmp" | "tcp"
+                                      )
+                                    }
+                                    style={{ width: "100%", padding: "10px 12px" }}
+                                  >
+                                    <option value="icmp">ICMP</option>
+                                    <option value="tcp">TCP</option>
+                                  </select>
+                                </div>
+
+                                {m27TesterMode === "sender" && (
+                                  <>
+                                    <div className="form-field">
+                                      <label>RECEIVER PUBLIC IPV4</label>
+                                      <input
+                                        value={
+                                          m27TesterDstIP ||
+                                          snDraft.peer_public_ip ||
+                                          selectedServer.ip
+                                        }
+                                        onChange={(e) =>
+                                          setM27TesterDstIP(e.target.value)
+                                        }
+                                        placeholder={selectedServer.ip}
+                                      />
+                                    </div>
+
+                                    <div className="form-field">
+                                      <label>DESTINATION PORT (TCP)</label>
+                                      <input
+                                        type="number"
+                                        value={m27TesterDstPort}
+                                        onChange={(e) =>
+                                          setM27TesterDstPort(
+                                            Number(e.target.value) || 80
+                                          )
+                                        }
+                                      />
+                                    </div>
+                                  </>
+                                )}
+
+                                <div className="form-field">
+                                  <label>TIMEOUT (SEC) / PACKET COUNT / MAX LOSS %</label>
+                                  <div style={{ display: "flex", gap: "6px" }}>
+                                    <input
+                                      type="number"
+                                      value={snDraft.timeout_sec || 30}
+                                      onChange={(e) =>
+                                        updateSNDraft({
+                                          timeout_sec: Number(e.target.value) || 30,
+                                        })
+                                      }
+                                    />
+                                    <input
+                                      type="number"
+                                      value={snDraft.packet_count || 10}
+                                      onChange={(e) =>
+                                        updateSNDraft({
+                                          packet_count: Number(e.target.value) || 10,
+                                        })
+                                      }
+                                    />
+                                    <input
+                                      type="number"
+                                      value={snDraft.max_loss_pct ?? 20}
+                                      onChange={(e) =>
+                                        updateSNDraft({
+                                          max_loss_pct: Number(e.target.value) || 0,
+                                        })
+                                      }
+                                    />
+                                  </div>
+                                </div>
+
+                                <div className="form-field" style={{ gridColumn: "1 / -1" }}>
+                                  <label>CANDIDATE SOURCE IPS / CIDRS TO TEST</label>
+                                  <input
+                                    value={m27TesterSourcesRaw}
+                                    onChange={(e) =>
+                                      setM27TesterSourcesRaw(e.target.value)
+                                    }
+                                    placeholder="8.8.8.8, 1.1.1.1, 9.9.9.9, 198.51.100.0/24"
+                                  />
+                                </div>
+                              </div>
+
+                              {m27Tester && m27Tester.status !== "idle" && (
+                                <div
+                                  style={{
+                                    marginTop: "10px",
+                                    fontSize: "12px",
+                                    display: "flex",
+                                    flexDirection: "column",
+                                    gap: "6px",
+                                  }}
+                                >
+                                  <div>
+                                    <span>
+                                      Tester Status:{" "}
+                                      <strong>
+                                        {m27Tester.status.toUpperCase()}
+                                      </strong>{" "}
+                                      ({m27Tester.mode} /{" "}
+                                      {m27Tester.protocol?.toUpperCase()})
+                                    </span>
+                                    {m27Tester.error && (
+                                      <span
+                                        style={{
+                                          color: "#ef4444",
+                                          marginLeft: "8px",
+                                        }}
+                                      >
+                                        — {m27Tester.error}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {m27Tester.passed &&
+                                    m27Tester.passed.length > 0 && (
+                                      <div
+                                        style={{
+                                          display: "flex",
+                                          flexWrap: "wrap",
+                                          gap: "6px",
+                                        }}
+                                      >
+                                        {m27Tester.passed.map((item, idx) => (
+                                          <span
+                                            key={idx}
+                                            className="disc-pill disc-ok"
+                                          >
+                                            {item.ip} ({item.received}/
+                                            {item.sent} • {item.loss_pct}% loss)
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
+                                </div>
+                              )}
+                            </div>
+
+                            {errBanner && (
+                              <div className="form-error-banner" style={{ marginTop: "10px" }}>
+                                {errBanner}
+                              </div>
+                            )}
+
+                            {role === "master" && (
+                              <div className="settings-actions-row">
+                                <button
+                                  type="button"
+                                  className="save-tunnel-btn"
+                                  disabled={isSaving}
+                                  onClick={() =>
+                                    commitTunnelConfig(selectedServer.id, draft)
+                                  }
+                                >
+                                  <Save size={14} />
+                                  <span>
+                                    {isSaving
+                                      ? "Saving..."
+                                      : "Save Method 27 Settings"}
                                   </span>
                                 </button>
 
