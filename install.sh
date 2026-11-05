@@ -14,6 +14,7 @@ SPOOF_SHA256_arm64="caf08b3960d4eea72910fb0613a8893560a41f5b2f2e18f9a6c595c9ad7e
 CONFIG_DIR="/etc/sahand-tunnel"
 DATA_DIR="/var/lib/sahand-tunnel"
 SPOOF_DIR="/etc/spoof"
+SPOOF_M27_DIR="/etc/spoof-m27"
 WG_DIR="/etc/wireguard"
 CONFIG="${CONFIG_DIR}/config.json"
 SERVICE="/etc/systemd/system/sahand-tunnel.service"
@@ -79,8 +80,8 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$SPOOF_DIR" "$WG_DIR"
-chmod 0700 "$CONFIG_DIR" "$DATA_DIR" "$SPOOF_DIR" "$WG_DIR"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$SPOOF_DIR" "$SPOOF_M27_DIR" "$WG_DIR"
+chmod 0700 "$CONFIG_DIR" "$DATA_DIR" "$SPOOF_DIR" "$SPOOF_M27_DIR" "$WG_DIR"
 
 log "Installing Spoof Tunnel core (${SPOOF_VER} ${ARCH})"
 
@@ -113,9 +114,11 @@ install_spoof_core() {
             if [ "$got_sha" = "$SPOOF_WANT_SHA" ]; then
                 install -m 0755 "$tmp_spoof" "$SPOOF_BIN"
                 echo "Installed and SHA-256 verified ${SPOOF_BIN} (${SPOOF_VER})."
-                if systemctl is-active --quiet spoof-core 2>/dev/null; then
-                    systemctl restart spoof-core 2>/dev/null || true
-                fi
+                for svc in spoof-core spoof-core-m27; do
+                    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                        systemctl restart "$svc" 2>/dev/null || true
+                    fi
+                done
                 return 0
             fi
         fi
@@ -401,7 +404,7 @@ LimitNOFILE=1048576
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=${DATA_DIR} ${CONFIG_DIR} ${SPOOF_DIR} ${WG_DIR} /etc/systemd/system /usr/local/bin
+ReadWritePaths=${DATA_DIR} ${CONFIG_DIR} ${SPOOF_DIR} ${SPOOF_M27_DIR} ${WG_DIR} /etc/systemd/system /usr/local/bin
 
 [Install]
 WantedBy=multi-user.target
@@ -458,7 +461,6 @@ if [[ ! "$DOMAIN" =~ ^[a-z0-9.-]+$ ]] || [[ "$DOMAIN" != *.* ]]; then
     exit 1
 fi
 
-# Detect the server's primary interface IP, not its NAT egress IP.
 SERVER_IP="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
 
 if [ -z "$SERVER_IP" ]; then
