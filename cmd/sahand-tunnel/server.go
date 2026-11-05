@@ -210,6 +210,24 @@ func allocateNonCollidingTunnelsForNewPeer(existing []ServerPeer, peerID, remote
 			}
 			tunnels[i].SpoofWG = normalizeSpoofWGConfig(tunnels[i].SpoofWG)
 		}
+
+		if id == 27 && tunnels[i].SpoofNative != nil {
+			tunnels[i].SpoofNative.Role = "local"
+			tunnels[i].SpoofNative.PeerPublicIP = remoteIP
+			if slot > 0 {
+				subnetOctet := (27 + slot) % 250
+				if subnetOctet <= 0 || subnetOctet == 20 {
+					subnetOctet = 28
+				}
+				tunnels[i].SpoofNative.WGLocalIP = fmt.Sprintf("10.%d.0.1", subnetOctet)
+				tunnels[i].SpoofNative.WGPeerIP = fmt.Sprintf("10.%d.0.2", subnetOctet)
+				tunnels[i].SpoofNative.SpoofListenPort = defaultM27SpoofPort + slot
+				tunnels[i].SpoofNative.RecvPort = defaultM27RecvPort + slot
+				tunnels[i].SpoofNative.CorePort = defaultM27CorePort + slot
+				tunnels[i].SpoofNative.AdapterPort = defaultM27AdaptPort + slot
+			}
+			tunnels[i].SpoofNative = normalizeSpoofNativeConfig(tunnels[i].SpoofNative)
+		}
 	}
 
 	return tunnels
@@ -288,6 +306,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/tunnels/ping", requireAuth(handleTunnelPing))
 	mux.HandleFunc("/api/v1/tunnels/gre-frp", requireAuth(handleGREFRPAction))
 	mux.HandleFunc("/api/v1/tunnels/spoof-wg", requireAuth(handleSpoofWGAction))
+	mux.HandleFunc("/api/v1/tunnels/spoof-native", requireAuth(handleSpoofNativeAction))
 	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
 
 	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -350,6 +369,7 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	mTime := formatMasterClock(masterNow())
 	testerView := getSpoofTesterStatusView()
+	m27TesterView := getSpoofM27TesterStatusView()
 
 	stateMu.RLock()
 	serversCopy := make([]ServerPeer, len(appCfg.Servers))
@@ -373,6 +393,15 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 				swg.Health = querySpoofWGRuntimeHealth(swg)
 				swg.Tester = testerView
 				tunnelsCopy[j].SpoofWG = swg
+			}
+			if tunnelsCopy[j].ID == 27 {
+				sn := normalizeSpoofNativeConfig(tunnelsCopy[j].SpoofNative)
+				if sn.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					sn.PeerPublicIP = srv.IP
+				}
+				sn.Health = querySpoofNativeRuntimeHealth(srv.ID, sn)
+				sn.Tester = m27TesterView
+				tunnelsCopy[j].SpoofNative = sn
 			}
 		}
 		srvCopy.Tunnels = tunnelsCopy
@@ -767,7 +796,6 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 
 	action := strings.ToLower(strings.TrimSpace(req.Action))
 
-	// Run potentially slow network download outside stateMu lock
 	var installedMsg string
 	if action == "install_binary" {
 		m, err := installOfficialSpoofBinary()
@@ -937,6 +965,247 @@ func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleSpoofNativeAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID    string              `json:"server_id"`
+		Action      string              `json:"action"` // "save" | "bundle" | "import" | "up" | "down" | "restart" | "verify_pipe" | "install_binary" | "tester_start" | "tester_stop" | "tester_clear"
+		Bundle      string              `json:"bundle,omitempty"`
+		SpoofNative *SpoofNativeConfig  `json:"spoof_native,omitempty"`
+		TesterReq   *SpoofTesterRequest `json:"tester_req,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	var installedMsg string
+	if action == "install_binary" {
+		m, err := installOfficialSpoofBinary()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		installedMsg = m
+	}
+
+	stateMu.Lock()
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	tIdx := -1
+	for i := range srv.Tunnels {
+		if srv.Tunnels[i].ID == 27 {
+			tIdx = i
+			break
+		}
+	}
+	if tIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "Method 27 (Native Spoof Engine) not found", http.StatusNotFound)
+		return
+	}
+
+	cur := normalizeSpoofNativeConfig(srv.Tunnels[tIdx].SpoofNative)
+	if req.SpoofNative != nil {
+		edited := *req.SpoofNative
+		if edited.WGPrivKey == "" {
+			edited.WGPrivKey = cur.WGPrivKey
+		}
+		if edited.WGPubKey == "" {
+			edited.WGPubKey = cur.WGPubKey
+		}
+		if edited.WGPeerPriv == "" {
+			edited.WGPeerPriv = cur.WGPeerPriv
+		}
+		if edited.WGPeerPub == "" {
+			edited.WGPeerPub = cur.WGPeerPub
+		}
+		if edited.NoisePrivKey == "" {
+			edited.NoisePrivKey = cur.NoisePrivKey
+		}
+		if edited.NoisePubKey == "" {
+			edited.NoisePubKey = cur.NoisePubKey
+		}
+		if edited.NoisePeerPriv == "" {
+			edited.NoisePeerPriv = cur.NoisePeerPriv
+		}
+		if edited.NoisePeerPub == "" {
+			edited.NoisePeerPub = cur.NoisePeerPub
+		}
+		cur = normalizeSpoofNativeConfig(&edited)
+	}
+	if cur.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+		cur.PeerPublicIP = srv.IP
+	}
+
+	var msg string
+	var bundleOut string
+	needVerifyProbe := false
+
+	switch action {
+	case "save":
+		msg = fmt.Sprintf("Method 27 (%s) settings saved", strings.ToUpper(cur.Mode))
+
+	case "install_binary":
+		msg = installedMsg
+
+	case "bundle":
+		bStr, err := makeSpoofNativeBundle(cur, "")
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bundleOut = bStr
+		msg = fmt.Sprintf("Generated Method 27 (%s) m27spf1_ bundle", strings.ToUpper(cur.Mode))
+
+	case "import":
+		imported, err := importSpoofNativeBundle(req.Bundle, cur)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.SpoofNative != nil && len(req.SpoofNative.SpoofIPs) > 0 {
+			imported.SpoofIPs = cleanSpoofIPs(req.SpoofNative.SpoofIPs)
+		}
+		cur = imported
+		bundleOut = cur.LastBundle
+		msg = fmt.Sprintf("Imported Method 27 bundle (Mode: %s, %s/%s)",
+			strings.ToUpper(cur.Mode), cur.SendTransport, cur.RecvTransport)
+
+	case "up", "apply":
+		outMsg, err := applyLinuxSpoofNativeServices(cur)
+		if err != nil {
+			cur.LastError = err.Error()
+			srv.Tunnels[tIdx].SpoofNative = cur
+			_ = saveConfig(configPath(), appCfg)
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur.LastError = ""
+		msg = outMsg
+		needVerifyProbe = true
+
+	case "down", "stop":
+		stopLinuxSpoofNativeServices(cur)
+		cur.LastError = ""
+		recordSpoofNativeVerification(srv.ID, cur.Mode, "", 0, 100, "Stopped by user")
+		msg = "Method 27 (spoof-core-m27) services stopped"
+
+	case "restart":
+		msg = "Method 27 adapter listener restarted"
+		needVerifyProbe = true
+
+	case "verify_pipe":
+		needVerifyProbe = true
+		msg = "Running end-to-end Spoof Pipe verification..."
+
+	case "tester_start":
+		if req.TesterReq == nil {
+			stateMu.Unlock()
+			http.Error(w, "tester_req is required", http.StatusBadRequest)
+			return
+		}
+		tReq := *req.TesterReq
+		if tReq.DstIP == "" {
+			tReq.DstIP = cur.PeerPublicIP
+		}
+		if err := startSpoofM27TesterProcess(tReq); err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msg = fmt.Sprintf("Method 27 Spoof IP Tester started in %s mode (%s)", tReq.Mode, strings.ToUpper(tReq.Protocol))
+
+	case "tester_stop":
+		stopSpoofM27TesterProcess()
+		msg = "Method 27 Spoof IP Tester stopped"
+
+	case "tester_clear":
+		clearSpoofM27TesterStatus()
+		msg = "Method 27 Spoof IP Tester results cleared"
+
+	default:
+		stateMu.Unlock()
+		http.Error(w, "unknown Method 27 action", http.StatusBadRequest)
+		return
+	}
+
+	srv.Tunnels[tIdx].SpoofNative = cur
+	peerCopy := *srv
+	tcCopy := srv.Tunnels[tIdx]
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	if action == "up" || action == "apply" || action == "import" || action == "restart" || action == "save" {
+		syncServerListeners(peerCopy)
+	}
+
+	if needVerifyProbe {
+		res := probeSpoofNative(peerCopy, tcCopy, appCfg.NodeID)
+		stateMu.Lock()
+		for i := range appCfg.Servers {
+			if appCfg.Servers[i].ID == peerCopy.ID {
+				for j := range appCfg.Servers[i].Tunnels {
+					if appCfg.Servers[i].Tunnels[j].ID == 27 {
+						appCfg.Servers[i].Tunnels[j].LastDiscovery = res
+						break
+					}
+				}
+				_ = saveConfig(configPath(), appCfg)
+				break
+			}
+		}
+		stateMu.Unlock()
+		if action == "verify_pipe" {
+			if res.Success {
+				msg = fmt.Sprintf("End-to-End Spoof Pipe Verified (%dms RTT)", res.LatencyMS)
+			} else {
+				msg = fmt.Sprintf("Spoof Pipe Verification Failed: %s", res.ErrorReason)
+			}
+		}
+	}
+
+	cur.Health = querySpoofNativeRuntimeHealth(peerCopy.ID, cur)
+	cur.Tester = getSpoofM27TesterStatusView()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK          bool               `json:"ok"`
+		Message     string             `json:"message"`
+		Bundle      string             `json:"bundle,omitempty"`
+		SpoofNative *SpoofNativeConfig `json:"spoof_native"`
+		Health      SpoofNativeHealth  `json:"health"`
+		Tester      SpoofTesterStatus  `json:"tester"`
+	}{
+		OK:          true,
+		Message:     msg,
+		Bundle:      bundleOut,
+		SpoofNative: cur,
+		Health:      cur.Health,
+		Tester:      cur.Tester,
+	})
+}
+
 func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1009,6 +1278,29 @@ func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
 				}
 				updated.SpoofWG.Health = querySpoofWGRuntimeHealth(updated.SpoofWG)
 				updated.SpoofWG.Tester = getSpoofTesterStatusView()
+			}
+			if updated.ID == 27 {
+				prevNat := normalizeSpoofNativeConfig(srv.Tunnels[i].SpoofNative)
+				if updated.SpoofNative != nil {
+					if updated.SpoofNative.WGPrivKey == "" {
+						updated.SpoofNative.WGPrivKey = prevNat.WGPrivKey
+					}
+					if updated.SpoofNative.WGPeerPriv == "" {
+						updated.SpoofNative.WGPeerPriv = prevNat.WGPeerPriv
+					}
+					if updated.SpoofNative.NoisePrivKey == "" {
+						updated.SpoofNative.NoisePrivKey = prevNat.NoisePrivKey
+					}
+					if updated.SpoofNative.NoisePeerPriv == "" {
+						updated.SpoofNative.NoisePeerPriv = prevNat.NoisePeerPriv
+					}
+				}
+				updated.SpoofNative = normalizeSpoofNativeConfig(updated.SpoofNative)
+				if updated.SpoofNative.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					updated.SpoofNative.PeerPublicIP = srv.IP
+				}
+				updated.SpoofNative.Health = querySpoofNativeRuntimeHealth(srv.ID, updated.SpoofNative)
+				updated.SpoofNative.Tester = getSpoofM27TesterStatusView()
 			}
 			if strings.TrimSpace(updated.SpeedLimitMBps) == "" {
 				updated.SpeedLimitMBps = "0"
