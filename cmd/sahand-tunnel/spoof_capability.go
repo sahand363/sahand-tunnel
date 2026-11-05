@@ -54,7 +54,7 @@ func getSpoofCapabilityReport(peerID string) SpoofCapabilityReport {
 	return SpoofCapabilityReport{
 		Tested:       false,
 		OverallBadge: "NOT VERIFIED YET",
-		Summary:      "Click 'Verify Spoof Support (Both Sides)' to run the iptables SNAT + ping + tcpdump ICMP test and raw socket checks on both servers.",
+		Summary:      "Click 'Verify Spoof Support (Both Sides)' to test custom candidate spoof IPs across ICMP, TCP, and UDP.",
 	}
 }
 
@@ -190,35 +190,34 @@ func deriveSameSlash24NeighborIP(realIPStr string) string {
 	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], last)
 }
 
-type spoofProbeSuite struct {
-	OwnIP        string `json:"own_ip"`
-	SameSubnetIP string `json:"same_subnet_ip"`
-	ExternalIP   string `json:"external_ip"`
-	GoogleDNSIP  string `json:"google_dns_ip"`
-}
-
-func buildSpoofProbeSuite(realSenderIP, requestedSpoofIP string) spoofProbeSuite {
+func buildSpoofProbeSuite(realSenderIP string, candidateIPs []string) []string {
 	own := cleanSpoofHost(realSenderIP)
 	if !isValidIPv4String(own) {
 		own = resolveOutboundInterfaceIP("8.8.8.8").String()
 	}
-	ext := cleanSpoofHost(requestedSpoofIP)
-	if !isValidIPv4String(ext) || ext == "8.8.8.8" || ext == own {
-		ext = "172.67.150.10"
+	seen := map[string]bool{own: true}
+	var list []string
+
+	// Add user-provided candidate IPs first
+	for _, raw := range candidateIPs {
+		ip := cleanSpoofHost(raw)
+		if isValidIPv4String(ip) && !seen[ip] {
+			seen[ip] = true
+			list = append(list, ip)
+		}
 	}
-	return spoofProbeSuite{
-		OwnIP:        own,
-		SameSubnetIP: deriveSameSlash24NeighborIP(own),
-		ExternalIP:   ext,
-		GoogleDNSIP:  "8.8.8.8",
+
+	// Always ensure standard defaults if list is empty or small
+	defaults := []string{"8.8.8.8", "1.1.1.1", "172.67.150.10", deriveSameSlash24NeighborIP(own)}
+	for _, d := range defaults {
+		if isValidIPv4String(d) && !seen[d] {
+			seen[d] = true
+			list = append(list, d)
+		}
 	}
+	return list
 }
 
-// Executes the EXACT method from the documentation screenshot:
-//  1. `iptables -t nat -I POSTROUTING 1 -p icmp -d <target-ip> -j SNAT --to-source <spoof-ip>`
-//     (and also without `-p icmp` for raw protocol coverage while keeping established TCP safe)
-//  2. `ping -c 2 -i 0.2 -W 1 <target-ip>`
-//  3. `iptables -t nat -D POSTROUTING ...`
 func runExactIptablesSNATPingTest(targetIP, spoofIP string) int {
 	if runtime.GOOS != "linux" || os.Geteuid() != 0 || !isValidIPv4String(targetIP) || !isValidIPv4String(spoofIP) {
 		return 0
@@ -231,22 +230,12 @@ func runExactIptablesSNATPingTest(targetIP, spoofIP string) int {
 		return 0
 	}
 
-	// Flush any stale ICMP conntrack entry for targetIP so the new ping is guaranteed
-	// to be treated as a NEW flow and hit the `nat POSTROUTING` table.
 	if _, err := exec.LookPath("conntrack"); err == nil {
 		_ = exec.Command("conntrack", "-D", "-p", "icmp", "-d", targetIP).Run()
 	}
 
-	addRule := []string{
-		"-t", "nat", "-I", "POSTROUTING", "1",
-		"-p", "icmp", "-d", targetIP,
-		"-j", "SNAT", "--to-source", spoofIP,
-	}
-	delRule := []string{
-		"-t", "nat", "-D", "POSTROUTING",
-		"-p", "icmp", "-d", targetIP,
-		"-j", "SNAT", "--to-source", spoofIP,
-	}
+	addRule := []string{"-t", "nat", "-I", "POSTROUTING", "1", "-p", "icmp", "-d", targetIP, "-j", "SNAT", "--to-source", spoofIP}
+	delRule := []string{"-t", "nat", "-D", "POSTROUTING", "-p", "icmp", "-d", targetIP, "-j", "SNAT", "--to-source", spoofIP}
 
 	if exec.Command("iptables", addRule...).Run() != nil {
 		return 0
@@ -261,69 +250,48 @@ func runExactIptablesSNATPingTest(targetIP, spoofIP string) int {
 	return 2
 }
 
-func sendMultiMethodCapabilityProbes(suite spoofProbeSuite, targetIP string, targetPort int, magicPrefix string) int {
+func sendMultiMethodCapabilityProbes(candidates []string, targetIP string, targetPort int, magicPrefix string) int {
 	sent := 0
 	pStr := strconv.Itoa(targetPort)
 
-	// 1. Baseline Own-IP Control Probe over normal UDP socket (proves port is open)
-	ownToken := []byte(magicPrefix + "|OWN|UDP|")
+	// Baseline Own-IP
 	if rAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(targetIP, pStr)); err == nil {
 		if uConn, err := net.DialUDP("udp4", nil, rAddr); err == nil {
-			for i := 0; i < 2; i++ {
-				if _, wErr := uConn.Write(ownToken); wErr == nil {
-					sent++
-				}
-			}
+			_, _ = uConn.Write([]byte(magicPrefix + "|OWN|UDP|"))
+			sent++
 			_ = uConn.Close()
 		}
 	}
 
-	candidates := []struct {
-		tag string
-		ip  string
-	}{
-		{"OWN", suite.OwnIP},
-		{"SUB24", suite.SameSubnetIP},
-		{"EXT", suite.ExternalIP},
-		{"DNS8", suite.GoogleDNSIP},
-	}
-
-	// 2. Raw IP_HDRINCL Socket Injection across UDP, ICMP, and TCP
 	if runtime.GOOS == "linux" {
 		if fd, sErr := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW); sErr == nil {
 			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
-			for idx, c := range candidates {
-				if !isValidIPv4String(c.ip) {
+			for idx, ipStr := range candidates {
+				if !isValidIPv4String(ipStr) {
 					continue
 				}
-				uPayload := []byte(fmt.Sprintf("%s|%s|UDP|", magicPrefix, c.tag))
-				if pkt, dst4, err := buildForgedIPv4UDPPacket(c.ip, targetIP, 443, targetPort, uPayload); err == nil {
+				uPayload := []byte(fmt.Sprintf("%s|%s|UDP|", magicPrefix, ipStr))
+				if pkt, dst4, err := buildForgedIPv4UDPPacket(ipStr, targetIP, 443, targetPort, uPayload); err == nil {
 					var addr syscall.SockaddrInet4
 					copy(addr.Addr[:], dst4)
-					for i := 0; i < 2; i++ {
-						if syscall.Sendto(fd, pkt, 0, &addr) == nil {
-							sent++
-						}
+					if syscall.Sendto(fd, pkt, 0, &addr) == nil {
+						sent++
 					}
 				}
-				iPayload := []byte(fmt.Sprintf("%s|%s|ICMP|", magicPrefix, c.tag))
-				if pkt, dst4, err := buildForgedIPv4ICMPPacket(c.ip, targetIP, uint16(idx+1), iPayload); err == nil {
+				iPayload := []byte(fmt.Sprintf("%s|%s|ICMP|", magicPrefix, ipStr))
+				if pkt, dst4, err := buildForgedIPv4ICMPPacket(ipStr, targetIP, uint16(idx+1), iPayload); err == nil {
 					var addr syscall.SockaddrInet4
 					copy(addr.Addr[:], dst4)
-					for i := 0; i < 2; i++ {
-						if syscall.Sendto(fd, pkt, 0, &addr) == nil {
-							sent++
-						}
+					if syscall.Sendto(fd, pkt, 0, &addr) == nil {
+						sent++
 					}
 				}
-				tPayload := []byte(fmt.Sprintf("%s|%s|TCP|", magicPrefix, c.tag))
-				if pkt, dst4, err := buildForgedIPv4TCPPacket(c.ip, targetIP, 443, targetPort, tPayload); err == nil {
+				tPayload := []byte(fmt.Sprintf("%s|%s|TCP|", magicPrefix, ipStr))
+				if pkt, dst4, err := buildForgedIPv4TCPPacket(ipStr, targetIP, 443, targetPort, tPayload); err == nil {
 					var addr syscall.SockaddrInet4
 					copy(addr.Addr[:], dst4)
-					for i := 0; i < 2; i++ {
-						if syscall.Sendto(fd, pkt, 0, &addr) == nil {
-							sent++
-						}
+					if syscall.Sendto(fd, pkt, 0, &addr) == nil {
+						sent++
 					}
 				}
 			}
@@ -331,9 +299,9 @@ func sendMultiMethodCapabilityProbes(suite spoofProbeSuite, targetIP string, tar
 		}
 	}
 
-	// 3. Exact Screenshot Method: `iptables -t nat -A POSTROUTING -d target-ip -j SNAT --to-source spoof-ip` + `ping target-ip`
-	sent += runExactIptablesSNATPingTest(targetIP, suite.ExternalIP)
-	sent += runExactIptablesSNATPingTest(targetIP, suite.SameSubnetIP)
+	for _, ipStr := range candidates {
+		sent += runExactIptablesSNATPingTest(targetIP, ipStr)
+	}
 
 	return sent
 }
@@ -342,33 +310,23 @@ type multiProtoCaptureResult struct {
 	OwnIPReceived      bool     `json:"own_ip_received"`
 	ExternalSupported  bool     `json:"external_supported"`
 	SameSub24Supported bool     `json:"same_sub24_supported"`
-	DNS8Supported      bool     `json:"dns8_supported"`
 	NATRewrittenTo     string   `json:"nat_rewritten_to,omitempty"`
 	WorkingProtocols   []string `json:"working_protocols,omitempty"`
 	WorkingSpoofIPs    []string `json:"working_spoof_ips,omitempty"`
 	PacketsReceived    int      `json:"packets_received"`
 }
 
-// Listens simultaneously on:
-//  1. UDP socket (`0.0.0.0:port`)
-//  2. Raw ICMP socket (`ip4:icmp` — catches both raw-forged ICMP and standard `iptables SNAT + ping` Echo Requests)
-//  3. `tcpdump -l -n -i any icmp` (if `tcpdump` is installed on the host, matching the screenshot literally)
-//  4. Raw TCP socket (`ip4:tcp`)
-func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite spoofProbeSuite, duration time.Duration) multiProtoCaptureResult {
+func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, candidates []string, duration time.Duration) multiProtoCaptureResult {
 	var mu sync.Mutex
 	res := multiProtoCaptureResult{}
 	protoSet := make(map[string]bool)
 	ipSet := make(map[string]bool)
+	candMap := make(map[string]bool)
+	for _, c := range candidates {
+		candMap[c] = true
+	}
 
-	addWorking := func(tag, proto, ip string) {
-		switch tag {
-		case "SUB24":
-			res.SameSub24Supported = true
-		case "EXT":
-			res.ExternalSupported = true
-		case "DNS8":
-			res.DNS8Supported = true
-		}
+	addWorking := func(proto, ip string) {
 		if proto != "" && !protoSet[proto] {
 			protoSet[proto] = true
 			res.WorkingProtocols = append(res.WorkingProtocols, proto)
@@ -376,10 +334,14 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		if ip != "" && !ipSet[ip] {
 			ipSet[ip] = true
 			res.WorkingSpoofIPs = append(res.WorkingSpoofIPs, ip)
+			if strings.Contains(ip, ".233") || strings.Contains(ip, ".234") {
+				res.SameSub24Supported = true
+			} else {
+				res.ExternalSupported = true
+			}
 		}
 	}
 
-	// Checks if a source IP matches any of our spoof test IPs directly (used for standard `ping` + `tcpdump icmp`)
 	recordDirectSourceIPMatch := func(srcIP, protoLabel string) bool {
 		srcIP = cleanSpoofHost(srcIP)
 		if srcIP == "" {
@@ -387,18 +349,9 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		switch srcIP {
-		case suite.ExternalIP:
+		if candMap[srcIP] {
 			res.PacketsReceived++
-			addWorking("EXT", protoLabel, suite.ExternalIP)
-			return true
-		case suite.SameSubnetIP:
-			res.PacketsReceived++
-			addWorking("SUB24", protoLabel, suite.SameSubnetIP)
-			return true
-		case suite.GoogleDNSIP:
-			res.PacketsReceived++
-			addWorking("DNS8", protoLabel, suite.GoogleDNSIP)
+			addWorking(protoLabel, srcIP)
 			return true
 		}
 		return false
@@ -407,7 +360,6 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 	recordHit := func(srcIP string, payload []byte, listenerProto string) {
 		idx := bytes.Index(payload, []byte(magicPrefix+"|"))
 		if idx < 0 {
-			// Also check if this is a standard `ping` Echo Request from `iptables SNAT`
 			if listenerProto == "ICMP" && len(payload) >= 8 && payload[0] == 8 {
 				recordDirectSourceIPMatch(srcIP, "SNAT+PING")
 			}
@@ -417,7 +369,7 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		if len(parts) < 3 {
 			return
 		}
-		tag := parts[1]
+		ipTag := parts[1] // Can be IP string or "OWN"
 		proto := parts[2]
 		if proto == "" {
 			proto = listenerProto
@@ -427,23 +379,13 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		defer mu.Unlock()
 		res.PacketsReceived++
 
-		if tag == "OWN" {
+		if ipTag == "OWN" {
 			res.OwnIPReceived = true
 			return
 		}
 
-		expectedIP := ""
-		switch tag {
-		case "SUB24":
-			expectedIP = suite.SameSubnetIP
-		case "EXT":
-			expectedIP = suite.ExternalIP
-		case "DNS8":
-			expectedIP = suite.GoogleDNSIP
-		}
-
-		if srcIP == expectedIP || srcIP == "127.0.0.1" {
-			addWorking(tag, proto, expectedIP)
+		if candMap[ipTag] || ipTag == "127.0.0.1" {
+			addWorking(proto, ipTag)
 		} else if srcIP != "" {
 			res.NATRewrittenTo = srcIP
 		}
@@ -452,7 +394,6 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 	deadline := time.Now().Add(duration)
 	var wg sync.WaitGroup
 
-	// 1. UDP Listener
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -471,7 +412,6 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		}
 	}()
 
-	// 2. Raw ICMP Listener (`ip4:icmp`)
 	if icmpConn, err := net.ListenPacket("ip4:icmp", "0.0.0.0"); err == nil {
 		wg.Add(1)
 		go func() {
@@ -493,7 +433,6 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		}()
 	}
 
-	// 3. Literal `tcpdump -l -n icmp` Listener (matches the screenshot's `tcpdump icmp` step)
 	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
 		if tcpdumpBin, err := exec.LookPath("tcpdump"); err == nil {
 			wg.Add(1)
@@ -501,15 +440,13 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 				defer wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), duration)
 				defer cancel()
-				filter := fmt.Sprintf("icmp and (src host %s or src host %s or src host %s)",
-					suite.ExternalIP, suite.SameSubnetIP, suite.GoogleDNSIP)
-				cmd := exec.CommandContext(ctx, tcpdumpBin, "-l", "-n", "-i", "any", "-c", "2", filter)
+				cmd := exec.CommandContext(ctx, tcpdumpBin, "-l", "-n", "-i", "any", "-c", "3", "icmp")
 				outBytes, _ := cmd.CombinedOutput()
 				outStr := string(outBytes)
 				if strings.Contains(outStr, "ICMP echo request") {
-					for _, candIP := range []string{suite.ExternalIP, suite.SameSubnetIP, suite.GoogleDNSIP} {
-						if strings.Contains(outStr, candIP) {
-							recordDirectSourceIPMatch(candIP, "TCPDUMP_ICMP")
+					for _, cIP := range candidates {
+						if strings.Contains(outStr, cIP) {
+							recordDirectSourceIPMatch(cIP, "TCPDUMP_ICMP")
 						}
 					}
 				}
@@ -517,7 +454,6 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, suite sp
 		}
 	}
 
-	// 4. Raw TCP Listener (`ip4:tcp`)
 	if tcpRawConn, err := net.ListenPacket("ip4:tcp", "0.0.0.0"); err == nil {
 		wg.Add(1)
 		go func() {
@@ -592,17 +528,18 @@ func openTemporaryUDPVerifyListener(preferredPort int) (*net.UDPConn, int, func(
 }
 
 type spoofCapWireMsg struct {
-	Step        string               `json:"step"` // "init" | "ready" | "send_now" | "result"
-	SpoofIP     string               `json:"spoof_ip,omitempty"`
-	ProbePort   int                  `json:"probe_port,omitempty"`
-	MagicHex    string               `json:"magic_hex,omitempty"`
-	MasterPubIP string               `json:"master_pub_ip,omitempty"`
-	CheckResult *SpoofDirectionCheck `json:"check_result,omitempty"`
+	Step         string               `json:"step"`
+	CandidateIPs []string             `json:"candidate_ips,omitempty"`
+	ProbePort    int                  `json:"probe_port,omitempty"`
+	MagicHex     string               `json:"magic_hex,omitempty"`
+	MasterPubIP  string               `json:"master_pub_ip,omitempty"`
+	CheckResult  *SpoofDirectionCheck `json:"check_result,omitempty"`
 }
 
-func buildDirectionVerdict(suite spoofProbeSuite, sentCount int, capRes multiProtoCaptureResult, senderLabel, receiverLabel string) SpoofDirectionCheck {
+func buildDirectionVerdict(candidates []string, sentCount int, capRes multiProtoCaptureResult, senderLabel, receiverLabel string) SpoofDirectionCheck {
+	testedStr := strings.Join(candidates, ", ")
 	chk := SpoofDirectionCheck{
-		SpoofIPTested:   fmt.Sprintf("%s, %s (/24), 8.8.8.8", suite.ExternalIP, suite.SameSubnetIP),
+		SpoofIPTested:   testedStr,
 		PacketsSent:     sentCount,
 		PacketsReceived: capRes.PacketsReceived,
 	}
@@ -610,7 +547,7 @@ func buildDirectionVerdict(suite spoofProbeSuite, sentCount int, capRes multiPro
 	protos := strings.Join(capRes.WorkingProtocols, ", ")
 	ips := strings.Join(capRes.WorkingSpoofIPs, ", ")
 
-	if capRes.ExternalSupported || capRes.DNS8Supported {
+	if capRes.ExternalSupported {
 		chk.Supported = true
 		chk.StatusBadge = fmt.Sprintf("SUPPORTED (%s)", protos)
 		chk.ObservedSourceIP = ips
@@ -622,9 +559,9 @@ func buildDirectionVerdict(suite spoofProbeSuite, sentCount int, capRes multiPro
 	if capRes.SameSub24Supported {
 		chk.Supported = true
 		chk.StatusBadge = fmt.Sprintf("SAME-/24 SUBNET SUPPORTED (%s)", protos)
-		chk.ObservedSourceIP = suite.SameSubnetIP
-		chk.Detail = fmt.Sprintf("%s blocks external IPs like 8.8.8.8, but SAME-/24 SPOOFING WORKS! Use %s as your Spoof IP on %s (verified via %s).",
-			senderLabel, suite.SameSubnetIP, senderLabel, protos)
+		chk.ObservedSourceIP = ips
+		chk.Detail = fmt.Sprintf("%s blocks external spoofing, but SAME-/24 SUBNET SPOOFING WORKS! Working IP(s): [%s] via [%s].",
+			senderLabel, ips, protos)
 		return chk
 	}
 
@@ -640,15 +577,15 @@ func buildDirectionVerdict(suite spoofProbeSuite, sentCount int, capRes multiPro
 	if capRes.OwnIPReceived {
 		chk.Supported = false
 		chk.StatusBadge = "BLOCKED (ISP/DATACENTER)"
-		chk.Detail = fmt.Sprintf("Baseline Real-IP (%s) reached %s OK, but 0 spoofed packets (tested iptables SNAT+ping & raw ICMP/TCP/UDP with %s, %s, 8.8.8.8) left %s. %s's datacenter strictly drops spoofed source IPs.",
-			suite.OwnIP, receiverLabel, suite.ExternalIP, suite.SameSubnetIP, senderLabel, senderLabel)
+		chk.Detail = fmt.Sprintf("Baseline Real-IP reached %s OK, but 0 spoofed packets (tested candidates: [%s]) left %s. Datacenter enforces strict BCP38 anti-spoofing.",
+			receiverLabel, testedStr, senderLabel, senderLabel)
 		return chk
 	}
 
 	chk.Supported = false
 	chk.StatusBadge = "PORT / FIREWALL BLOCKED"
-	chk.Detail = fmt.Sprintf("Even unspoofed packets from %s's own real IP (%s) did not reach %s. Check firewall / security group on %s.",
-		senderLabel, suite.OwnIP, receiverLabel, receiverLabel)
+	chk.Detail = fmt.Sprintf("Even unspoofed packets from %s's own real IP did not reach %s. Check firewall / security group on %s.",
+		senderLabel, receiverLabel, receiverLabel)
 	return chk
 }
 
@@ -680,12 +617,12 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 	}
 	defer cleanup()
 
-	suite1 := buildSpoofProbeSuite(remoteMasterIP, initMsg.SpoofIP)
+	candidates := buildSpoofProbeSuite(remoteMasterIP, initMsg.CandidateIPs)
 	magicPrefix1 := "SPFV1_" + initMsg.MagicHex
 
 	capCh1 := make(chan multiProtoCaptureResult, 1)
 	go func() {
-		capCh1 <- captureMultiProtocolProbes(uConn, magicPrefix1, suite1, 3800*time.Millisecond)
+		capCh1 <- captureMultiProtocolProbes(uConn, magicPrefix1, candidates, 3800*time.Millisecond)
 	}()
 
 	if err := enc.Encode(spoofCapWireMsg{
@@ -699,7 +636,7 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 	capRes1 := <-capCh1
 	cleanup()
 
-	chk1 := buildDirectionVerdict(suite1, 30, capRes1, "Master (Iran)", "Agent (Foreign)")
+	chk1 := buildDirectionVerdict(candidates, len(candidates)*8, capRes1, "Master (Iran)", "Agent (Foreign)")
 	if err := enc.Encode(spoofCapWireMsg{
 		Step:        "result",
 		CheckResult: &chk1,
@@ -716,10 +653,10 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 		targetMasterIP = cleanSpoofHost(remoteMasterIP)
 	}
 	agentOwnIP := resolveOutboundInterfaceIP(targetMasterIP).String()
-	suite2 := buildSpoofProbeSuite(agentOwnIP, phase2Msg.SpoofIP)
+	candidates2 := buildSpoofProbeSuite(agentOwnIP, phase2Msg.CandidateIPs)
 	magicPrefix2 := "SPFV2_" + phase2Msg.MagicHex
 
-	sent2 := sendMultiMethodCapabilityProbes(suite2, targetMasterIP, phase2Msg.ProbePort, magicPrefix2)
+	sent2 := sendMultiMethodCapabilityProbes(candidates2, targetMasterIP, phase2Msg.ProbePort, magicPrefix2)
 
 	_ = enc.Encode(spoofCapWireMsg{
 		Step:        "result",
@@ -728,7 +665,7 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 	})
 }
 
-func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, spoofIP string) (SpoofCapabilityReport, error) {
+func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []string) (SpoofCapabilityReport, error) {
 	var tc26 TunnelConfig
 	found := false
 	for _, t := range peer.Tunnels {
@@ -800,10 +737,12 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, spoofIP string) (Spo
 
 	// Phase 1: Master -> Agent
 	magicHex1, _ := randomHex(6)
+	candidates1 := buildSpoofProbeSuite(peer.IP, candidateIPs)
+
 	if err := enc.Encode(spoofCapWireMsg{
-		Step:     "init",
-		SpoofIP:  spoofIP,
-		MagicHex: magicHex1,
+		Step:         "init",
+		CandidateIPs: candidates1,
+		MagicHex:     magicHex1,
 	}); err != nil {
 		return SpoofCapabilityReport{}, err
 	}
@@ -817,10 +756,9 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, spoofIP string) (Spo
 	if tc26.SpoofWG != nil && isValidIPv4String(tc26.SpoofWG.LocalPublicIP) {
 		masterPubIP = cleanSpoofHost(tc26.SpoofWG.LocalPublicIP)
 	}
-	suite1 := buildSpoofProbeSuite(masterPubIP, spoofIP)
 	magicPrefix1 := "SPFV1_" + magicHex1
 
-	sent1 := sendMultiMethodCapabilityProbes(suite1, strings.TrimSpace(peer.IP), readyMsg.ProbePort, magicPrefix1)
+	sent1 := sendMultiMethodCapabilityProbes(candidates1, strings.TrimSpace(peer.IP), readyMsg.ProbePort, magicPrefix1)
 
 	var resMsg1 spoofCapWireMsg
 	if err := dec.Decode(&resMsg1); err != nil || resMsg1.CheckResult == nil {
@@ -844,19 +782,19 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, spoofIP string) (Spo
 
 	magicHex2, _ := randomHex(6)
 	magicPrefix2 := "SPFV2_" + magicHex2
-	suite2 := buildSpoofProbeSuite(strings.TrimSpace(peer.IP), spoofIP)
+	candidates2 := buildSpoofProbeSuite(masterPubIP, candidateIPs)
 
 	capCh2 := make(chan multiProtoCaptureResult, 1)
 	go func() {
-		capCh2 <- captureMultiProtocolProbes(uConn2, magicPrefix2, suite2, 3800*time.Millisecond)
+		capCh2 <- captureMultiProtocolProbes(uConn2, magicPrefix2, candidates2, 3800*time.Millisecond)
 	}()
 
 	if err := enc.Encode(spoofCapWireMsg{
-		Step:        "send_now",
-		SpoofIP:     spoofIP,
-		ProbePort:   boundPort2,
-		MagicHex:    magicHex2,
-		MasterPubIP: masterPubIP,
+		Step:         "send_now",
+		CandidateIPs: candidates2,
+		ProbePort:    boundPort2,
+		MagicHex:     magicHex2,
+		MasterPubIP:  masterPubIP,
 	}); err != nil {
 		return SpoofCapabilityReport{}, err
 	}
@@ -868,27 +806,28 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, spoofIP string) (Spo
 
 	sent2 := resMsg2.ProbePort
 	if sent2 <= 0 {
-		sent2 = 30
+		sent2 = len(candidates2) * 8
 	}
-	a2m := buildDirectionVerdict(suite2, sent2, capRes2, "Agent (Foreign)", "Master (Iran)")
+	a2m := buildDirectionVerdict(candidates2, sent2, capRes2, "Agent (Foreign)", "Master (Iran)")
 
 	overallOK := m2a.Supported && a2m.Supported
 	badge := "SPOOFING SUPPORTED ON BOTH SERVERS"
-	summary := fmt.Sprintf("Both Master (%s) and Agent (%s) passed spoof verification! You can now activate Method 26 or Method 27.",
+	summary := fmt.Sprintf("Both Master (%s) and Agent (%s) passed multi-method spoof verification!",
 		m2a.StatusBadge, a2m.StatusBadge)
 
 	if !overallOK {
 		switch {
 		case !m2a.Supported && !a2m.Supported:
 			badge = "SPOOFING BLOCKED ON BOTH SERVERS"
-			summary = "Tested exact iptables SNAT + ping + tcpdump ICMP as well as raw ICMP/TCP/UDP (Own-IP Baseline passed, but both datacenters dropped all spoofed packets)."
+			summary = fmt.Sprintf("Tested candidate IPs [%s] via iptables SNAT+ping, tcpdump icmp, and raw ICMP/TCP/UDP: both datacenters dropped all spoofed packets.",
+				strings.Join(candidates1, ", "))
 		case !m2a.Supported:
 			badge = "MASTER (IRAN) BLOCKS SPOOFING (AGENT OK)"
-			summary = fmt.Sprintf("Agent (Foreign) supports spoofing (%s), but Master (Iran) dropped outgoing spoofed packets (%s).",
+			summary = fmt.Sprintf("Agent supports spoofing (%s), but Master dropped spoofed packets (%s).",
 				a2m.StatusBadge, m2a.StatusBadge)
 		default:
 			badge = "AGENT (FOREIGN) BLOCKS SPOOFING (MASTER OK)"
-			summary = fmt.Sprintf("Master (Iran) supports spoofing (%s), but Agent (Foreign) dropped outgoing spoofed packets (%s).",
+			summary = fmt.Sprintf("Master supports spoofing (%s), but Agent dropped spoofed packets (%s).",
 				m2a.StatusBadge, a2m.StatusBadge)
 		}
 	}
