@@ -72,6 +72,42 @@ const (
 
 var spoofM27Modes = []string{"pure", "wireguard", "quic", "noise"}
 
+// Self-contained 64-bit sliding-window anti-replay filter for Method 27 Noise sessions
+type m27ReplayWindow struct {
+	mu     sync.Mutex
+	maxSeq uint64
+	bitmap uint64
+}
+
+func (rw *m27ReplayWindow) CheckAndAccept(seq uint64) bool {
+	if seq == 0 {
+		return false
+	}
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+
+	if seq > rw.maxSeq {
+		shift := seq - rw.maxSeq
+		if shift >= 64 {
+			rw.bitmap = 1
+		} else {
+			rw.bitmap = (rw.bitmap << shift) | 1
+		}
+		rw.maxSeq = seq
+		return true
+	}
+	diff := rw.maxSeq - seq
+	if diff >= 64 {
+		return false
+	}
+	mask := uint64(1) << diff
+	if (rw.bitmap & mask) != 0 {
+		return false
+	}
+	rw.bitmap |= mask
+	return true
+}
+
 func spoofM27ModeOK(mode string) bool {
 	m := strings.ToLower(strings.TrimSpace(mode))
 	for _, valid := range spoofM27Modes {
@@ -1048,7 +1084,7 @@ type spoofNativeRuntime struct {
 	streams       map[uint32]*spoofM27Stream
 	pingWaitersMu sync.Mutex
 	pingWaiters   map[uint64]chan []byte
-	noiseSessions sync.Map // map[string]*spoofM27NoiseSession
+	noiseSessions sync.Map // map[uint32]*spoofM27NoiseSession
 	closed        atomic.Bool
 }
 
@@ -1061,7 +1097,7 @@ type spoofM27NoiseSession struct {
 	sendAEAD  cipher.AEAD
 	recvAEAD  cipher.AEAD
 	sendNonce atomic.Uint64
-	replayWin * sahandRawReplayWindow
+	replayWin *m27ReplayWindow
 	createdAt time.Time
 }
 
@@ -1155,7 +1191,7 @@ func decodeM27Datagram(subKey []byte, raw []byte) (pktType byte, streamID, seq u
 }
 
 // Noise Mode Envelope over UDP Pipe:
-//- Init:   [0x11][SessionID:4B][EphemeralPub:32B][Timestamp:8B][HMAC:32B]
+// - Init:   [0x11][SessionID:4B][EphemeralPub:32B][Timestamp:8B][HMAC:32B]
 // - Resp:   [0x12][SessionID:4B][EphemeralPub:32B][HMAC:32B]
 // - Packet: [0x13][SessionID:4B][Nonce:8B][ChaCha20Poly1305 Ciphertext of M27Datagram]
 func deriveM27NoiseSessionKeys(subKey []byte, sessionID uint32, clientEph, serverEph []byte) (c2s cipher.AEAD, s2c cipher.AEAD, err error) {
@@ -1252,8 +1288,7 @@ func startSpoofNativeServer(peer ServerPeer, tc TunnelConfig) (net.Listener, net
 		}
 
 	case "quic":
-		// In QUIC mode, bind both the Spoof Pipe UDP port (`127.0.0.1:AdapterPort`) and the fallback port
-		// using the QUIC server listener.
+		// In QUIC mode, bind the Spoof Pipe UDP port (`127.0.0.1:AdapterPort`).
 		pipeAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(tc.SpoofNative.AdapterPort))
 		if uAddr, err := net.ResolveUDPAddr("udp", pipeAddr); err == nil {
 			if uConn, err := net.ListenUDP("udp", uAddr); err == nil {
@@ -1323,7 +1358,7 @@ func (rt *spoofNativeRuntime) handleIncomingDatagram(conn *net.UDPConn, rAddr *n
 			sessionID: sid,
 			sendAEAD:  s2c,
 			recvAEAD:  c2s,
-			replayWin: &sahandRawReplayWindow{},
+			replayWin: &m27ReplayWindow{},
 			createdAt: time.Now(),
 		}
 		rt.noiseSessions.Store(sid, sess)
@@ -1656,7 +1691,7 @@ func performM27NoiseClientHandshake(uConn *net.UDPConn, subKey []byte, timeout t
 		sessionID: sid,
 		sendAEAD:  c2s,
 		recvAEAD:  s2c,
-		replayWin: &sahandRawReplayWindow{},
+		replayWin: &m27ReplayWindow{},
 		createdAt: time.Now(),
 	}, nil
 }
@@ -1950,8 +1985,6 @@ func probeSpoofNative(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	}
 	defer uConn.Close()
 
-	// Try up to 2 attempts: first over SPOOF_PIPE, and if that times out and StrictRealSpoof == false,
-	// fall back to DIRECT_FALLBACK.
 	challenge := make([]byte, 16)
 	_, _ = io.ReadFull(rand.Reader, challenge)
 	pingFrame := encodeM27Datagram(subKey, m27FrameTypePing, 1, 1, uint16(tc.ListenPort), challenge)
@@ -1984,8 +2017,7 @@ func probeSpoofNative(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 		}
 	}
 
-	// If primary SPOOF_PIPE timed out (e.g. spoof-core-m27 not running in non-strict mode),
-	// try direct UDP fallback ONLY if StrictRealSpoof is false.
+	// If primary SPOOF_PIPE timed out, try direct UDP fallback ONLY if StrictRealSpoof is false.
 	if !s.StrictRealSpoof && dialPathTag == "SPOOF_PIPE" && strings.TrimSpace(peer.IP) != "" {
 		if fbAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort))); err == nil {
 			if fbConn, err := net.DialUDP("udp", nil, fbAddr); err == nil {
@@ -2413,7 +2445,6 @@ func startSpoofNativeUDPEntryForwarder(peer ServerPeer, tc TunnelConfig, targetP
 	return entryConn
 }
 
-// Helper for X25519 public key derivation used in Noise bundle import
 func curve25519ScalarBaseMult(priv []byte) ([]byte, error) {
 	if len(priv) != 32 {
 		return nil, errors.New("invalid X25519 private key length")
@@ -2425,7 +2456,6 @@ func curve25519ScalarBaseMult(priv []byte) ([]byte, error) {
 
 func curve25519X25519Basepoint(scalar []byte) ([]byte, error) {
 	privHex := hex.EncodeToString(scalar)
-	// Reuse standard library crypto/ecdh via validate/generate helpers
 	pub, err := deriveX25519PubFromPrivHex(privHex)
 	if err != nil {
 		return nil, err
@@ -2438,7 +2468,6 @@ func deriveX25519PubFromPrivHex(privHex string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Use golang.org/x/crypto/curve25519 (already imported in spoof_wg.go)
 	pubB, err := spoofPubFromPriv(base64.StdEncoding.EncodeToString(raw))
 	if err != nil {
 		return "", err
@@ -2450,7 +2479,6 @@ func deriveX25519PubFromPrivHex(privHex string) (string, error) {
 	return hex.EncodeToString(pubRaw), nil
 }
 
-// Suppress unused import warnings in environments where bufio/tls are referenced conditionally
 var (
 	_ = bufio.NewReader
 	_ = tls.VersionTLS13
