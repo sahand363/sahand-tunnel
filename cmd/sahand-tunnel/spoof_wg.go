@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,9 +17,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -45,11 +49,17 @@ const (
 	defaultWGMTU        = 1280
 	spoofHandshakeFresh = 3 * time.Minute
 
-	spoofWGMagic            = "SPFWG1"
-	spoofWGCmdProbe    byte = 0x01
-	spoofWGCmdSync     byte = 0x02
-	spoofWGCmdTCP      byte = 0x03
-	spoofWGCmdUDP      byte = 0x04
+	// Official pinned ParsaKSH/spoof-tunnel release & SHA-256 digests (from hashem.sh)
+	defaultSpoofVersion = "v3.0.2"
+	spoofGitHubRepo     = "ParsaKSH/spoof-tunnel"
+	spoofSHA256AMD64    = "a8dfe9e838ad5655b467765eae6f374e5f63af31bf2dded9aab295815fbcabf8"
+	spoofSHA256ARM64    = "caf08b3960d4eea72910fb0613a8893560a41f5b2f2e18f9a6c595c9ad7ea16c"
+
+	spoofWGMagic         = "SPFWG1"
+	spoofWGCmdProbe byte = 0x01
+	spoofWGCmdSync  byte = 0x02
+	spoofWGCmdTCP   byte = 0x03
+	spoofWGCmdUDP   byte = 0x04
 )
 
 var spoofTransports = []string{"tcp", "udp", "icmp", "icmpv6"}
@@ -192,7 +202,6 @@ func spoofGenKeypair() (priv, pub string, err error) {
 	if _, err = rand.Read(p[:]); err != nil {
 		return "", "", err
 	}
-	// WireGuard RFC 7748 Curve25519 scalar clamping
 	p[0] &= 248
 	p[31] &= 127
 	p[31] |= 64
@@ -220,7 +229,7 @@ func ensureSpoofWGKeys(s *SpoofWGConfig) error {
 		return errors.New("spoof config is nil")
 	}
 	if pub, err := spoofPubFromPriv(s.WGPrivKey); err == nil && pub == s.WGPubKey {
-		// Local keypair is valid
+		// Local keypair valid
 	} else {
 		priv, pub, err := spoofGenKeypair()
 		if err != nil {
@@ -294,7 +303,7 @@ func makeSpoofWGBundle(s *SpoofWGConfig, fallbackLocalIP string) (string, error)
 		localIP = resolveOutboundInterfaceIP("8.8.8.8").String()
 	}
 	if !isValidIPv4String(localIP) {
-		return "", errors.New("enter a valid IPv4 under Local Public IPv4 before generating the bundle")
+		return "", errors.New("enter a valid IPv4 under This Server's Public IPv4 before generating the bundle")
 	}
 	s.LocalPublicIP = localIP
 
@@ -355,7 +364,6 @@ func importSpoofWGBundle(bundleStr string, prev *SpoofWGConfig) (*SpoofWGConfig,
 	out.RecvPort = b.RecvPort
 	out.SpoofPort = b.ListenPort
 	out.WGPeerPriv = ""
-	// Transports mirror the Iran side: remote's send is how Iran receives
 	out.SendTransport = b.RecvTransport
 	out.RecvTransport = b.SendTransport
 	out.WGPrivKey = b.ForeignWGPriv
@@ -372,7 +380,187 @@ func importSpoofWGBundle(bundleStr string, prev *SpoofWGConfig) (*SpoofWGConfig,
 }
 
 // ============================================================================
-// 2. CONFIG FILE & SYSTEMD UNIT GENERATORS (/etc/spoof & /etc/wireguard)
+// 2. OFFICIAL SPOOF BINARY + WIREGUARD INSTALLER (WITH SHA256 & IRAN MIRRORS)
+// ============================================================================
+
+func expectedSpoofBinarySHA256(goarch string) (string, string, error) {
+	switch goarch {
+	case "amd64":
+		return "spoof-linux-amd64", spoofSHA256AMD64, nil
+	case "arm64":
+		return "spoof-linux-arm64", spoofSHA256ARM64, nil
+	default:
+		return "", "", fmt.Errorf("Spoof Tunnel has no official release for %s (amd64/arm64 only)", goarch)
+	}
+}
+
+func computeFileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func findSpoofBinaryPath() (string, bool, bool) {
+	_, wantSHA, _ := expectedSpoofBinarySHA256(runtime.GOARCH)
+	candidates := []string{
+		"/usr/local/bin/spoof",
+		"/usr/bin/spoof",
+		filepath.Join(filepath.Dir(configPath()), "bin", "spoof"),
+	}
+	if p, err := exec.LookPath(spoofBinName); err == nil {
+		candidates = append([]string{p}, candidates...)
+	}
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			shaOK := false
+			if wantSHA != "" {
+				if sum, sErr := computeFileSHA256Hex(p); sErr == nil && strings.EqualFold(sum, wantSHA) {
+					shaOK = true
+				}
+			}
+			return p, true, shaOK
+		}
+	}
+	return "/usr/local/bin/spoof", false, false
+}
+
+func checkWireGuardToolsInstalled() bool {
+	_, err1 := exec.LookPath("wg")
+	_, err2 := exec.LookPath("wg-quick")
+	return err1 == nil && err2 == nil
+}
+
+func ensureWireGuardToolsInstalled() {
+	if checkWireGuardToolsInstalled() || runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		return
+	}
+	if _, err := exec.LookPath("apt-get"); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		_ = exec.CommandContext(ctx, "apt-get", "update", "-qq").Run()
+		cmd := exec.CommandContext(ctx, "apt-get", "install", "-y", "-qq", "--no-install-recommends", "wireguard-tools")
+		cmd.Env = append(os.Environ(), "DEBIAN_FRONTEND=noninteractive")
+		_ = cmd.Run()
+	} else if _, err := exec.LookPath("dnf"); err == nil {
+		_ = exec.Command("dnf", "install", "-y", "-q", "wireguard-tools").Run()
+	} else if _, err := exec.LookPath("yum"); err == nil {
+		_ = exec.Command("yum", "install", "-y", "-q", "wireguard-tools").Run()
+	} else if _, err := exec.LookPath("pacman"); err == nil {
+		_ = exec.Command("pacman", "-Sy", "--noconfirm", "wireguard-tools").Run()
+	}
+}
+
+// Downloads the official ParsaKSH/spoof-tunnel v3.0.2 binary (trying direct GitHub
+// first and Iran proxy mirrors if blocked), verifies its SHA-256 against the
+// pinned digest from hashem.sh, installs it to /usr/local/bin/spoof, and installs
+// wireguard-tools if missing.
+func installOfficialSpoofBinary() (string, error) {
+	ensureWireGuardToolsInstalled()
+
+	assetName, wantSHA, err := expectedSpoofBinarySHA256(runtime.GOARCH)
+	if err != nil {
+		return "", err
+	}
+
+	destPath := "/usr/local/bin/spoof"
+	if os.Geteuid() != 0 {
+		destDir := filepath.Join(filepath.Dir(configPath()), "bin")
+		_ = os.MkdirAll(destDir, 0755)
+		destPath = filepath.Join(destDir, "spoof")
+	}
+
+	if existingSHA, err := computeFileSHA256Hex(destPath); err == nil && strings.EqualFold(existingSHA, wantSHA) {
+		return fmt.Sprintf("Spoof Tunnel %s (%s) is already installed and SHA-256 verified at %s",
+			defaultSpoofVersion, runtime.GOARCH, destPath), nil
+	}
+
+	rawURL := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s",
+		spoofGitHubRepo, defaultSpoofVersion, assetName)
+
+	candidateURLs := []string{
+		rawURL,
+		"https://mirror.ghproxy.com/" + rawURL,
+		"https://ghproxy.net/" + rawURL,
+		"https://ghproxy.cc/" + rawURL,
+		"https://gh-proxy.com/" + rawURL,
+		"https://gh.ddlc.top/" + rawURL,
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	var lastErr error
+
+	for _, u := range candidateURLs {
+		req, rErr := http.NewRequest("GET", u, nil)
+		if rErr != nil {
+			continue
+		}
+		resp, dErr := client.Do(req)
+		if dErr != nil {
+			lastErr = dErr
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d from %s", resp.StatusCode, u)
+			continue
+		}
+
+		tmpFile := destPath + ".tmp"
+		outF, fErr := os.OpenFile(tmpFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if fErr != nil {
+			_ = resp.Body.Close()
+			return "", fErr
+		}
+		h := sha256.New()
+		_, cErr := io.Copy(io.MultiWriter(outF, h), io.LimitReader(resp.Body, 64<<20))
+		_ = outF.Close()
+		_ = resp.Body.Close()
+		if cErr != nil {
+			_ = os.Remove(tmpFile)
+			lastErr = cErr
+			continue
+		}
+
+		gotSHA := hex.EncodeToString(h.Sum(nil))
+		if !strings.EqualFold(gotSHA, wantSHA) {
+			_ = os.Remove(tmpFile)
+			lastErr = fmt.Errorf("SHA-256 mismatch from %s (want %s, got %s)", u, wantSHA[:12], gotSHA[:12])
+			continue
+		}
+
+		if err := os.Chmod(tmpFile, 0755); err != nil {
+			_ = os.Remove(tmpFile)
+			return "", err
+		}
+		if err := os.Rename(tmpFile, destPath); err != nil {
+			_ = os.Remove(tmpFile)
+			return "", err
+		}
+
+		if runtime.GOOS == "linux" && os.Geteuid() == 0 {
+			if exec.Command("systemctl", "is-active", "--quiet", spoofCoreSvc).Run() == nil {
+				_ = exec.Command("systemctl", "restart", spoofCoreSvc).Run()
+			}
+		}
+		return fmt.Sprintf("Installed & verified Spoof Tunnel %s (%s) to %s (SHA-256 OK)",
+			defaultSpoofVersion, runtime.GOARCH, destPath), nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("all download mirrors failed")
+	}
+	return "", fmt.Errorf("failed to download official spoof binary: %w", lastErr)
+}
+
+// ============================================================================
+// 3. CONFIG FILE, FIREWALL & SYSTEMD UNIT GENERATORS (/etc/spoof & /etc/wireguard)
 // ============================================================================
 
 func spoofCoreConfigPath() string { return filepath.Join(spoofDir, "config.json") }
@@ -461,6 +649,32 @@ func writeSpoofAndWGConfigs(s *SpoofWGConfig) error {
 	return os.Rename(tmpWG, spoofWGConfPath())
 }
 
+func openSpoofFirewallPorts(s *SpoofWGConfig) {
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 || s == nil {
+		return
+	}
+	port := s.RecvPort
+	if s.Role == "remote" {
+		port = s.SpoofListenPort
+	}
+	if port <= 0 || port > 65535 {
+		return
+	}
+	pStr := strconv.Itoa(port)
+	if _, err := exec.LookPath("ufw"); err == nil {
+		_ = exec.Command("ufw", "allow", pStr+"/tcp").Run()
+		_ = exec.Command("ufw", "allow", pStr+"/udp").Run()
+	}
+	if _, err := exec.LookPath("iptables"); err == nil {
+		if exec.Command("iptables", "-C", "INPUT", "-p", "tcp", "--dport", pStr, "-j", "ACCEPT").Run() != nil {
+			_ = exec.Command("iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport", pStr, "-j", "ACCEPT").Run()
+		}
+		if exec.Command("iptables", "-C", "INPUT", "-p", "udp", "--dport", pStr, "-j", "ACCEPT").Run() != nil {
+			_ = exec.Command("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", pStr, "-j", "ACCEPT").Run()
+		}
+	}
+}
+
 func validateSpoofWGReady(s *SpoofWGConfig) error {
 	if s == nil {
 		return errors.New("spoof configuration is nil")
@@ -470,13 +684,13 @@ func validateSpoofWGReady(s *SpoofWGConfig) error {
 		return errors.New("the other server's public IPv4 is not set")
 	}
 	if !isValidIPv4String(s.PeerPublicIP) {
-		return errors.New("the other server's public IP must be a valid IPv4 address")
+		return errors.New("the other server's public IP must be a valid IPv4 address (the spoof core works over IPv4 only)")
 	}
 	if len(s.SpoofIPs) == 0 {
-		return errors.New("at least one valid IPv4 Spoof IP is required")
+		return errors.New("no spoof IP set: run the tester or enter at least one usable IPv4 address")
 	}
 	if strings.TrimSpace(s.WGPeerPub) == "" {
-		return errors.New("peer WireGuard public key is missing (generate or import a bundle first)")
+		return errors.New("peer WireGuard public key is missing: generate the bundle on the Iran server and import it on the foreign server first")
 	}
 	if !spoofTransportOK(s.SendTransport) || !spoofTransportOK(s.RecvTransport) {
 		return fmt.Errorf("transports must be one of %s", strings.Join(spoofTransports, ", "))
@@ -484,77 +698,111 @@ func validateSpoofWGReady(s *SpoofWGConfig) error {
 	return nil
 }
 
-func findSpoofBinaryPath() (string, bool) {
-	candidates := []string{
-		"/usr/local/bin/spoof",
-		"/usr/bin/spoof",
-		filepath.Join(filepath.Dir(configPath()), "bin", "spoof"),
-	}
-	for _, p := range candidates {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, true
-		}
-	}
-	if p, err := exec.LookPath(spoofBinName); err == nil {
-		return p, true
-	}
-	return "/usr/local/bin/spoof", false
-}
-
 func querySpoofWGRuntimeHealth(s *SpoofWGConfig) SpoofWGHealth {
-	_, binOK := findSpoofBinaryPath()
+	binPath, binOK, shaOK := findSpoofBinaryPath()
+	wgToolsOK := checkWireGuardToolsInstalled()
+
 	h := SpoofWGHealth{
 		BinaryInstalled: binOK,
-		ActivePath:      "DIRECT_CARRIER",
+		BinarySHA256OK:  shaOK,
+		WGToolsPresent:  wgToolsOK,
+		SpoofModeBadge:  "FALLBACK ONLY (NO IP SPOOFING)",
+		ActivePath:      "DIRECT_CARRIER_FALLBACK",
+	}
+	if binOK {
+		if out, err := exec.Command(binPath, "--version").Output(); err == nil {
+			v := strings.TrimSpace(string(out))
+			if v != "" {
+				h.BinaryVersion = v
+			}
+		}
+		if h.BinaryVersion == "" {
+			h.BinaryVersion = defaultSpoofVersion
+		}
 	}
 	if s != nil && s.LastError != "" {
 		h.LastError = s.LastError
 	}
-	if runtime.GOOS != "linux" {
-		return h
-	}
-	if exec.Command("systemctl", "is-active", "--quiet", spoofCoreSvc).Run() == nil {
-		h.CoreActive = true
-	}
-	iface := spoofIface
-	if s != nil && strings.TrimSpace(s.WGInterface) != "" {
-		iface = strings.TrimSpace(s.WGInterface)
-	}
-	if exec.Command("systemctl", "is-active", "--quiet", spoofWGUnitTmpl+iface).Run() == nil {
-		h.WGActive = true
-	}
-	if out, err := exec.Command("wg", "show", iface, "latest-handshakes").Output(); err == nil {
-		fields := strings.Fields(strings.TrimSpace(string(out)))
-		if len(fields) >= 2 {
-			if ts, err := strconv.ParseInt(fields[len(fields)-1], 10, 64); err == nil && ts > 0 {
-				age := time.Since(time.Unix(ts, 0))
-				h.Handshake = age.Truncate(time.Second).String() + " ago"
-				if age < spoofHandshakeFresh {
-					h.PeerPing = true
-					h.ActivePath = "WIREGUARD_SPOOF (" + iface + ")"
+
+	if runtime.GOOS == "linux" {
+		if exec.Command("systemctl", "is-active", "--quiet", spoofCoreSvc).Run() == nil {
+			h.CoreActive = true
+		}
+		iface := spoofIface
+		if s != nil && strings.TrimSpace(s.WGInterface) != "" {
+			iface = strings.TrimSpace(s.WGInterface)
+		}
+		if exec.Command("systemctl", "is-active", "--quiet", spoofWGUnitTmpl+iface).Run() == nil {
+			h.WGActive = true
+		}
+		if out, err := exec.Command("wg", "show", iface, "latest-handshakes").Output(); err == nil {
+			fields := strings.Fields(strings.TrimSpace(string(out)))
+			if len(fields) >= 2 {
+				if ts, err := strconv.ParseInt(fields[len(fields)-1], 10, 64); err == nil && ts > 0 {
+					age := time.Since(time.Unix(ts, 0))
+					h.Handshake = age.Truncate(time.Second).String() + " ago"
+					if age < spoofHandshakeFresh {
+						h.PeerPing = true
+					}
 				}
 			}
 		}
+		if s != nil && isLocalIPAddressBound(s.WGLocalIP) {
+			h.WGActive = true
+		}
 	}
-	if s != nil && isLocalIPAddressBound(s.WGLocalIP) {
-		h.WGActive = true
-		h.ActivePath = "WIREGUARD_SPOOF (" + s.WGLocalIP + " ↔ " + s.WGPeerIP + ")"
+
+	// Determine whether REAL IP Spoofing + WireGuard is actively carrying traffic
+	if h.BinaryInstalled && h.CoreActive && h.WGActive && (h.PeerPing || (s != nil && isLocalIPAddressBound(s.WGLocalIP))) {
+		h.RealSpoofActive = true
+		h.SpoofModeBadge = "REAL SPOOF ACTIVE (wg-spoof)"
+		if s != nil {
+			h.ActivePath = fmt.Sprintf("WIREGUARD_SPOOF (%s ↔ %s)", s.WGLocalIP, s.WGPeerIP)
+		} else {
+			h.ActivePath = "WIREGUARD_SPOOF"
+		}
+	} else if !h.BinaryInstalled {
+		h.RealSpoofActive = false
+		h.SpoofModeBadge = "BINARY MISSING (NOT SPOOFING)"
+		h.WarningBanner = "The external 'spoof' binary is NOT installed on this server. Traffic is currently using Sahand's unspoofed direct TLS carrier. Click 'Install Spoof Binary (v3.0.2)' below to enable real Layer-3 IP spoofing."
+	} else if !h.CoreActive || !h.WGActive {
+		h.RealSpoofActive = false
+		h.SpoofModeBadge = "FALLBACK ONLY (SPOOF SERVICES STOPPED)"
+		h.WarningBanner = "The 'spoof' binary is installed, but spoof-core / wg-spoof services are not running yet. Click 'Apply & Start' on both Iran and Foreign servers to activate real IP spoofing."
+	} else {
+		h.RealSpoofActive = false
+		h.SpoofModeBadge = "WAITING FOR WIREGUARD HANDSHAKE"
+		h.WarningBanner = "spoof-core and wg-spoof are running, but WireGuard has not completed a handshake yet. Verify the Foreign server has imported the bundle and started its Spoof services."
 	}
+
 	return h
 }
 
 func applyLinuxSpoofAndWGServices(s *SpoofWGConfig) (string, error) {
+	if s != nil && s.Role == "local" {
+		_ = ensureSpoofWGKeys(s)
+	}
 	if err := validateSpoofWGReady(s); err != nil {
 		return "", err
 	}
 	if err := writeSpoofAndWGConfigs(s); err != nil {
 		return "", fmt.Errorf("failed to write spoof/wireguard configs: %w", err)
 	}
-	binPath, binOK := findSpoofBinaryPath()
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 || !binOK {
-		s.ServiceEnabled = true
-		return fmt.Sprintf("Spoof + WireGuard configuration saved (%s / %s). Built-in Sahand carrier active.", s.SendTransport, s.RecvTransport), nil
+	binPath, binOK, _ := findSpoofBinaryPath()
+	if !binOK {
+		if s.RequireRealSpoof {
+			return "", errors.New("the spoof binary is not installed (click 'Install Spoof Binary' first); refused because Strict Real Spoof mode is enabled")
+		}
+		s.ServiceEnabled = false
+		return "WARNING: The 'spoof' binary is not installed! Configs were written, but REAL IP SPOOFING IS NOT ACTIVE (using unspoofed fallback carrier). Click 'Install Spoof Binary' to enable real spoofing.", nil
 	}
+	if runtime.GOOS != "linux" || os.Geteuid() != 0 {
+		s.ServiceEnabled = true
+		return fmt.Sprintf("Spoof + WireGuard configuration written (%s / %s).", s.SendTransport, s.RecvTransport), nil
+	}
+
+	ensureWireGuardToolsInstalled()
+	openSpoofFirewallPorts(s)
 
 	unitContent := fmt.Sprintf(`[Unit]
 Description=Sahand Spoof Tunnel Core (%s)
@@ -563,9 +811,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 ExecStart=%s run -c %s
 Restart=always
 RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -577,17 +827,17 @@ WantedBy=multi-user.target
 	}
 	_ = exec.Command("systemctl", "daemon-reload").Run()
 	if err := exec.Command("systemctl", "restart", spoofCoreSvc).Run(); err != nil {
-		return "", fmt.Errorf("failed to start %s: %w", spoofCoreSvc, err)
+		return "", fmt.Errorf("start %s: %w", spoofCoreSvc, err)
 	}
 	_ = exec.Command("systemctl", "enable", spoofCoreSvc).Run()
 
 	wgUnit := spoofWGUnitTmpl + s.WGInterface
 	if err := exec.Command("systemctl", "restart", wgUnit).Run(); err != nil {
-		return "", fmt.Errorf("failed to start WireGuard (%s): %w", wgUnit, err)
+		return "", fmt.Errorf("start WireGuard (%s): %w", wgUnit, err)
 	}
 	_ = exec.Command("systemctl", "enable", wgUnit).Run()
 	s.ServiceEnabled = true
-	return fmt.Sprintf("Spoof + WireGuard tunnel is up on %s (%s/%s, %s ↔ %s).",
+	return fmt.Sprintf("REAL Spoof + WireGuard tunnel is UP on %s (%s/%s, %s ↔ %s).",
 		s.Role, s.SendTransport, s.RecvTransport, s.WGLocalIP, s.WGPeerIP), nil
 }
 
@@ -606,7 +856,218 @@ func stopLinuxSpoofAndWGServices(s *SpoofWGConfig) {
 }
 
 // ============================================================================
-// 3. ENGINE 1 & ENGINE 2 BUILT-IN CARRIER & FORWARDER FOR METHOD 26 (:28026)
+// 4. SPOOF IP TESTER (`spoof tester` SUBCOMMAND FROM spoof_tester.go)
+// ============================================================================
+
+var (
+	spoofTesterMu     sync.Mutex
+	spoofTesterCur    = SpoofTesterStatus{Status: "idle", Passed: []SpoofTesterResult{}}
+	spoofTesterCancel context.CancelFunc
+	spoofTesterStart  time.Time
+	spoofTesterDur    time.Duration
+	spoofTesterWG     sync.WaitGroup
+	spoofTesterLineRe = regexp.MustCompile(`^(\d{1,3}(?:\.\d{1,3}){3})\s+(\d+)/(\d+)\s+([\d.]+)%`)
+)
+
+type SpoofTesterRequest struct {
+	Action      string   `json:"action"`       // "start" | "stop" | "clear"
+	Mode        string   `json:"mode"`         // "sender" | "receiver"
+	Protocol    string   `json:"protocol"`     // "tcp" | "icmp"
+	Sources     []string `json:"sources"`      // IPs / ranges / CIDRs
+	DstIP       string   `json:"dst_ip"`       // sender: receiver server's public IP
+	DstPort     int      `json:"dst_port"`     // default 80
+	Timeout     int      `json:"timeout"`      // receiver timeout (sec), default 30
+	PacketCount int      `json:"packet_count"` // packets per source IP, default 10
+	MaxLoss     float64  `json:"max_loss"`     // max accepted packet loss %, default 20
+}
+
+func (r SpoofTesterRequest) normalize() SpoofTesterRequest {
+	if r.Protocol != "tcp" && r.Protocol != "icmp" {
+		r.Protocol = "icmp"
+	}
+	if r.DstPort <= 0 || r.DstPort > 65535 {
+		r.DstPort = 80
+	}
+	if r.Timeout <= 0 || r.Timeout > 600 {
+		r.Timeout = 30
+	}
+	if r.PacketCount <= 0 || r.PacketCount > 1000 {
+		r.PacketCount = 10
+	}
+	if r.MaxLoss < 0 || r.MaxLoss > 100 {
+		r.MaxLoss = 20
+	}
+	return r
+}
+
+func getSpoofTesterStatusView() SpoofTesterStatus {
+	spoofTesterMu.Lock()
+	defer spoofTesterMu.Unlock()
+	st := spoofTesterCur
+	if st.Status == "running" && spoofTesterDur > 0 {
+		p := int(time.Since(spoofTesterStart) * 100 / spoofTesterDur)
+		if p > 99 {
+			p = 99
+		}
+		if p < 0 {
+			p = 0
+		}
+		st.Progress = p
+	}
+	if st.Passed == nil {
+		st.Passed = []SpoofTesterResult{}
+	}
+	return st
+}
+
+func parseSpoofTesterOutput(out string) []SpoofTesterResult {
+	var res []SpoofTesterResult
+	sc := bufio.NewScanner(strings.NewReader(out))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		m := spoofTesterLineRe.FindStringSubmatch(strings.TrimSpace(sc.Text()))
+		if m == nil {
+			continue
+		}
+		recv, _ := strconv.Atoi(m[2])
+		sent, _ := strconv.Atoi(m[3])
+		loss, _ := strconv.ParseFloat(m[4], 64)
+		res = append(res, SpoofTesterResult{
+			IP:       m[1],
+			Received: recv,
+			Sent:     sent,
+			LossPct:  loss,
+		})
+	}
+	return res
+}
+
+func extractSpoofTesterErr(out string, err error) string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if last := strings.TrimSpace(lines[len(lines)-1]); last != "" {
+		return last
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return "tester failed"
+}
+
+func startSpoofTesterProcess(req SpoofTesterRequest) error {
+	req = req.normalize()
+	if req.Mode != "sender" && req.Mode != "receiver" {
+		return errors.New("tester mode must be sender or receiver")
+	}
+	if req.Mode == "sender" && cleanSpoofHost(req.DstIP) == "" {
+		return errors.New("destination IP (the receiver server's IPv4) is required in sender mode")
+	}
+	var cleanedSources []string
+	for _, s := range req.Sources {
+		for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == '\n' || r == '\r' }) {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				cleanedSources = append(cleanedSources, trimmed)
+			}
+		}
+	}
+	if len(cleanedSources) == 0 {
+		return errors.New("add at least one source IP, range, or CIDR to test")
+	}
+	binPath, binOK, _ := findSpoofBinaryPath()
+	if !binOK {
+		return errors.New("the spoof binary is not installed (click 'Install Spoof Binary' first)")
+	}
+
+	spoofTesterMu.Lock()
+	if spoofTesterCur.Status == "running" {
+		spoofTesterMu.Unlock()
+		return errors.New("a spoof tester run is already in progress")
+	}
+	if err := os.MkdirAll(spoofDir, 0700); err != nil {
+		spoofTesterMu.Unlock()
+		return err
+	}
+	srcFile := filepath.Join(spoofDir, "tester-sources.txt")
+	if err := os.WriteFile(srcFile, []byte(strings.Join(cleanedSources, "\n")+"\n"), 0600); err != nil {
+		spoofTesterMu.Unlock()
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	spoofTesterCancel = cancel
+	spoofTesterStart = time.Now()
+	spoofTesterDur = time.Duration(req.Timeout) * time.Second
+	spoofTesterCur = SpoofTesterStatus{
+		Status:   "running",
+		Mode:     req.Mode,
+		Protocol: req.Protocol,
+		Started:  spoofTesterStart.Format(time.RFC3339),
+		Passed:   []SpoofTesterResult{},
+	}
+	spoofTesterMu.Unlock()
+
+	args := []string{
+		"tester",
+		"--mode", req.Mode,
+		"--protocol", req.Protocol,
+		"--src-list", srcFile,
+		"--timeout", strconv.Itoa(req.Timeout),
+		"--packet-count", strconv.Itoa(req.PacketCount),
+		"--max-loss", strconv.FormatFloat(req.MaxLoss, 'f', -1, 64),
+	}
+	if req.Mode == "sender" {
+		args = append(args, "--dst-ip", cleanSpoofHost(req.DstIP), "--dst-port", strconv.Itoa(req.DstPort))
+	}
+
+	spoofTesterWG.Add(1)
+	go func() {
+		defer spoofTesterWG.Done()
+		cmd := exec.CommandContext(ctx, binPath, args...)
+		outBytes, err := cmd.CombinedOutput()
+		out := string(outBytes)
+		passed := parseSpoofTesterOutput(out)
+
+		spoofTesterMu.Lock()
+		defer spoofTesterMu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		spoofTesterCancel = nil
+		spoofTesterCur.Finished = time.Now().Format(time.RFC3339)
+		spoofTesterCur.Progress = 100
+		spoofTesterCur.Passed = passed
+		if err != nil {
+			spoofTesterCur.Status = "error"
+			spoofTesterCur.Error = extractSpoofTesterErr(out, err)
+			return
+		}
+		spoofTesterCur.Status = "done"
+	}()
+	return nil
+}
+
+func stopSpoofTesterProcess() {
+	spoofTesterMu.Lock()
+	cancel := spoofTesterCancel
+	if spoofTesterCur.Status == "running" {
+		spoofTesterCur.Status = "stopped"
+		spoofTesterCur.Finished = time.Now().Format(time.RFC3339)
+	}
+	spoofTesterMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func clearSpoofTesterStatus() {
+	spoofTesterMu.Lock()
+	if spoofTesterCur.Status != "running" {
+		spoofTesterCur = SpoofTesterStatus{Status: "idle", Passed: []SpoofTesterResult{}}
+	}
+	spoofTesterMu.Unlock()
+}
+
+// ============================================================================
+// 5. ENGINE 1 & ENGINE 2 CARRIER & FORWARDER FOR METHOD 26 (:28026)
 // ============================================================================
 
 type spoofWGRuntime struct {
@@ -641,15 +1102,13 @@ func stopSpoofWGPeerResources(peerID string) {
 	}
 }
 
-// Resolves the target IP for dialing the peer: prefers the WireGuard overlay IP (`WGPeerIP`, e.g. 10.20.0.2)
-// if the local WireGuard interface (`WGLocalIP`, e.g. 10.20.0.1) is up on the host; otherwise dials `peer.IP`.
-func resolveSpoofWGTargetHost(peer ServerPeer, tc TunnelConfig) string {
+func resolveSpoofWGTargetHost(peer ServerPeer, tc TunnelConfig) (string, bool) {
 	if tc.SpoofWG != nil && isValidIPv4String(tc.SpoofWG.WGLocalIP) && isValidIPv4String(tc.SpoofWG.WGPeerIP) {
 		if isLocalIPAddressBound(tc.SpoofWG.WGLocalIP) {
-			return cleanSpoofHost(tc.SpoofWG.WGPeerIP)
+			return cleanSpoofHost(tc.SpoofWG.WGPeerIP), true
 		}
 	}
-	return strings.TrimSpace(peer.IP)
+	return strings.TrimSpace(peer.IP), false
 }
 
 type spoofWGWireHeader struct {
@@ -724,10 +1183,15 @@ func dialSpoofWGCarrier(peer ServerPeer, tc TunnelConfig, cmd byte, targetPort i
 		return nil, err
 	}
 
-	targetHost := resolveSpoofWGTargetHost(peer, tc)
+	strictReal := tc.SpoofWG != nil && tc.SpoofWG.RequireRealSpoof
+	targetHost, usingWGOverlay := resolveSpoofWGTargetHost(peer, tc)
+	if strictReal && !usingWGOverlay {
+		return nil, errors.New("Strict Real Spoof mode is enabled, but wg-spoof interface is not active")
+	}
+
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 20 * time.Second}
 	rawConn, err := dialer.Dial("tcp", net.JoinHostPort(targetHost, strconv.Itoa(tc.ListenPort)))
-	if err != nil && targetHost != strings.TrimSpace(peer.IP) && strings.TrimSpace(peer.IP) != "" {
+	if err != nil && !strictReal && targetHost != strings.TrimSpace(peer.IP) && strings.TrimSpace(peer.IP) != "" {
 		rawConn, err = dialer.Dial("tcp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc.ListenPort)))
 	}
 	if err != nil {
@@ -952,11 +1416,14 @@ func probeSpoofWG(peer ServerPeer, tc TunnelConfig, _ string) MethodResult {
 	if err != nil {
 		res.Success = false
 		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "timeout") {
+		switch {
+		case strings.Contains(msg, "strict real spoof"):
+			res.ErrorReason = "wg-spoof inactive (Strict Mode)"
+		case strings.Contains(msg, "timeout"):
 			res.ErrorReason = "Timeout"
-		} else if strings.Contains(msg, "rejected") || strings.Contains(msg, "auth") {
+		case strings.Contains(msg, "rejected") || strings.Contains(msg, "auth"):
 			res.ErrorReason = "Authentication failure"
-		} else {
+		default:
 			res.ErrorReason = "Port unreachable"
 		}
 		return res
