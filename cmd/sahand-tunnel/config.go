@@ -159,41 +159,67 @@ type GREFRPConfig struct {
 	Diagnostics        GREFRPDiagnostics   `json:"diagnostics"`
 }
 
+type SpoofTesterResult struct {
+	IP       string  `json:"ip"`
+	Received int     `json:"received"`
+	Sent     int     `json:"sent"`
+	LossPct  float64 `json:"loss_pct"`
+}
+
+type SpoofTesterStatus struct {
+	Status   string              `json:"status"` // "idle" | "running" | "done" | "stopped" | "error"
+	Mode     string              `json:"mode"`   // "sender" | "receiver"
+	Protocol string              `json:"protocol"`
+	Error    string              `json:"error,omitempty"`
+	Progress int                 `json:"progress"`
+	Passed   []SpoofTesterResult `json:"passed"`
+	Started  string              `json:"started,omitempty"`
+	Finished string              `json:"finished,omitempty"`
+}
+
 type SpoofWGHealth struct {
 	BinaryInstalled bool   `json:"binary_installed"`
+	BinaryVersion   string `json:"binary_version,omitempty"`
+	BinarySHA256OK  bool   `json:"binary_sha256_ok"`
+	WGToolsPresent  bool   `json:"wg_tools_present"`
 	CoreActive      bool   `json:"core_active"`
 	WGActive        bool   `json:"wg_active"`
 	PeerPing        bool   `json:"peer_ping"`
+	RealSpoofActive bool   `json:"real_spoof_active"`
+	SpoofModeBadge  string `json:"spoof_mode_badge"` // "REAL SPOOF ACTIVE (wg-spoof)" | "FALLBACK ONLY (NO IP SPOOFING)" | "BINARY MISSING (NOT SPOOFING)"
+	WarningBanner   string `json:"warning_banner,omitempty"`
 	Handshake       string `json:"handshake,omitempty"`
-	ActivePath      string `json:"active_path,omitempty"` // "WIREGUARD_SPOOF" or "DIRECT_CARRIER"
+	ActivePath      string `json:"active_path,omitempty"` // "WIREGUARD_SPOOF" or "DIRECT_CARRIER_FALLBACK"
 	LastError       string `json:"last_error,omitempty"`
 }
 
 type SpoofWGConfig struct {
-	Role            string        `json:"role"`             // "local" (Iran/Master) | "remote" (Foreign/Agent)
-	ServiceEnabled  bool          `json:"service_enabled"`  // whether systemd spoof-core + wg-quick@wg-spoof is enabled
-	PeerPublicIP    string        `json:"peer_public_ip"`   // the other server's real public IPv4
-	LocalPublicIP   string        `json:"local_public_ip"`  // this server's real public IPv4 (for bundle generation)
-	SpoofListenPort int           `json:"spoof_listen_port"` // public port the remote receives on (default 8090)
-	RecvPort        int           `json:"recv_port"`        // local recv port / remote client_port (default 5001)
-	SpoofPort       int           `json:"spoof_port"`       // source port stamped on outgoing packets (default 443 on local)
-	SpoofIPs        []string      `json:"spoof_ips"`        // forged source IPv4 addresses (single inline or round-robin file)
-	SendTransport   string        `json:"send_transport"`   // "tcp" | "udp" | "icmp" | "icmpv6"
-	RecvTransport   string        `json:"recv_transport"`   // "tcp" | "udp" | "icmp" | "icmpv6"
-	WGInterface     string        `json:"wg_interface"`     // default "wg-spoof"
-	WGPrivKey       string        `json:"wg_priv_key,omitempty"`
-	WGPubKey        string        `json:"wg_pub_key"`
-	WGPeerPub       string        `json:"wg_peer_pub"`
-	WGPeerPriv      string        `json:"wg_peer_priv,omitempty"`
-	WGLocalIP       string        `json:"wg_local_ip"` // 10.20.0.1 (local) / 10.20.0.2 (remote)
-	WGPeerIP        string        `json:"wg_peer_ip"`  // 10.20.0.2 (local) / 10.20.0.1 (remote)
-	WGListen        int           `json:"wg_listen"`   // foreign WireGuard listen port (default 51820)
-	CorePort        int           `json:"core_port"`   // local core UDP listen port (default 5000)
-	WGMTU           int           `json:"wg_mtu"`      // default 1280
-	LastBundle      string        `json:"last_bundle,omitempty"`
-	LastError       string        `json:"last_error,omitempty"`
-	UpdatedAt       string        `json:"updated_at,omitempty"`
-	Health          SpoofWGHealth `json:"health"`
+	Role             string            `json:"role"`               // "local" (Iran/Master) | "remote" (Foreign/Agent)
+	ServiceEnabled   bool              `json:"service_enabled"`    // whether systemd spoof-core + wg-quick@wg-spoof is enabled
+	RequireRealSpoof bool              `json:"require_real_spoof"` // if true, refuse unspoofed direct fallback
+	PeerPublicIP     string            `json:"peer_public_ip"`     // the other server's real public IPv4
+	LocalPublicIP    string            `json:"local_public_ip"`    // this server's real public IPv4 (for bundle generation)
+	SpoofListenPort  int               `json:"spoof_listen_port"`  // public port the remote receives on (default 8090)
+	RecvPort         int               `json:"recv_port"`          // local recv port / remote client_port (default 5001)
+	SpoofPort        int               `json:"spoof_port"`         // source port stamped on outgoing packets (default 443 on local)
+	SpoofIPs         []string          `json:"spoof_ips"`          // forged source IPv4 addresses (single inline or round-robin file)
+	SendTransport    string            `json:"send_transport"`     // "tcp" | "udp" | "icmp" | "icmpv6"
+	RecvTransport    string            `json:"recv_transport"`     // "tcp" | "udp" | "icmp" | "icmpv6"
+	WGInterface      string            `json:"wg_interface"`       // default "wg-spoof"
+	WGPrivKey        string            `json:"wg_priv_key,omitempty"`
+	WGPubKey         string            `json:"wg_pub_key"`
+	WGPeerPub        string            `json:"wg_peer_pub"`
+	WGPeerPriv       string            `json:"wg_peer_priv,omitempty"`
+	WGLocalIP        string            `json:"wg_local_ip"` // 10.20.0.1 (local) / 10.20.0.2 (remote)
+	WGPeerIP         string            `json:"wg_peer_ip"`  // 10.20.0.2 (local) / 10.20.0.1 (remote)
+	WGListen         int               `json:"wg_listen"`   // foreign WireGuard listen port (default 51820)
+	CorePort         int               `json:"core_port"`   // local core UDP listen port (default 5000)
+	WGMTU            int               `json:"wg_mtu"`      // default 1280
+	LastBundle       string            `json:"last_bundle,omitempty"`
+	LastError        string            `json:"last_error,omitempty"`
+	UpdatedAt        string            `json:"updated_at,omitempty"`
+	Health           SpoofWGHealth     `json:"health"`
+	Tester           SpoofTesterStatus `json:"tester"`
 }
 
 type TunnelConfig struct {
@@ -834,22 +860,28 @@ func defaultSpoofWGConfig() *SpoofWGConfig {
 		role = "remote"
 	}
 	cfg := &SpoofWGConfig{
-		Role:            role,
-		ServiceEnabled:  false,
-		SpoofListenPort: defaultSpoofPort,
-		RecvPort:        defaultRecvPort,
-		SpoofPort:       443,
-		SpoofIPs:        []string{"8.8.8.8"},
-		SendTransport:   "tcp",
-		RecvTransport:   "udp",
-		WGInterface:     spoofIface,
-		WGLocalIP:       "10.20.0.1",
-		WGPeerIP:        "10.20.0.2",
-		WGListen:        defaultWGListen,
-		CorePort:        defaultCorePort,
-		WGMTU:           defaultWGMTU,
+		Role:             role,
+		ServiceEnabled:   false,
+		RequireRealSpoof: false,
+		SpoofListenPort:  defaultSpoofPort,
+		RecvPort:         defaultRecvPort,
+		SpoofPort:        443,
+		SpoofIPs:         []string{"8.8.8.8"},
+		SendTransport:    "tcp",
+		RecvTransport:    "udp",
+		WGInterface:      spoofIface,
+		WGLocalIP:        "10.20.0.1",
+		WGPeerIP:         "10.20.0.2",
+		WGListen:         defaultWGListen,
+		CorePort:         defaultCorePort,
+		WGMTU:            defaultWGMTU,
 		Health: SpoofWGHealth{
-			ActivePath: "DIRECT_CARRIER",
+			SpoofModeBadge: "FALLBACK ONLY (NO IP SPOOFING)",
+			ActivePath:     "DIRECT_CARRIER_FALLBACK",
+		},
+		Tester: SpoofTesterStatus{
+			Status: "idle",
+			Passed: []SpoofTesterResult{},
 		},
 	}
 	applySpoofWGRoleDefaults(cfg)
