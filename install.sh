@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -7,8 +6,15 @@ VERSION_URL="https://github.com/${REPO}/releases/download/dev"
 RAW_INSTALLER="https://raw.githubusercontent.com/${REPO}/main/install.sh"
 
 BIN="/usr/local/bin/sahand-tunnel"
+SPOOF_BIN="/usr/local/bin/spoof"
+SPOOF_VER="v3.0.2"
+SPOOF_SHA256_amd64="a8dfe9e838ad5655b467765eae6f374e5f63af31bf2dded9aab295815fbcabf8"
+SPOOF_SHA256_arm64="caf08b3960d4eea72910fb0613a8893560a41f5b2f2e18f9a6c595c9ad7ea16c"
+
 CONFIG_DIR="/etc/sahand-tunnel"
 DATA_DIR="/var/lib/sahand-tunnel"
+SPOOF_DIR="/etc/spoof"
+WG_DIR="/etc/wireguard"
 CONFIG="${CONFIG_DIR}/config.json"
 SERVICE="/etc/systemd/system/sahand-tunnel.service"
 
@@ -48,8 +54,14 @@ fi
 command -v systemctl >/dev/null 2>&1 || fail "systemd is required."
 
 case "$(uname -m)" in
-    x86_64) ARCH="amd64" ;;
-    aarch64|arm64) ARCH="arm64" ;;
+    x86_64)
+        ARCH="amd64"
+        SPOOF_WANT_SHA="$SPOOF_SHA256_amd64"
+        ;;
+    aarch64|arm64)
+        ARCH="arm64"
+        SPOOF_WANT_SHA="$SPOOF_SHA256_arm64"
+        ;;
     *) fail "Unsupported CPU architecture." ;;
 esac
 
@@ -57,16 +69,62 @@ if [ "$NO_MENU" != "1" ] && [ ! -r /dev/tty ]; then
     fail "Interactive terminal is required."
 fi
 
-if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y curl ca-certificates python3
+if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 || ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+    log "Installing system dependencies (curl, python3, wireguard-tools)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends curl ca-certificates python3 wireguard-tools iproute2 iptables
 fi
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-mkdir -p "$CONFIG_DIR" "$DATA_DIR"
-chmod 0700 "$CONFIG_DIR" "$DATA_DIR"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$SPOOF_DIR" "$WG_DIR"
+chmod 0700 "$CONFIG_DIR" "$DATA_DIR" "$SPOOF_DIR" "$WG_DIR"
+
+log "Installing Spoof Tunnel core (${SPOOF_VER} ${ARCH})"
+
+install_spoof_core() {
+    if [ -x "$SPOOF_BIN" ]; then
+        local cur_sha
+        cur_sha="$(sha256sum "$SPOOF_BIN" 2>/dev/null | awk '{print $1}' || true)"
+        if [ "$cur_sha" = "$SPOOF_WANT_SHA" ]; then
+            echo "Spoof binary ${SPOOF_VER} is already installed and SHA-256 verified."
+            return 0
+        fi
+    fi
+
+    local raw_url="https://github.com/ParsaKSH/spoof-tunnel/releases/download/${SPOOF_VER}/spoof-linux-${ARCH}"
+    local urls=(
+        "$raw_url"
+        "https://mirror.ghproxy.com/${raw_url}"
+        "https://ghproxy.net/${raw_url}"
+        "https://ghproxy.cc/${raw_url}"
+        "https://gh-proxy.com/${raw_url}"
+        "https://gh.ddlc.top/${raw_url}"
+    )
+
+    local tmp_spoof="${TMP}/spoof-bin"
+    for u in "${urls[@]}"; do
+        rm -f "$tmp_spoof"
+        if curl -fsSL --connect-timeout 6 --max-time 60 -o "$tmp_spoof" "$u" 2>/dev/null; then
+            local got_sha
+            got_sha="$(sha256sum "$tmp_spoof" 2>/dev/null | awk '{print $1}' || true)"
+            if [ "$got_sha" = "$SPOOF_WANT_SHA" ]; then
+                install -m 0755 "$tmp_spoof" "$SPOOF_BIN"
+                echo "Installed and SHA-256 verified ${SPOOF_BIN} (${SPOOF_VER})."
+                if systemctl is-active --quiet spoof-core 2>/dev/null; then
+                    systemctl restart spoof-core 2>/dev/null || true
+                fi
+                return 0
+            fi
+        fi
+    done
+
+    echo "WARNING: Could not download spoof binary right now. You can install it from the Tunnels tab in the dashboard."
+}
+
+install_spoof_core
 
 log "Checking existing installation"
 
@@ -283,6 +341,9 @@ new["created_at"] = old.get("created_at", new.get("created_at"))
 if old.get("panel_url"):
     new["panel_url"] = old["panel_url"]
 
+if old.get("servers"):
+    new["servers"] = old["servers"]
+
 with open(output_path, "w") as f:
     json.dump(new, f, indent=2)
     f.write("\n")
@@ -336,11 +397,11 @@ ExecStart=${BIN} serve
 Restart=on-failure
 RestartSec=5
 User=root
-NoNewPrivileges=true
+LimitNOFILE=1048576
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=${DATA_DIR} ${CONFIG_DIR}
+ReadWritePaths=${DATA_DIR} ${CONFIG_DIR} ${SPOOF_DIR} ${WG_DIR} /etc/systemd/system /usr/local/bin
 
 [Install]
 WantedBy=multi-user.target
