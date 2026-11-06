@@ -582,7 +582,7 @@ func buildDirectionVerdict(candidates []string, sentCount int, capRes multiProto
 	if capRes.OwnIPReceived {
 		chk.Supported = false
 		chk.StatusBadge = "BLOCKED (ISP/DATACENTER)"
-		chk.Detail = fmt.Sprintf("Baseline Real-IP reached %s OK, but 0 spoofed packets (tested candidates: [%s]) left %s. Datacenter enforces strict BCP38 anti-spoofing.",
+		chk.Detail = fmt.Sprintf("Baseline Real-IP reached %s OK, but 0 spoofed packets (tested candidates: [%s]) left %s. %s's datacenter enforces strict BCP38 anti-spoofing.",
 			receiverLabel, testedStr, senderLabel, senderLabel)
 		return chk
 	}
@@ -672,8 +672,6 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 	})
 }
 
-// Accepts `rawSpoofIPs string` (single IP or comma-separated list of IPs)
-// so it compiles cleanly with `server.go`'s `RunBidirectionalSpoofCapabilityVerify(*peerSnapshot, spoofIP)`.
 func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, rawSpoofIPs string) (SpoofCapabilityReport, error) {
 	var candidateIPs []string
 	for _, p := range strings.Split(rawSpoofIPs, ",") {
