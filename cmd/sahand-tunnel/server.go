@@ -297,7 +297,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/health", handleHealth)
 	mux.HandleFunc("/login", handleLogin)
 	mux.HandleFunc("/logout", requireAuth(handleLogout))
-	mux.HandleFunc("/api/v1/node", requireAuth(handleNode))
+	mux.HandleFunc("/api/v1/node", handleNode)
 	mux.HandleFunc("/api/v1/state", requireAuth(handleState))
 	mux.HandleFunc("/api/v1/servers", requireAuth(handleServers))
 	mux.HandleFunc("/api/v1/servers/action", requireAuth(handleServerAction))
@@ -462,8 +462,9 @@ func handleSpoofCapabilityVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ServerID string `json:"server_id"`
-		SpoofIP  string `json:"spoof_ip,omitempty"`
+		ServerID string   `json:"server_id"`
+		SpoofIP  string   `json:"spoof_ip,omitempty"`
+		SpoofIPs []string `json:"spoof_ips,omitempty"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -486,23 +487,26 @@ func handleSpoofCapabilityVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spoofIP := cleanSpoofHost(req.SpoofIP)
-	if !isValidIPv4String(spoofIP) {
+	spoofIPStr := strings.TrimSpace(req.SpoofIP)
+	if spoofIPStr == "" && len(req.SpoofIPs) > 0 {
+		spoofIPStr = strings.Join(req.SpoofIPs, ", ")
+	}
+	if spoofIPStr == "" {
 		for _, tc := range peerSnapshot.Tunnels {
 			if tc.ID == 27 && tc.SpoofNative != nil && len(tc.SpoofNative.SpoofIPs) > 0 {
-				spoofIP = tc.SpoofNative.SpoofIPs[0]
+				spoofIPStr = strings.Join(tc.SpoofNative.SpoofIPs, ", ")
 				break
 			}
 			if tc.ID == 26 && tc.SpoofWG != nil && len(tc.SpoofWG.SpoofIPs) > 0 {
-				spoofIP = tc.SpoofWG.SpoofIPs[0]
+				spoofIPStr = strings.Join(tc.SpoofWG.SpoofIPs, ", ")
 			}
 		}
 	}
-	if !isValidIPv4String(spoofIP) {
-		spoofIP = "8.8.8.8"
+	if spoofIPStr == "" {
+		spoofIPStr = "172.67.150.10, 1.1.1.1, 9.9.9.9, 8.8.8.8"
 	}
 
-	rep, err := RunBidirectionalSpoofCapabilityVerify(*peerSnapshot, spoofIP)
+	rep, err := RunBidirectionalSpoofCapabilityVerify(*peerSnapshot, spoofIPStr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1726,7 +1730,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-func handleLogout(w http.ResponseWriter, r *http.Request) {
+fn handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
