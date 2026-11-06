@@ -297,7 +297,7 @@ func runServer() error {
 	mux.HandleFunc("/api/v1/health", handleHealth)
 	mux.HandleFunc("/login", handleLogin)
 	mux.HandleFunc("/logout", requireAuth(handleLogout))
-	mux.HandleFunc("/api/v1/node", handleNode)
+	mux.HandleFunc("/api/v1/node", requireAuth(handleNode))
 	mux.HandleFunc("/api/v1/state", requireAuth(handleState))
 	mux.HandleFunc("/api/v1/servers", requireAuth(handleServers))
 	mux.HandleFunc("/api/v1/servers/action", requireAuth(handleServerAction))
@@ -1730,7 +1730,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
-fn handleLogout(w http.ResponseWriter, r *http.Request) {
+func handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
