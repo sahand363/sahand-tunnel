@@ -514,6 +514,9 @@ export default function App() {
     null
   );
   const [spoofCapError, setSpoofCapError] = useState<Record<string, string>>({});
+  const [capCustomIPsDraft, setCapCustomIPsDraft] = useState<
+    Record<string, string>
+  >({});
 
   // Method 26 states
   const [spoofActionBusy, setSpoofActionBusy] = useState<string | null>(null);
@@ -731,7 +734,7 @@ export default function App() {
 
   async function handleVerifySpoofCapability(
     serverID: string,
-    candidateSpoofIP?: string
+    rawCandidatesCSV?: string
   ) {
     if (verifyingSpoofCapID) return;
     setVerifyingSpoofCapID(serverID);
@@ -740,13 +743,25 @@ export default function App() {
       delete next[serverID];
       return next;
     });
+
+    const csv =
+      rawCandidatesCSV !== undefined
+        ? rawCandidatesCSV
+        : capCustomIPsDraft[serverID] ||
+          "172.67.150.10, 1.1.1.1, 9.9.9.9, 8.8.8.8";
+    const parsedList = parseSpoofIPsCSV(csv);
+
     try {
       const res = await fetch("/api/v1/tunnels/spoof-capability", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           server_id: serverID,
-          spoof_ip: candidateSpoofIP || "8.8.8.8",
+          spoof_ip: csv,
+          spoof_ips:
+            parsedList.length > 0
+              ? parsedList
+              : ["172.67.150.10", "1.1.1.1", "8.8.8.8"],
         }),
       });
       if (res.ok) {
@@ -1220,11 +1235,17 @@ export default function App() {
   // Renders the shared Bidirectional Spoof Capability Verifier box at the top of Method 26 & Method 27
   function renderSpoofCapabilityPrecheckBox(
     serverID: string,
-    candidateSpoofIP: string
+    defaultCandidateCSV: string,
+    onApplyWorkingIPs: (ips: string[]) => void
   ) {
     const cap = spoofCapabilities[serverID];
     const isBusy = verifyingSpoofCapID === serverID;
     const errMsg = spoofCapError[serverID];
+
+    const customCSVValue =
+      capCustomIPsDraft[serverID] !== undefined
+        ? capCustomIPsDraft[serverID]
+        : defaultCandidateCSV || "172.67.150.10, 1.1.1.1, 9.9.9.9, 8.8.8.8";
 
     const borderCol = !cap?.tested
       ? "rgba(56, 189, 248, 0.35)"
@@ -1237,6 +1258,19 @@ export default function App() {
       : cap.overall_supported
       ? "rgba(16, 185, 129, 0.1)"
       : "rgba(239, 68, 68, 0.1)";
+
+    const discoveredWorkingIPs: string[] = [];
+    if (cap?.tested) {
+      for (const side of [cap.master_to_agent, cap.agent_to_master]) {
+        if (side?.supported && side.observed_source_ip) {
+          for (const ip of parseSpoofIPsCSV(side.observed_source_ip)) {
+            if (!discoveredWorkingIPs.includes(ip)) {
+              discoveredWorkingIPs.push(ip);
+            }
+          }
+        }
+      }
+    }
 
     return (
       <div
@@ -1260,7 +1294,14 @@ export default function App() {
             gap: "8px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
             <Shield size={15} />
             <strong style={{ fontSize: "13px" }}>
               Pre-Flight Server Spoof Capability Check (Master ↔ Agent)
@@ -1278,22 +1319,76 @@ export default function App() {
             )}
           </div>
 
-          <button
-            type="button"
-            className="next-method-btn"
-            disabled={isBusy}
-            onClick={() =>
-              handleVerifySpoofCapability(serverID, candidateSpoofIP)
-            }
-            title="Automatically test whether both Master (Iran) and Agent (Foreign) can transmit and receive spoofed-source packets (raw IP_HDRINCL + temporary iptables SNAT probe)"
+          <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+            {discoveredWorkingIPs.length > 0 && (
+              <button
+                type="button"
+                className="next-method-btn"
+                style={{ borderColor: "#10b981", color: "#10b981" }}
+                onClick={() => onApplyWorkingIPs(discoveredWorkingIPs)}
+                title="Copy the verified working Spoof IP(s) into this tunnel's configuration"
+              >
+                <Check size={13} />
+                <span>
+                  Use Working IP ({discoveredWorkingIPs.join(", ")})
+                </span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              className="next-method-btn"
+              disabled={isBusy}
+              onClick={() =>
+                handleVerifySpoofCapability(serverID, customCSVValue)
+              }
+              title="Test your custom candidate IPs (plus auto Same-/24 neighbor IP) using iptables SNAT+ping, tcpdump icmp, and raw ICMP/TCP/UDP"
+            >
+              <Activity size={13} />
+              <span>
+                {isBusy
+                  ? "Testing Both Sides (~4s)..."
+                  : "Verify Spoof Support (Both Sides)"}
+              </span>
+            </button>
+          </div>
+        </div>
+
+        {/* Custom Candidate Spoof IP Input Row */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr",
+            gap: "4px",
+            marginTop: "2px",
+          }}
+        >
+          <label
+            style={{
+              fontSize: "10.5px",
+              fontWeight: 700,
+              opacity: 0.78,
+              letterSpacing: "0.04em",
+            }}
           >
-            <Activity size={13} />
-            <span>
-              {isBusy
-                ? "Testing Both Sides (~4s)..."
-                : "Verify Spoof Support (Both Sides)"}
-            </span>
-          </button>
+            CUSTOM CANDIDATE SPOOF IPS TO TEST (CSV — ALSO AUTO-TESTS SAME-/24 SUBNET NEIGHBOR IP)
+          </label>
+          <input
+            value={customCSVValue}
+            onChange={(e) =>
+              setCapCustomIPsDraft((prev) => ({
+                ...prev,
+                [serverID]: e.target.value,
+              }))
+            }
+            placeholder="172.67.150.10, 1.1.1.1, 9.9.9.9, 8.8.8.8"
+            style={{
+              width: "100%",
+              padding: "7px 10px",
+              fontSize: "12.5px",
+              borderRadius: "8px",
+            }}
+          />
         </div>
 
         <div style={{ fontSize: "12px", opacity: 0.9 }}>
@@ -1304,7 +1399,7 @@ export default function App() {
           ) : cap?.tested ? (
             cap.summary
           ) : (
-            "Before configuring or starting Method 26 / Method 27, click 'Verify Spoof Support (Both Sides)' to test if your Iran and Foreign datacenters allow sending spoofed-source packets."
+            "Enter any candidate Spoof IPs above and click 'Verify Spoof Support (Both Sides)' to test iptables SNAT + ping + tcpdump ICMP as well as raw ICMP/TCP/UDP packets."
           )}
         </div>
 
@@ -1341,7 +1436,7 @@ export default function App() {
                   }`}
                 >
                   {cap.master_to_agent.supported
-                    ? "✓ SUPPORTED"
+                    ? `✓ ${cap.master_to_agent.status_badge}`
                     : cap.master_to_agent.status_badge}
                 </span>
               </div>
@@ -1372,7 +1467,7 @@ export default function App() {
                   }`}
                 >
                   {cap.agent_to_master.supported
-                    ? "✓ SUPPORTED"
+                    ? `✓ ${cap.agent_to_master.status_badge}`
                     : cap.agent_to_master.status_badge}
                 </span>
               </div>
@@ -2620,9 +2715,9 @@ export default function App() {
                                 onClick={() =>
                                   handleVerifySpoofCapability(
                                     selectedServer.id,
-                                    (tunnel.id === 27
-                                      ? snDraft?.spoof_ips?.[0]
-                                      : swgDraft?.spoof_ips?.[0]) || "8.8.8.8"
+                                    capCustomIPsDraft[selectedServer.id] ||
+                                      spoofIPsInputValue ||
+                                      "172.67.150.10, 1.1.1.1, 9.9.9.9, 8.8.8.8"
                                   )
                                 }
                                 title="Test if both Master and Agent servers allow sending spoofed-source packets"
@@ -3444,7 +3539,14 @@ export default function App() {
                             {/* TOP PRE-FLIGHT CAPABILITY CHECK BOX */}
                             {renderSpoofCapabilityPrecheckBox(
                               selectedServer.id,
-                              swgDraft.spoof_ips?.[0] || "8.8.8.8"
+                              spoofIPsInputValue,
+                              (ips) => {
+                                setSpoofIPsRawDraft((prev) => ({
+                                  ...prev,
+                                  [tunnelKey]: ips.join(", "),
+                                }));
+                                updateSWGDraft({ spoof_ips: ips });
+                              }
                             )}
 
                             {/* REAL SPOOF VS FALLBACK STATUS BANNER */}
@@ -4425,7 +4527,14 @@ export default function App() {
                             {/* TOP PRE-FLIGHT CAPABILITY CHECK BOX */}
                             {renderSpoofCapabilityPrecheckBox(
                               selectedServer.id,
-                              snDraft.spoof_ips?.[0] || "8.8.8.8"
+                              spoofIPsInputValue,
+                              (ips) => {
+                                setSpoofIPsRawDraft((prev) => ({
+                                  ...prev,
+                                  [tunnelKey]: ips.join(", "),
+                                }));
+                                updateSNDraft({ spoof_ips: ips });
+                              }
                             )}
 
                             {/* STATUS & STRICT MODE BANNER */}
