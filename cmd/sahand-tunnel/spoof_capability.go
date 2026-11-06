@@ -1,846 +1,1806 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"encoding/binary"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
 	"net"
+	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
-type SpoofDirectionCheck struct {
-	Supported        bool   `json:"supported"`
-	StatusBadge      string `json:"status_badge"` // "SUPPORTED" | "SAME-/24 ONLY" | "BLOCKED (ISP/DATACENTER)" | "REWRITTEN BY NAT" | "PORT FIREWALLED"
-	SpoofIPTested    string `json:"spoof_ip_tested"`
-	ObservedSourceIP string `json:"observed_source_ip,omitempty"`
-	PacketsSent      int    `json:"packets_sent"`
-	PacketsReceived  int    `json:"packets_received"`
-	Detail           string `json:"detail"`
-}
-
-type SpoofCapabilityReport struct {
-	Tested           bool                `json:"tested"`
-	OverallSupported bool                `json:"overall_supported"`
-	OverallBadge     string              `json:"overall_badge"`
-	Summary          string              `json:"summary"`
-	MasterToAgent    SpoofDirectionCheck `json:"master_to_agent"`
-	AgentToMaster    SpoofDirectionCheck `json:"agent_to_master"`
-	TestedAt         string              `json:"tested_at,omitempty"`
-}
-
 var (
-	spoofCapMu      sync.RWMutex
-	spoofCapReports = make(map[string]SpoofCapabilityReport)
+	sessionsMu sync.Mutex
+	sessions   = make(map[string]Session)
+
+	loginMu       sync.Mutex
+	loginAttempts = make(map[string][]time.Time)
+
+	analyticsMu   sync.Mutex
+	analyticsData AnalyticsStore
 )
 
-func getSpoofCapabilityReport(peerID string) SpoofCapabilityReport {
-	spoofCapMu.RLock()
-	defer spoofCapMu.RUnlock()
-	if rep, ok := spoofCapReports[peerID]; ok {
-		return rep
-	}
-	return SpoofCapabilityReport{
-		Tested:       false,
-		OverallBadge: "NOT VERIFIED YET",
-		Summary:      "Click 'Verify Spoof Support (Both Sides)' to test custom candidate spoof IPs across ICMP, TCP, and UDP.",
-	}
-}
-
-func setSpoofCapabilityReport(peerID string, rep SpoofCapabilityReport) {
-	spoofCapMu.Lock()
-	spoofCapReports[peerID] = rep
-	spoofCapMu.Unlock()
-}
-
-func ipv4HeaderChecksum(data []byte) uint16 {
-	var sum uint32
-	length := len(data)
-	for i := 0; i < length-1; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
-	}
-	if length%2 == 1 {
-		sum += uint32(data[length-1]) << 8
-	}
-	for (sum >> 16) > 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	return ^uint16(sum)
-}
-
-func l4IPv4PseudoChecksum(srcIP, dstIP net.IP, proto uint8, l4Pkt []byte) uint16 {
-	var sum uint32
-	s4 := srcIP.To4()
-	d4 := dstIP.To4()
-	sum += uint32(binary.BigEndian.Uint16(s4[0:2]))
-	sum += uint32(binary.BigEndian.Uint16(s4[2:4]))
-	sum += uint32(binary.BigEndian.Uint16(d4[0:2]))
-	sum += uint32(binary.BigEndian.Uint16(d4[2:4]))
-	sum += uint32(proto)
-	sum += uint32(len(l4Pkt))
-
-	length := len(l4Pkt)
-	for i := 0; i < length-1; i += 2 {
-		sum += uint32(binary.BigEndian.Uint16(l4Pkt[i : i+2]))
-	}
-	if length%2 == 1 {
-		sum += uint32(l4Pkt[length-1]) << 8
-	}
-	for (sum >> 16) > 0 {
-		sum = (sum & 0xFFFF) + (sum >> 16)
-	}
-	csum := ^uint16(sum)
-	if proto == syscall.IPPROTO_UDP && csum == 0 {
-		csum = 0xFFFF
-	}
-	return csum
-}
-
-func wrapIPv4Header(srcIP, dstIP net.IP, proto uint8, l4Payload []byte) []byte {
-	totalLen := 20 + len(l4Payload)
-	ipHdr := make([]byte, 20)
-	ipHdr[0] = 0x45
-	ipHdr[1] = 0x00
-	binary.BigEndian.PutUint16(ipHdr[2:4], uint16(totalLen))
-	binary.BigEndian.PutUint16(ipHdr[4:6], 54321)
-	binary.BigEndian.PutUint16(ipHdr[6:8], 0x4000)
-	ipHdr[8] = 64
-	ipHdr[9] = proto
-	copy(ipHdr[12:16], srcIP.To4())
-	copy(ipHdr[16:20], dstIP.To4())
-	binary.BigEndian.PutUint16(ipHdr[10:12], ipv4HeaderChecksum(ipHdr))
-
-	full := make([]byte, totalLen)
-	copy(full[0:20], ipHdr)
-	copy(full[20:], l4Payload)
-	return full
-}
-
-func buildForgedIPv4UDPPacket(srcIPStr, dstIPStr string, srcPort, dstPort int, payload []byte) ([]byte, net.IP, error) {
-	srcIP := net.ParseIP(strings.TrimSpace(srcIPStr)).To4()
-	dstIP := net.ParseIP(strings.TrimSpace(dstIPStr)).To4()
-	if srcIP == nil || dstIP == nil {
-		return nil, nil, errors.New("valid IPv4 addresses required")
-	}
-	udpLen := 8 + len(payload)
-	udpPkt := make([]byte, udpLen)
-	binary.BigEndian.PutUint16(udpPkt[0:2], uint16(srcPort))
-	binary.BigEndian.PutUint16(udpPkt[2:4], uint16(dstPort))
-	binary.BigEndian.PutUint16(udpPkt[4:6], uint16(udpLen))
-	copy(udpPkt[8:], payload)
-	binary.BigEndian.PutUint16(udpPkt[6:8], l4IPv4PseudoChecksum(srcIP, dstIP, syscall.IPPROTO_UDP, udpPkt))
-	return wrapIPv4Header(srcIP, dstIP, syscall.IPPROTO_UDP, udpPkt), dstIP, nil
-}
-
-func buildForgedIPv4ICMPPacket(srcIPStr, dstIPStr string, seq uint16, payload []byte) ([]byte, net.IP, error) {
-	srcIP := net.ParseIP(strings.TrimSpace(srcIPStr)).To4()
-	dstIP := net.ParseIP(strings.TrimSpace(dstIPStr)).To4()
-	if srcIP == nil || dstIP == nil {
-		return nil, nil, errors.New("valid IPv4 addresses required")
-	}
-	icmpPkt := make([]byte, 8+len(payload))
-	icmpPkt[0] = 8 // ICMPv4 Echo Request
-	icmpPkt[1] = 0
-	binary.BigEndian.PutUint16(icmpPkt[4:6], 0x5A27)
-	binary.BigEndian.PutUint16(icmpPkt[6:8], seq)
-	copy(icmpPkt[8:], payload)
-	binary.BigEndian.PutUint16(icmpPkt[2:4], ipv4HeaderChecksum(icmpPkt))
-	return wrapIPv4Header(srcIP, dstIP, syscall.IPPROTO_ICMP, icmpPkt), dstIP, nil
-}
-
-func buildForgedIPv4TCPPacket(srcIPStr, dstIPStr string, srcPort, dstPort int, payload []byte) ([]byte, net.IP, error) {
-	srcIP := net.ParseIP(strings.TrimSpace(srcIPStr)).To4()
-	dstIP := net.ParseIP(strings.TrimSpace(dstIPStr)).To4()
-	if srcIP == nil || dstIP == nil {
-		return nil, nil, errors.New("valid IPv4 addresses required")
-	}
-	tcpPkt := make([]byte, 20+len(payload))
-	binary.BigEndian.PutUint16(tcpPkt[0:2], uint16(srcPort))
-	binary.BigEndian.PutUint16(tcpPkt[2:4], uint16(dstPort))
-	binary.BigEndian.PutUint32(tcpPkt[4:8], 0x10203040)
-	binary.BigEndian.PutUint32(tcpPkt[8:12], 0)
-	tcpPkt[12] = 5 << 4
-	tcpPkt[13] = 0x18 // PSH | ACK
-	binary.BigEndian.PutUint16(tcpPkt[14:16], 64240)
-	copy(tcpPkt[20:], payload)
-	binary.BigEndian.PutUint16(tcpPkt[16:18], l4IPv4PseudoChecksum(srcIP, dstIP, syscall.IPPROTO_TCP, tcpPkt))
-	return wrapIPv4Header(srcIP, dstIP, syscall.IPPROTO_TCP, tcpPkt), dstIP, nil
-}
-
-func deriveSameSlash24NeighborIP(realIPStr string) string {
-	ip := net.ParseIP(cleanSpoofHost(realIPStr)).To4()
-	if ip == nil || ip[0] == 127 || ip[0] == 10 {
-		return "198.51.100.233"
-	}
-	last := byte(233)
-	if ip[3] == 233 {
-		last = 234
-	}
-	return fmt.Sprintf("%d.%d.%d.%d", ip[0], ip[1], ip[2], last)
-}
-
-func buildSpoofProbeSuite(realSenderIP string, candidateIPs []string) []string {
-	own := cleanSpoofHost(realSenderIP)
-	if !isValidIPv4String(own) {
-		own = resolveOutboundInterfaceIP("8.8.8.8").String()
-	}
-	seen := map[string]bool{own: true}
-	var list []string
-
-	// Add user-provided candidate IPs first
-	for _, raw := range candidateIPs {
-		ip := cleanSpoofHost(raw)
-		if isValidIPv4String(ip) && !seen[ip] {
-			seen[ip] = true
-			list = append(list, ip)
-		}
-	}
-
-	// Always ensure standard defaults if list is empty or small
-	defaults := []string{"8.8.8.8", "1.1.1.1", "172.67.150.10", deriveSameSlash24NeighborIP(own)}
-	for _, d := range defaults {
-		if isValidIPv4String(d) && !seen[d] {
-			seen[d] = true
-			list = append(list, d)
-		}
-	}
-	return list
-}
-
-func runExactIptablesSNATPingTest(targetIP, spoofIP string) int {
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 || !isValidIPv4String(targetIP) || !isValidIPv4String(spoofIP) {
-		return 0
-	}
-	if _, err := exec.LookPath("iptables"); err != nil {
-		return 0
-	}
-	pingBin, err := exec.LookPath("ping")
+func readPhysicalNetCounters() (uint64, uint64) {
+	data, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
-		return 0
+		return atomic.LoadUint64(&appRxBytes), atomic.LoadUint64(&appTxBytes)
 	}
-
-	if _, err := exec.LookPath("conntrack"); err == nil {
-		_ = exec.Command("conntrack", "-D", "-p", "icmp", "-d", targetIP).Run()
-	}
-
-	addRule := []string{"-t", "nat", "-I", "POSTROUTING", "1", "-p", "icmp", "-d", targetIP, "-j", "SNAT", "--to-source", spoofIP}
-	delRule := []string{"-t", "nat", "-D", "POSTROUTING", "-p", "icmp", "-d", targetIP, "-j", "SNAT", "--to-source", spoofIP}
-
-	if exec.Command("iptables", addRule...).Run() != nil {
-		return 0
-	}
-	defer func() {
-		_ = exec.Command("iptables", delRule...).Run()
-	}()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
-	defer cancel()
-	_ = exec.CommandContext(ctx, pingBin, "-c", "2", "-i", "0.2", "-W", "1", targetIP).Run()
-	return 2
-}
-
-func sendMultiMethodCapabilityProbes(candidates []string, targetIP string, targetPort int, magicPrefix string) int {
-	sent := 0
-	pStr := strconv.Itoa(targetPort)
-
-	// Baseline Own-IP
-	if rAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(targetIP, pStr)); err == nil {
-		if uConn, err := net.DialUDP("udp4", nil, rAddr); err == nil {
-			_, _ = uConn.Write([]byte(magicPrefix + "|OWN|UDP|"))
-			sent++
-			_ = uConn.Close()
-		}
-	}
-
-	if runtime.GOOS == "linux" {
-		if fd, sErr := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW); sErr == nil {
-			_ = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
-			for idx, ipStr := range candidates {
-				if !isValidIPv4String(ipStr) {
-					continue
-				}
-				uPayload := []byte(fmt.Sprintf("%s|%s|UDP|", magicPrefix, ipStr))
-				if pkt, dst4, err := buildForgedIPv4UDPPacket(ipStr, targetIP, 443, targetPort, uPayload); err == nil {
-					var addr syscall.SockaddrInet4
-					copy(addr.Addr[:], dst4)
-					if syscall.Sendto(fd, pkt, 0, &addr) == nil {
-						sent++
-					}
-				}
-				iPayload := []byte(fmt.Sprintf("%s|%s|ICMP|", magicPrefix, ipStr))
-				if pkt, dst4, err := buildForgedIPv4ICMPPacket(ipStr, targetIP, uint16(idx+1), iPayload); err == nil {
-					var addr syscall.SockaddrInet4
-					copy(addr.Addr[:], dst4)
-					if syscall.Sendto(fd, pkt, 0, &addr) == nil {
-						sent++
-					}
-				}
-				tPayload := []byte(fmt.Sprintf("%s|%s|TCP|", magicPrefix, ipStr))
-				if pkt, dst4, err := buildForgedIPv4TCPPacket(ipStr, targetIP, 443, targetPort, tPayload); err == nil {
-					var addr syscall.SockaddrInet4
-					copy(addr.Addr[:], dst4)
-					if syscall.Sendto(fd, pkt, 0, &addr) == nil {
-						sent++
-					}
-				}
-			}
-			_ = syscall.Close(fd)
-		}
-	}
-
-	for _, ipStr := range candidates {
-		sent += runExactIptablesSNATPingTest(targetIP, ipStr)
-	}
-
-	return sent
-}
-
-type multiProtoCaptureResult struct {
-	OwnIPReceived      bool     `json:"own_ip_received"`
-	ExternalSupported  bool     `json:"external_supported"`
-	SameSub24Supported bool     `json:"same_sub24_supported"`
-	NATRewrittenTo     string   `json:"nat_rewritten_to,omitempty"`
-	WorkingProtocols   []string `json:"working_protocols,omitempty"`
-	WorkingSpoofIPs    []string `json:"working_spoof_ips,omitempty"`
-	PacketsReceived    int      `json:"packets_received"`
-}
-
-func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, candidates []string, duration time.Duration) multiProtoCaptureResult {
-	var mu sync.Mutex
-	res := multiProtoCaptureResult{}
-	protoSet := make(map[string]bool)
-	ipSet := make(map[string]bool)
-	candMap := make(map[string]bool)
-	for _, c := range candidates {
-		candMap[c] = true
-	}
-
-	addWorking := func(proto, ip string) {
-		if proto != "" && !protoSet[proto] {
-			protoSet[proto] = true
-			res.WorkingProtocols = append(res.WorkingProtocols, proto)
-		}
-		if ip != "" && !ipSet[ip] {
-			ipSet[ip] = true
-			res.WorkingSpoofIPs = append(res.WorkingSpoofIPs, ip)
-			if strings.Contains(ip, ".233") || strings.Contains(ip, ".234") {
-				res.SameSub24Supported = true
-			} else {
-				res.ExternalSupported = true
-			}
-		}
-	}
-
-	recordDirectSourceIPMatch := func(srcIP, protoLabel string) bool {
-		srcIP = cleanSpoofHost(srcIP)
-		if srcIP == "" {
-			return false
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if candMap[srcIP] {
-			res.PacketsReceived++
-			addWorking(protoLabel, srcIP)
-			return true
-		}
-		return false
-	}
-
-	recordHit := func(srcIP string, payload []byte, listenerProto string) {
-		idx := bytes.Index(payload, []byte(magicPrefix+"|"))
-		if idx < 0 {
-			if listenerProto == "ICMP" && len(payload) >= 8 && payload[0] == 8 {
-				recordDirectSourceIPMatch(srcIP, "SNAT+PING")
-			}
-			return
-		}
-		parts := strings.Split(string(payload[idx:]), "|")
-		if len(parts) < 3 {
-			return
-		}
-		ipTag := parts[1] // Can be IP string or "OWN"
-		proto := parts[2]
-		if proto == "" {
-			proto = listenerProto
-		}
-
-		mu.Lock()
-		defer mu.Unlock()
-		res.PacketsReceived++
-
-		if ipTag == "OWN" {
-			res.OwnIPReceived = true
-			return
-		}
-
-		if candMap[ipTag] || ipTag == "127.0.0.1" {
-			addWorking(proto, ipTag)
-		} else if srcIP != "" {
-			res.NATRewrittenTo = srcIP
-		}
-	}
-
-	deadline := time.Now().Add(duration)
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = uConn.SetDeadline(deadline)
-		buf := make([]byte, 4096)
-		for {
-			n, rAddr, err := uConn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			src := ""
-			if rAddr != nil && rAddr.IP != nil {
-				src = rAddr.IP.String()
-			}
-			recordHit(src, buf[:n], "UDP")
-		}
-	}()
-
-	if icmpConn, err := net.ListenPacket("ip4:icmp", "0.0.0.0"); err == nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer icmpConn.Close()
-			_ = icmpConn.SetDeadline(deadline)
-			buf := make([]byte, 4096)
-			for {
-				n, rAddr, rErr := icmpConn.ReadFrom(buf)
-				if rErr != nil {
-					return
-				}
-				src := ""
-				if rAddr != nil {
-					src = cleanSpoofHost(rAddr.String())
-				}
-				recordHit(src, buf[:n], "ICMP")
-			}
-		}()
-	}
-
-	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-		if tcpdumpBin, err := exec.LookPath("tcpdump"); err == nil {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				ctx, cancel := context.WithTimeout(context.Background(), duration)
-				defer cancel()
-				cmd := exec.CommandContext(ctx, tcpdumpBin, "-l", "-n", "-i", "any", "-c", "3", "icmp")
-				outBytes, _ := cmd.CombinedOutput()
-				outStr := string(outBytes)
-				if strings.Contains(outStr, "ICMP echo request") {
-					for _, cIP := range candidates {
-						if strings.Contains(outStr, cIP) {
-							recordDirectSourceIPMatch(cIP, "TCPDUMP_ICMP")
-						}
-					}
-				}
-			}()
-		}
-	}
-
-	if tcpRawConn, err := net.ListenPacket("ip4:tcp", "0.0.0.0"); err == nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer tcpRawConn.Close()
-			_ = tcpRawConn.SetDeadline(deadline)
-			buf := make([]byte, 4096)
-			for {
-				n, rAddr, rErr := tcpRawConn.ReadFrom(buf)
-				if rErr != nil {
-					return
-				}
-				if !bytes.Contains(buf[:n], []byte(magicPrefix+"|")) {
-					continue
-				}
-				src := ""
-				if rAddr != nil {
-					src = cleanSpoofHost(rAddr.String())
-				}
-				recordHit(src, buf[:n], "TCP")
-			}
-		}()
-	}
-
-	wg.Wait()
-	return res
-}
-
-func openTemporaryUDPVerifyListener(preferredPort int) (*net.UDPConn, int, func(), error) {
-	portsToTry := []int{preferredPort, 0}
-	var uConn *net.UDPConn
-	var boundPort int
-
-	for _, p := range portsToTry {
-		if p < 0 || p > 65535 {
+	var totalRx, totalTx uint64
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines[2:] {
+		colon := strings.Index(line, ":")
+		if colon < 0 {
 			continue
 		}
-		addr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort("0.0.0.0", strconv.Itoa(p)))
-		if err != nil {
+		iface := strings.TrimSpace(line[:colon])
+		if iface == "lo" ||
+			strings.HasPrefix(iface, "tun") ||
+			strings.HasPrefix(iface, "tap") ||
+			strings.HasPrefix(iface, "wg") ||
+			strings.HasPrefix(iface, "sahand-gre") ||
+			strings.HasPrefix(iface, "gre") ||
+			strings.HasPrefix(iface, "docker") ||
+			strings.HasPrefix(iface, "veth") ||
+			strings.HasPrefix(iface, "br-") {
 			continue
 		}
-		c, err := net.ListenUDP("udp4", addr)
-		if err == nil {
-			uConn = c
-			boundPort = c.LocalAddr().(*net.UDPAddr).Port
+		fields := strings.Fields(line[colon+1:])
+		if len(fields) < 9 {
+			continue
+		}
+		rx, err1 := strconv.ParseUint(fields[0], 10, 64)
+		tx, err2 := strconv.ParseUint(fields[8], 10, 64)
+		if err1 == nil && err2 == nil {
+			totalRx += rx
+			totalTx += tx
+		}
+	}
+	return totalRx, totalTx
+}
+
+func loadAnalytics() {
+	analyticsMu.Lock()
+	defer analyticsMu.Unlock()
+
+	raw, err := os.ReadFile(analyticsPath())
+	if err == nil {
+		_ = json.Unmarshal(raw, &analyticsData)
+	}
+	curRx, curTx := readPhysicalNetCounters()
+	analyticsData.LastRawRx = curRx
+	analyticsData.LastRawTx = curTx
+	ensure30DaysLocked()
+}
+
+func ensure30DaysLocked() {
+	now := masterNow()
+	byDate := make(map[string]DailyUsage, len(analyticsData.Days))
+	for _, d := range analyticsData.Days {
+		byDate[d.Date] = d
+	}
+	days := make([]DailyUsage, 0, 30)
+	for i := 29; i >= 0; i-- {
+		dateStr := now.AddDate(0, 0, -i).Format("2006-01-02")
+		if existing, ok := byDate[dateStr]; ok {
+			days = append(days, existing)
+		} else {
+			days = append(days, DailyUsage{Date: dateStr, RxBytes: 0, TxBytes: 0})
+		}
+	}
+	analyticsData.Days = days
+}
+
+func sampleAnalyticsTick() {
+	analyticsMu.Lock()
+	defer analyticsMu.Unlock()
+
+	ensure30DaysLocked()
+	curRx, curTx := readPhysicalNetCounters()
+	var deltaRx, deltaTx uint64
+	if curRx >= analyticsData.LastRawRx && analyticsData.LastRawRx > 0 {
+		deltaRx = curRx - analyticsData.LastRawRx
+	}
+	if curTx >= analyticsData.LastRawTx && analyticsData.LastRawTx > 0 {
+		deltaTx = curTx - analyticsData.LastRawTx
+	}
+	analyticsData.LastRawRx = curRx
+	analyticsData.LastRawTx = curTx
+
+	today := masterNow().Format("2006-01-02")
+	for i := range analyticsData.Days {
+		if analyticsData.Days[i].Date == today {
+			analyticsData.Days[i].RxBytes += deltaRx
+			analyticsData.Days[i].TxBytes += deltaTx
 			break
 		}
 	}
-	if uConn == nil {
-		return nil, 0, nil, errors.New("could not bind temporary UDP listener for spoof verification")
-	}
 
-	pStr := strconv.Itoa(boundPort)
-	addedIptables := false
-	if runtime.GOOS == "linux" && os.Geteuid() == 0 {
-		if _, err := exec.LookPath("iptables"); err == nil {
-			if exec.Command("iptables", "-C", "INPUT", "-p", "udp", "--dport", pStr, "-j", "ACCEPT").Run() != nil {
-				if exec.Command("iptables", "-I", "INPUT", "1", "-p", "udp", "--dport", pStr, "-j", "ACCEPT").Run() == nil {
-					addedIptables = true
+	if raw, err := json.MarshalIndent(analyticsData, "", "  "); err == nil {
+		_ = os.WriteFile(analyticsPath(), raw, 0600)
+	}
+}
+
+func allocateNonCollidingTunnelsForNewPeer(existing []ServerPeer, peerID, remoteIP string) []TunnelConfig {
+	usedListenPorts := make(map[int]bool)
+	usedForwardPorts := make(map[int]bool)
+	for _, srv := range existing {
+		for _, t := range srv.Tunnels {
+			if t.ListenPort > 0 {
+				usedListenPorts[t.ListenPort] = true
+			}
+			for _, fpStr := range parsePortList(t.ForwardPorts) {
+				if p, err := strconv.Atoi(fpStr); err == nil && p > 0 {
+					usedForwardPorts[p] = true
 				}
 			}
 		}
 	}
 
-	cleanup := func() {
-		_ = uConn.Close()
-		if addedIptables {
-			_ = exec.Command("iptables", "-D", "INPUT", "-p", "udp", "--dport", pStr, "-j", "ACCEPT").Run()
-		}
-	}
-	return uConn, boundPort, cleanup, nil
-}
-
-type spoofCapWireMsg struct {
-	Step         string               `json:"step"`
-	CandidateIPs []string             `json:"candidate_ips,omitempty"`
-	ProbePort    int                  `json:"probe_port,omitempty"`
-	MagicHex     string               `json:"magic_hex,omitempty"`
-	MasterPubIP  string               `json:"master_pub_ip,omitempty"`
-	CheckResult  *SpoofDirectionCheck `json:"check_result,omitempty"`
-}
-
-func buildDirectionVerdict(candidates []string, sentCount int, capRes multiProtoCaptureResult, senderLabel, receiverLabel string) SpoofDirectionCheck {
-	testedStr := strings.Join(candidates, ", ")
-	chk := SpoofDirectionCheck{
-		SpoofIPTested:   testedStr,
-		PacketsSent:     sentCount,
-		PacketsReceived: capRes.PacketsReceived,
-	}
-
-	protos := strings.Join(capRes.WorkingProtocols, ", ")
-	ips := strings.Join(capRes.WorkingSpoofIPs, ", ")
-
-	if capRes.ExternalSupported {
-		chk.Supported = true
-		chk.StatusBadge = fmt.Sprintf("SUPPORTED (%s)", protos)
-		chk.ObservedSourceIP = ips
-		chk.Detail = fmt.Sprintf("%s can send spoofed packets! %s received forged packets from [%s] via [%s].",
-			senderLabel, receiverLabel, ips, protos)
-		return chk
-	}
-
-	if capRes.SameSub24Supported {
-		chk.Supported = true
-		chk.StatusBadge = fmt.Sprintf("SAME-/24 SUBNET SUPPORTED (%s)", protos)
-		chk.ObservedSourceIP = ips
-		chk.Detail = fmt.Sprintf("%s blocks external spoofing, but SAME-/24 SUBNET SPOOFING WORKS! Working IP(s): [%s] via [%s].",
-			senderLabel, ips, protos)
-		return chk
-	}
-
-	if capRes.NATRewrittenTo != "" {
-		chk.Supported = false
-		chk.StatusBadge = "REWRITTEN BY NAT"
-		chk.ObservedSourceIP = capRes.NATRewrittenTo
-		chk.Detail = fmt.Sprintf("Spoofed packets left %s, but an upstream NAT rewrote the source IP back to %s before reaching %s.",
-			senderLabel, capRes.NATRewrittenTo, receiverLabel)
-		return chk
-	}
-
-	if capRes.OwnIPReceived {
-		chk.Supported = false
-		chk.StatusBadge = "BLOCKED (ISP/DATACENTER)"
-		chk.Detail = fmt.Sprintf("Baseline Real-IP reached %s OK, but 0 spoofed packets (tested candidates: [%s]) left %s. Datacenter enforces strict BCP38 anti-spoofing.",
-			receiverLabel, testedStr, senderLabel, senderLabel)
-		return chk
-	}
-
-	chk.Supported = false
-	chk.StatusBadge = "PORT / FIREWALL BLOCKED"
-	chk.Detail = fmt.Sprintf("Even unspoofed packets from %s's own real IP did not reach %s. Check firewall / security group on %s.",
-		senderLabel, receiverLabel, receiverLabel)
-	return chk
-}
-
-func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofWGRuntime) {
-	_ = conn.SetDeadline(time.Now().Add(26 * time.Second))
-	dec := json.NewDecoder(conn)
-	enc := json.NewEncoder(conn)
-
-	var initMsg spoofCapWireMsg
-	if err := dec.Decode(&initMsg); err != nil || initMsg.Step != "init" {
-		return
-	}
-
-	preferredPort := defaultSpoofPort
-	if rt != nil && rt.tunnel.SpoofWG != nil && rt.tunnel.SpoofWG.SpoofListenPort > 0 {
-		preferredPort = rt.tunnel.SpoofWG.SpoofListenPort
-	}
-	uConn, boundPort, cleanup, err := openTemporaryUDPVerifyListener(preferredPort)
-	if err != nil {
-		_ = enc.Encode(spoofCapWireMsg{
-			Step: "result",
-			CheckResult: &SpoofDirectionCheck{
-				Supported:   false,
-				StatusBadge: "ERROR",
-				Detail:      err.Error(),
-			},
-		})
-		return
-	}
-	defer cleanup()
-
-	candidates := buildSpoofProbeSuite(remoteMasterIP, initMsg.CandidateIPs)
-	magicPrefix1 := "SPFV1_" + initMsg.MagicHex
-
-	capCh1 := make(chan multiProtoCaptureResult, 1)
-	go func() {
-		capCh1 <- captureMultiProtocolProbes(uConn, magicPrefix1, candidates, 3800*time.Millisecond)
-	}()
-
-	if err := enc.Encode(spoofCapWireMsg{
-		Step:        "ready",
-		ProbePort:   boundPort,
-		MasterPubIP: remoteMasterIP,
-	}); err != nil {
-		return
-	}
-
-	capRes1 := <-capCh1
-	cleanup()
-
-	chk1 := buildDirectionVerdict(candidates, len(candidates)*8, capRes1, "Master (Iran)", "Agent (Foreign)")
-	if err := enc.Encode(spoofCapWireMsg{
-		Step:        "result",
-		CheckResult: &chk1,
-	}); err != nil {
-		return
-	}
-
-	var phase2Msg spoofCapWireMsg
-	if err := dec.Decode(&phase2Msg); err != nil || phase2Msg.Step != "send_now" {
-		return
-	}
-	targetMasterIP := cleanSpoofHost(phase2Msg.MasterPubIP)
-	if !isValidIPv4String(targetMasterIP) {
-		targetMasterIP = cleanSpoofHost(remoteMasterIP)
-	}
-	agentOwnIP := resolveOutboundInterfaceIP(targetMasterIP).String()
-	candidates2 := buildSpoofProbeSuite(agentOwnIP, phase2Msg.CandidateIPs)
-	magicPrefix2 := "SPFV2_" + phase2Msg.MagicHex
-
-	sent2 := sendMultiMethodCapabilityProbes(candidates2, targetMasterIP, phase2Msg.ProbePort, magicPrefix2)
-
-	_ = enc.Encode(spoofCapWireMsg{
-		Step:        "result",
-		ProbePort:   sent2,
-		MasterPubIP: agentOwnIP,
-	})
-}
-
-func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []string) (SpoofCapabilityReport, error) {
-	var tc26 TunnelConfig
-	found := false
-	for _, t := range peer.Tunnels {
-		if t.ID == 26 {
-			tc26 = t
-			found = true
+	slot := 0
+	for slot < 25 {
+		e1Base := 28000 + slot*1000
+		e2Base := 32000 + slot*1000
+		if e2Base+30 > 65000 {
 			break
 		}
+		conflict := false
+		for id := 1; id <= 30; id++ {
+			if usedListenPorts[e1Base+id] || usedForwardPorts[e2Base+id] {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			break
+		}
+		slot++
 	}
-	if !found {
-		tc26 = TunnelConfig{ID: 26, ListenPort: 28026}
+
+	e1Base := 28000 + slot*1000
+	e2Base := 32000 + slot*1000
+	tunnels := defaultTunnelsForServer()
+	cidr, mIP, aIP := deriveDefaultSlash30ForPeer(peerID)
+
+	for i := range tunnels {
+		id := tunnels[i].ID
+		tunnels[i].ListenPort = e1Base + id
+		tunnels[i].ForwardPorts = strconv.Itoa(e2Base + id)
+
+		if id == 25 && tunnels[i].GREFRP != nil {
+			tunnels[i].GREFRP.PrivateSubnetCIDR = cidr
+			tunnels[i].GREFRP.LocalPrivateIP = mIP
+			tunnels[i].GREFRP.RemotePrivateIP = aIP
+			tunnels[i].GREFRP.RemotePublicIP = remoteIP
+			if len(peerID) >= 6 {
+				tunnels[i].GREFRP.GREInterfaceName = "gre-" + peerID[:6]
+			}
+			tunnels[i].GREFRP.RouteConfig = fmt.Sprintf("%s via %s", cidr, tunnels[i].GREFRP.GREInterfaceName)
+			tunnels[i].GREFRP.FRPServerPort = tunnels[i].ListenPort
+			tunnels[i].GREFRP.ForwardingRules = buildGREFRPRulesFromCSV(
+				tunnels[i].ForwardPorts,
+				tunnels[i].GREFRP.FRPEncryption,
+				tunnels[i].GREFRP.FRPCompression,
+				tunnels[i].GREFRP.FRPProxyProtoV2,
+			)
+		}
+
+		if id == 26 && tunnels[i].SpoofWG != nil {
+			tunnels[i].SpoofWG.Role = "local"
+			tunnels[i].SpoofWG.PeerPublicIP = remoteIP
+			if slot > 0 {
+				subnetOctet := (20 + slot) % 250
+				if subnetOctet <= 0 {
+					subnetOctet = 21
+				}
+				tunnels[i].SpoofWG.WGLocalIP = fmt.Sprintf("10.%d.0.1", subnetOctet)
+				tunnels[i].SpoofWG.WGPeerIP = fmt.Sprintf("10.%d.0.2", subnetOctet)
+				tunnels[i].SpoofWG.SpoofListenPort = defaultSpoofPort + slot
+				tunnels[i].SpoofWG.RecvPort = defaultRecvPort + slot
+				tunnels[i].SpoofWG.CorePort = defaultCorePort + slot
+				tunnels[i].SpoofWG.WGListen = defaultWGListen + slot
+			}
+			tunnels[i].SpoofWG = normalizeSpoofWGConfig(tunnels[i].SpoofWG)
+		}
+
+		if id == 27 && tunnels[i].SpoofNative != nil {
+			tunnels[i].SpoofNative.Role = "local"
+			tunnels[i].SpoofNative.PeerPublicIP = remoteIP
+			if slot > 0 {
+				subnetOctet := (27 + slot) % 250
+				if subnetOctet <= 0 || subnetOctet == 20 {
+					subnetOctet = 28
+				}
+				tunnels[i].SpoofNative.WGLocalIP = fmt.Sprintf("10.%d.0.1", subnetOctet)
+				tunnels[i].SpoofNative.WGPeerIP = fmt.Sprintf("10.%d.0.2", subnetOctet)
+				tunnels[i].SpoofNative.SpoofListenPort = defaultM27SpoofPort + slot
+				tunnels[i].SpoofNative.RecvPort = defaultM27RecvPort + slot
+				tunnels[i].SpoofNative.CorePort = defaultM27CorePort + slot
+				tunnels[i].SpoofNative.AdapterPort = defaultM27AdaptPort + slot
+			}
+			tunnels[i].SpoofNative = normalizeSpoofNativeConfig(tunnels[i].SpoofNative)
+		}
+	}
+
+	return tunnels
+}
+
+func runServer() error {
+	cfg, exists, err := loadExistingConfig(configPath())
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("configuration file does not exist; run the installer first")
+	}
+	if cfg.Role != "master" && cfg.Role != "agent" {
+		return errors.New("invalid role in configuration")
+	}
+	if cfg.NodeID == "" {
+		return errors.New("node ID is missing from configuration")
+	}
+	if cfg.PanelPort < 1024 || cfg.PanelPort > 65535 {
+		return errors.New("invalid panel port in configuration")
+	}
+	if cfg.ListenAddr == "" {
+		cfg.ListenAddr = fmt.Sprintf(":%d", cfg.PanelPort)
+	}
+	if cfg.AdminUsername == "" || cfg.AdminSalt == "" || cfg.AdminHash == "" {
+		return errors.New("administrator credentials are missing")
+	}
+
+	if changed, err := ensureCryptoMaterial(&cfg); err != nil {
+		return err
+	} else if changed {
+		_ = saveConfig(configPath(), cfg)
+	}
+
+	stateMu.Lock()
+	appCfg = cfg
+	stateMu.Unlock()
+
+	loadAnalytics()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			sampleAnalyticsTick()
+		}
+	}()
+
+	for _, srv := range cfg.Servers {
+		syncServerListeners(srv)
+		if srv.Running {
+			startDiscoveryLoop(srv.ID)
+		}
+	}
+
+	distFS, err := fs.Sub(webAssets, "web/dist")
+	if err != nil {
+		return fmt.Errorf("frontend assets are missing: %w", err)
+	}
+	assetFS, err := fs.Sub(distFS, "assets")
+	if err != nil {
+		return fmt.Errorf("frontend assets directory is missing: %w", err)
+	}
+	assetServer := http.FileServer(http.FS(assetFS))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/health", handleHealth)
+	mux.HandleFunc("/login", handleLogin)
+	mux.HandleFunc("/logout", requireAuth(handleLogout))
+	mux.HandleFunc("/api/v1/node", requireAuth(handleNode))
+	mux.HandleFunc("/api/v1/state", requireAuth(handleState))
+	mux.HandleFunc("/api/v1/servers", requireAuth(handleServers))
+	mux.HandleFunc("/api/v1/servers/action", requireAuth(handleServerAction))
+	mux.HandleFunc("/api/v1/tunnels", requireAuth(handleTunnelsUpdate))
+	mux.HandleFunc("/api/v1/tunnels/ports", requireAuth(handleBatchPortsUpdate))
+	mux.HandleFunc("/api/v1/tunnels/ping", requireAuth(handleTunnelPing))
+	mux.HandleFunc("/api/v1/tunnels/gre-frp", requireAuth(handleGREFRPAction))
+	mux.HandleFunc("/api/v1/tunnels/spoof-wg", requireAuth(handleSpoofWGAction))
+	mux.HandleFunc("/api/v1/tunnels/spoof-native", requireAuth(handleSpoofNativeAction))
+	mux.HandleFunc("/api/v1/tunnels/spoof-capability", requireAuth(handleSpoofCapabilityVerify))
+	mux.HandleFunc("/api/v1/analytics", requireAuth(handleAnalytics))
+
+	mux.HandleFunc("/assets/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		http.StripPrefix("/assets/", assetServer).ServeHTTP(w, r)
+	}))
+	mux.HandleFunc("/", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		handleDashboard(w, r, distFS)
+	}))
+
+	server := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	log.Printf("%s %s starting on %s", AppName, AppVersion, cfg.ListenAddr)
+	if cfg.PanelURL != "" {
+		log.Printf("Public panel: %s", cfg.PanelURL)
+	} else {
+		log.Printf("Panel is available on port %d (HTTP mode)", cfg.PanelPort)
+	}
+	return server.ListenAndServe()
+}
+
+func handleNode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	stateMu.RLock()
+	fp, _ := ComputeSigningKeyFingerprint(appCfg.MasterSigningPublicKey)
+	info := NodeInfo{
+		AppVersion:                  AppVersion,
+		Role:                        appCfg.Role,
+		NodeID:                      appCfg.NodeID,
+		Status:                      "online",
+		PanelURL:                    appCfg.PanelURL,
+		MasterSigningPublicKey:      appCfg.MasterSigningPublicKey,
+		MasterNoiseStaticPublicKey:  appCfg.MasterNoiseStaticPublicKey,
+		MasterSigningKeyFingerprint: fp,
+		AgentSigningPublicKey:       appCfg.AgentSigningPublicKey,
+		AgentNoiseStaticPublicKey:   appCfg.AgentNoiseStaticPublicKey,
+	}
+	stateMu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(info)
+}
+
+func handleState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	mTime := formatMasterClock(masterNow())
+	testerView := getSpoofTesterStatusView()
+	m27TesterView := getSpoofM27TesterStatusView()
+
+	stateMu.RLock()
+	serversCopy := make([]ServerPeer, len(appCfg.Servers))
+	spoofCapMap := make(map[string]SpoofCapabilityReport, len(appCfg.Servers))
+	for i, srv := range appCfg.Servers {
+		srvCopy := srv
+		spoofCapMap[srv.ID] = getSpoofCapabilityReport(srv.ID)
+		tunnelsCopy := make([]TunnelConfig, len(srv.Tunnels))
+		copy(tunnelsCopy, srv.Tunnels)
+		for j := range tunnelsCopy {
+			if tunnelsCopy[j].ID == 25 {
+				gf := normalizeGREFRPConfig(tunnelsCopy[j].GREFRP, tunnelsCopy[j].ListenPort, tunnelsCopy[j].ForwardPorts)
+				if diag, ok := GetGREFRPDiagnostics(srv.ID); ok {
+					gf.Diagnostics = diag
+				}
+				tunnelsCopy[j].GREFRP = gf
+			}
+			if tunnelsCopy[j].ID == 26 {
+				swg := normalizeSpoofWGConfig(tunnelsCopy[j].SpoofWG)
+				if swg.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					swg.PeerPublicIP = srv.IP
+				}
+				swg.Health = querySpoofWGRuntimeHealth(swg)
+				swg.Tester = testerView
+				tunnelsCopy[j].SpoofWG = swg
+			}
+			if tunnelsCopy[j].ID == 27 {
+				sn := normalizeSpoofNativeConfig(tunnelsCopy[j].SpoofNative)
+				if sn.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					sn.PeerPublicIP = srv.IP
+				}
+				sn.Health = querySpoofNativeRuntimeHealth(srv.ID, sn)
+				sn.Tester = m27TesterView
+				tunnelsCopy[j].SpoofNative = sn
+			}
+		}
+		srvCopy.Tunnels = tunnelsCopy
+		serversCopy[i] = srvCopy
+	}
+	role := appCfg.Role
+	nodeID := appCfg.NodeID
+	mSignPub := appCfg.MasterSigningPublicKey
+	mNoisePub := appCfg.MasterNoiseStaticPublicKey
+	aSignPub := appCfg.AgentSigningPublicKey
+	aNoisePub := appCfg.AgentNoiseStaticPublicKey
+	trustedMasterSignPub := appCfg.TrustedMasterSigningPublicKey
+	stateMu.RUnlock()
+
+	mFP, _ := ComputeSigningKeyFingerprint(mSignPub)
+	if mFP == "" && trustedMasterSignPub != "" {
+		mFP, _ = ComputeSigningKeyFingerprint(trustedMasterSignPub)
+	}
+
+	payload := struct {
+		AppVersion                  string                           `json:"app_version"`
+		Role                        string                           `json:"role"`
+		NodeID                      string                           `json:"node_id"`
+		ServerTime                  string                           `json:"server_time"`
+		MasterSigningPublicKey      string                           `json:"master_signing_public_key,omitempty"`
+		MasterNoiseStaticPublicKey  string                           `json:"master_noise_static_public_key,omitempty"`
+		MasterSigningKeyFingerprint string                           `json:"master_signing_key_fingerprint,omitempty"`
+		AgentSigningPublicKey       string                           `json:"agent_signing_public_key,omitempty"`
+		AgentNoiseStaticPublicKey   string                           `json:"agent_noise_static_public_key,omitempty"`
+		Servers                     []ServerPeer                     `json:"servers"`
+		SpoofCapabilities           map[string]SpoofCapabilityReport `json:"spoof_capabilities"`
+		Catalogue                   []MethodCatalogueItem            `json:"catalogue"`
+	}{
+		AppVersion:                  AppVersion,
+		Role:                        role,
+		NodeID:                      nodeID,
+		ServerTime:                  mTime,
+		MasterSigningPublicKey:      mSignPub,
+		MasterNoiseStaticPublicKey:  mNoisePub,
+		MasterSigningKeyFingerprint: mFP,
+		AgentSigningPublicKey:       aSignPub,
+		AgentNoiseStaticPublicKey:   aNoisePub,
+		Servers:                     serversCopy,
+		SpoofCapabilities:           spoofCapMap,
+		Catalogue:                   methodCatalogue,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func handleSpoofCapabilityVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string   `json:"server_id"`
+		SpoofIP  string   `json:"spoof_ip,omitempty"`
+		SpoofIPs []string `json:"spoof_ips,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
 	}
 
 	stateMu.RLock()
-	cfgSnapshot := appCfg
+	var peerSnapshot *ServerPeer
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			cp := appCfg.Servers[i]
+			peerSnapshot = &cp
+			break
+		}
+	}
 	stateMu.RUnlock()
 
-	subKey, err := derivePeerSubKey(cfgSnapshot, peer, "spoof-wg-carrier-v1")
-	if err != nil {
-		return SpoofCapabilityReport{}, err
+	if peerSnapshot == nil {
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
 	}
 
-	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
-	rawConn, err := dialer.Dial("tcp", net.JoinHostPort(strings.TrimSpace(peer.IP), strconv.Itoa(tc26.ListenPort)))
-	if err != nil {
-		return SpoofCapabilityReport{}, fmt.Errorf("could not reach Agent on port %d to coordinate spoof test: %w", tc26.ListenPort, err)
+	var candidateIPs []string
+	if len(req.SpoofIPs) > 0 {
+		candidateIPs = req.SpoofIPs
+	} else if strings.TrimSpace(req.SpoofIP) != "" {
+		for _, p := range strings.Split(req.SpoofIP, ",") {
+			if clean := cleanSpoofHost(p); isValidIPv4String(clean) {
+				candidateIPs = append(candidateIPs, clean)
+			}
+		}
 	}
-	defer rawConn.Close()
-	_ = rawConn.SetDeadline(time.Now().Add(26 * time.Second))
-
-	tlsConn := tls.Client(rawConn, &tls.Config{
-		ServerName:         "www.speedtest.net",
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS12,
-	})
-	if err := tlsConn.Handshake(); err != nil {
-		return SpoofCapabilityReport{}, err
-	}
-	defer tlsConn.Close()
-
-	nonce, _ := randomHex(12)
-	hdr := spoofWGWireHeader{
-		Magic:      spoofWGMagic,
-		Cmd:        spoofWGCmdVerifyCap,
-		PeerID:     peer.ID,
-		TargetPort: tc26.ListenPort,
-		TimeHdr:    buildMasterTimeHeader(),
-		Nonce:      nonce,
-	}
-	hdr.MAC = computeSpoofWGHeaderMAC(subKey, hdr)
-	rawHdr, _ := json.Marshal(hdr)
-
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(rawHdr)))
-	if _, err := tlsConn.Write(lenBuf[:]); err != nil {
-		return SpoofCapabilityReport{}, err
-	}
-	if _, err := tlsConn.Write(rawHdr); err != nil {
-		return SpoofCapabilityReport{}, err
-	}
-
-	var status [1]byte
-	if _, err := io.ReadFull(tlsConn, status[:]); err != nil || status[0] != 0x00 {
-		return SpoofCapabilityReport{}, errors.New("Agent rejected spoof capability verification session (ensure Agent is updated)")
-	}
-
-	dec := json.NewDecoder(tlsConn)
-	enc := json.NewEncoder(tlsConn)
-
-	// Phase 1: Master -> Agent
-	magicHex1, _ := randomHex(6)
-	candidates1 := buildSpoofProbeSuite(peer.IP, candidateIPs)
-
-	if err := enc.Encode(spoofCapWireMsg{
-		Step:         "init",
-		CandidateIPs: candidates1,
-		MagicHex:     magicHex1,
-	}); err != nil {
-		return SpoofCapabilityReport{}, err
-	}
-
-	var readyMsg spoofCapWireMsg
-	if err := dec.Decode(&readyMsg); err != nil || readyMsg.Step != "ready" {
-		return SpoofCapabilityReport{}, errors.New("Agent did not ready spoof listener")
-	}
-
-	masterPubIP := cleanSpoofHost(readyMsg.MasterPubIP)
-	if tc26.SpoofWG != nil && isValidIPv4String(tc26.SpoofWG.LocalPublicIP) {
-		masterPubIP = cleanSpoofHost(tc26.SpoofWG.LocalPublicIP)
-	}
-	magicPrefix1 := "SPFV1_" + magicHex1
-
-	sent1 := sendMultiMethodCapabilityProbes(candidates1, strings.TrimSpace(peer.IP), readyMsg.ProbePort, magicPrefix1)
-
-	var resMsg1 spoofCapWireMsg
-	if err := dec.Decode(&resMsg1); err != nil || resMsg1.CheckResult == nil {
-		return SpoofCapabilityReport{}, errors.New("failed to read Master->Agent spoof verification result")
-	}
-	m2a := *resMsg1.CheckResult
-	if sent1 > 0 {
-		m2a.PacketsSent = sent1
-	}
-
-	// Phase 2: Agent -> Master
-	preferredRecvPort := defaultRecvPort
-	if tc26.SpoofWG != nil && tc26.SpoofWG.RecvPort > 0 {
-		preferredRecvPort = tc26.SpoofWG.RecvPort
-	}
-	uConn2, boundPort2, cleanup2, err := openTemporaryUDPVerifyListener(preferredRecvPort)
-	if err != nil {
-		return SpoofCapabilityReport{}, err
-	}
-	defer cleanup2()
-
-	magicHex2, _ := randomHex(6)
-	magicPrefix2 := "SPFV2_" + magicHex2
-	candidates2 := buildSpoofProbeSuite(masterPubIP, candidateIPs)
-
-	capCh2 := make(chan multiProtoCaptureResult, 1)
-	go func() {
-		capCh2 <- captureMultiProtocolProbes(uConn2, magicPrefix2, candidates2, 3800*time.Millisecond)
-	}()
-
-	if err := enc.Encode(spoofCapWireMsg{
-		Step:         "send_now",
-		CandidateIPs: candidates2,
-		ProbePort:    boundPort2,
-		MagicHex:     magicHex2,
-		MasterPubIP:  masterPubIP,
-	}); err != nil {
-		return SpoofCapabilityReport{}, err
-	}
-
-	var resMsg2 spoofCapWireMsg
-	_ = dec.Decode(&resMsg2)
-	capRes2 := <-capCh2
-	cleanup2()
-
-	sent2 := resMsg2.ProbePort
-	if sent2 <= 0 {
-		sent2 = len(candidates2) * 8
-	}
-	a2m := buildDirectionVerdict(candidates2, sent2, capRes2, "Agent (Foreign)", "Master (Iran)")
-
-	overallOK := m2a.Supported && a2m.Supported
-	badge := "SPOOFING SUPPORTED ON BOTH SERVERS"
-	summary := fmt.Sprintf("Both Master (%s) and Agent (%s) passed multi-method spoof verification!",
-		m2a.StatusBadge, a2m.StatusBadge)
-
-	if !overallOK {
-		switch {
-		case !m2a.Supported && !a2m.Supported:
-			badge = "SPOOFING BLOCKED ON BOTH SERVERS"
-			summary = fmt.Sprintf("Tested candidate IPs [%s] via iptables SNAT+ping, tcpdump icmp, and raw ICMP/TCP/UDP: both datacenters dropped all spoofed packets.",
-				strings.Join(candidates1, ", "))
-		case !m2a.Supported:
-			badge = "MASTER (IRAN) BLOCKS SPOOFING (AGENT OK)"
-			summary = fmt.Sprintf("Agent supports spoofing (%s), but Master dropped spoofed packets (%s).",
-				a2m.StatusBadge, m2a.StatusBadge)
-		default:
-			badge = "AGENT (FOREIGN) BLOCKS SPOOFING (MASTER OK)"
-			summary = fmt.Sprintf("Master supports spoofing (%s), but Agent dropped spoofed packets (%s).",
-				m2a.StatusBadge, a2m.StatusBadge)
+	if len(candidateIPs) == 0 {
+		for _, tc := range peerSnapshot.Tunnels {
+			if tc.ID == 27 && tc.SpoofNative != nil {
+				candidateIPs = append(candidateIPs, tc.SpoofNative.SpoofIPs...)
+			}
+			if tc.ID == 26 && tc.SpoofWG != nil {
+				candidateIPs = append(candidateIPs, tc.SpoofWG.SpoofIPs...)
+			}
 		}
 	}
 
-	report := SpoofCapabilityReport{
-		Tested:           true,
-		OverallSupported: overallOK,
-		OverallBadge:     badge,
-		Summary:          summary,
-		MasterToAgent:    m2a,
-		AgentToMaster:    a2m,
-		TestedAt:         formatMasterClockSec(masterNow()),
+	rep, err := RunBidirectionalSpoofCapabilityVerify(*peerSnapshot, candidateIPs)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	setSpoofCapabilityReport(peer.ID, report)
-	return report, nil
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK     bool                  `json:"ok"`
+		Report SpoofCapabilityReport `json:"report"`
+	}{
+		OK:     true,
+		Report: rep,
+	})
 }
+
+func handleServers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name                 string `json:"name"`
+		IP                   string `json:"ip"`
+		Token                string `json:"token"`
+		MasterKeyFingerprint string `json:"master_key_fingerprint"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.Lock()
+	role := appCfg.Role
+	if role == "master" {
+		name := strings.TrimSpace(req.Name)
+		ip := strings.TrimSpace(req.IP)
+		if name == "" || ip == "" {
+			stateMu.Unlock()
+			http.Error(w, "server name and agent IP are required", http.StatusBadRequest)
+			return
+		}
+		peerID, _ := randomHex(8)
+		peerSecret, err := randomHex(32)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, "could not generate peer secret", http.StatusInternalServerError)
+			return
+		}
+		tunnels := allocateNonCollidingTunnelsForNewPeer(appCfg.Servers, peerID, ip)
+
+		peer := ServerPeer{
+			ID:                         peerID,
+			Name:                       name,
+			IP:                         ip,
+			PeerSecret:                 peerSecret,
+			MasterSigningPublicKey:     appCfg.MasterSigningPublicKey,
+			MasterNoiseStaticPublicKey: appCfg.MasterNoiseStaticPublicKey,
+			ConfigVersion:              1,
+			SyncState:                  "synced",
+			Status:                     "WAITING",
+			Running:                    false,
+			RecentLifelines:            []LifelineEvent{},
+			Tunnels:                    tunnels,
+		}
+		tok, err := generatePeerToken(appCfg, peer)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, "could not generate token", http.StatusInternalServerError)
+			return
+		}
+		peer.Token = tok
+		appCfg.Servers = append(appCfg.Servers, peer)
+		_ = saveConfig(configPath(), appCfg)
+		stateMu.Unlock()
+
+		syncServerListeners(peer)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(peer)
+		return
+	}
+
+	ip := strings.TrimSpace(req.IP)
+	rawToken := strings.TrimSpace(req.Token)
+	if ip == "" || rawToken == "" {
+		stateMu.Unlock()
+		http.Error(w, "master IP and connection token are required", http.StatusBadRequest)
+		return
+	}
+
+	var prevPeerID string
+	if len(appCfg.Servers) > 0 {
+		prevPeerID = appCfg.Servers[0].ID
+	}
+
+	fpToVerify := strings.TrimSpace(req.MasterKeyFingerprint)
+	if fpToVerify == "" {
+		if appCfg.TrustedMasterSigningPublicKey != "" {
+			fpToVerify, _ = ComputeSigningKeyFingerprint(appCfg.TrustedMasterSigningPublicKey)
+		} else if tp, pErr := parseAndValidateToken(rawToken); pErr == nil {
+			fpToVerify, _ = ComputeSigningKeyFingerprint(tp.MasterSigningPublicKey)
+		}
+	}
+
+	peer, err := VerifyAndEstablishInitialTrust(&appCfg, ip, rawToken, fpToVerify)
+	if err != nil {
+		stateMu.Unlock()
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	stateMu.Unlock()
+
+	if prevPeerID != "" && prevPeerID != peer.ID {
+		stopDiscoveryLoop(prevPeerID)
+		stopAllServerListeners(prevPeerID)
+	}
+	syncServerListeners(peer)
+	startDiscoveryLoop(peer.ID)
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(peer)
+}
+
+func handleServerAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string `json:"server_id"`
+		Action   string `json:"action"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if req.Action == "next_method" {
+		stateMu.RLock()
+		role := appCfg.Role
+		stateMu.RUnlock()
+		if role != "master" {
+			http.Error(w, "only master can switch methods", http.StatusForbidden)
+			return
+		}
+		switched, msg, err := switchNextMethod(req.ServerID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			OK       bool   `json:"ok"`
+			Switched bool   `json:"switched"`
+			Message  string `json:"message"`
+		}{
+			OK:       true,
+			Switched: switched,
+			Message:  msg,
+		})
+		return
+	}
+
+	stateMu.Lock()
+	idx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	switch req.Action {
+	case "play":
+		appCfg.Servers[idx].Running = true
+		appCfg.Servers[idx].Status = "TESTING"
+		appCfg.Servers[idx].ActiveMethodID = 0
+		appCfg.Servers[idx].ActiveMethod = ""
+		appCfg.Servers[idx].NextRetryAt = ""
+		peer := appCfg.Servers[idx]
+		_ = saveConfig(configPath(), appCfg)
+		stateMu.Unlock()
+		syncServerListeners(peer)
+		startDiscoveryLoop(peer.ID)
+
+	case "pause":
+		appCfg.Servers[idx].Running = false
+		appCfg.Servers[idx].Status = "PAUSED"
+		appCfg.Servers[idx].NextRetryAt = ""
+		peerID := appCfg.Servers[idx].ID
+		_ = saveConfig(configPath(), appCfg)
+		stateMu.Unlock()
+		stopDiscoveryLoop(peerID)
+
+	case "regen_token":
+		if appCfg.Role != "master" {
+			stateMu.Unlock()
+			http.Error(w, "only master can generate tokens", http.StatusForbidden)
+			return
+		}
+		newSecret, sErr := randomHex(32)
+		if sErr != nil {
+			stateMu.Unlock()
+			http.Error(w, "failed to generate peer secret", http.StatusInternalServerError)
+			return
+		}
+		appCfg.Servers[idx].PeerSecret = newSecret
+		appCfg.Servers[idx].ConfigVersion++
+		tok, err := generatePeerToken(appCfg, appCfg.Servers[idx])
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, "failed to generate token", http.StatusInternalServerError)
+			return
+		}
+		appCfg.Servers[idx].Token = tok
+		_ = saveConfig(configPath(), appCfg)
+		stateMu.Unlock()
+
+	case "delete":
+		peerID := appCfg.Servers[idx].ID
+		appCfg.Servers = append(appCfg.Servers[:idx], appCfg.Servers[idx+1:]...)
+		_ = saveConfig(configPath(), appCfg)
+		stateMu.Unlock()
+		stopDiscoveryLoop(peerID)
+		stopAllServerListeners(peerID)
+
+	default:
+		stateMu.Unlock()
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+func handleTunnelPing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string `json:"server_id"`
+		MethodID int    `json:"method_id"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.RLock()
+	var peerSnapshot *ServerPeer
+	var tcSnapshot *TunnelConfig
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			cp := appCfg.Servers[i]
+			peerSnapshot = &cp
+			for j := range cp.Tunnels {
+				if cp.Tunnels[j].ID == req.MethodID {
+					tc := cp.Tunnels[j]
+					tcSnapshot = &tc
+					break
+				}
+			}
+			break
+		}
+	}
+	stateMu.RUnlock()
+
+	if peerSnapshot == nil || tcSnapshot == nil {
+		http.Error(w, "server or tunnel method not found", http.StatusNotFound)
+		return
+	}
+
+	res := probeSingleMethod(*peerSnapshot, *tcSnapshot)
+
+	stateMu.Lock()
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			for j := range appCfg.Servers[i].Tunnels {
+				if appCfg.Servers[i].Tunnels[j].ID == req.MethodID {
+					appCfg.Servers[i].Tunnels[j].LastDiscovery = res
+					break
+				}
+			}
+			if res.Success && appCfg.Servers[i].ActiveMethodID == req.MethodID {
+				appCfg.Servers[i].ActiveLatencyMS = res.LatencyMS
+			}
+			_ = saveConfig(configPath(), appCfg)
+			break
+		}
+	}
+	stateMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK     bool         `json:"ok"`
+		Result MethodResult `json:"result"`
+	}{
+		OK:     true,
+		Result: res,
+	})
+}
+
+func handleGREFRPAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string `json:"server_id"`
+		Action   string `json:"action"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	msg, err := ExecuteGREFRPServiceAction(req.ServerID, req.Action)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	diag, _ := GetGREFRPDiagnostics(req.ServerID)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK          bool              `json:"ok"`
+		Message     string            `json:"message"`
+		Diagnostics GREFRPDiagnostics `json:"diagnostics"`
+	}{
+		OK:          true,
+		Message:     msg,
+		Diagnostics: diag,
+	})
+}
+
+func handleSpoofWGAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID  string              `json:"server_id"`
+		Action    string              `json:"action"`
+		Bundle    string              `json:"bundle,omitempty"`
+		SpoofWG   *SpoofWGConfig      `json:"spoof_wg,omitempty"`
+		TesterReq *SpoofTesterRequest `json:"tester_req,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	var installedMsg string
+	if action == "install_binary" {
+		m, err := installOfficialSpoofBinary()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		installedMsg = m
+	}
+
+	stateMu.Lock()
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	tIdx := -1
+	for i := range srv.Tunnels {
+		if srv.Tunnels[i].ID == 26 {
+			tIdx = i
+			break
+		}
+	}
+	if tIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "Method 26 (Spoof + WireGuard) not found", http.StatusNotFound)
+		return
+	}
+
+	cur := normalizeSpoofWGConfig(srv.Tunnels[tIdx].SpoofWG)
+	if req.SpoofWG != nil {
+		edited := *req.SpoofWG
+		if edited.WGPrivKey == "" {
+			edited.WGPrivKey = cur.WGPrivKey
+		}
+		if edited.WGPubKey == "" {
+			edited.WGPubKey = cur.WGPubKey
+		}
+		if edited.WGPeerPriv == "" {
+			edited.WGPeerPriv = cur.WGPeerPriv
+		}
+		if edited.WGPeerPub == "" {
+			edited.WGPeerPub = cur.WGPeerPub
+		}
+		cur = normalizeSpoofWGConfig(&edited)
+	}
+	if cur.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+		cur.PeerPublicIP = srv.IP
+	}
+
+	var msg string
+	var bundleOut string
+
+	switch action {
+	case "install_binary":
+		msg = installedMsg
+
+	case "bundle":
+		bStr, err := makeSpoofWGBundle(cur, "")
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bundleOut = bStr
+		msg = "Generated spf1_ bundle for foreign server"
+
+	case "import":
+		imported, err := importSpoofWGBundle(req.Bundle, cur)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur = imported
+		bundleOut = cur.LastBundle
+		msg = fmt.Sprintf("Imported bundle (%s/%s, %s ↔ %s)",
+			cur.SendTransport, cur.RecvTransport, cur.WGLocalIP, cur.WGPeerIP)
+
+	case "up", "apply":
+		outMsg, err := applyLinuxSpoofAndWGServices(cur)
+		if err != nil {
+			cur.LastError = err.Error()
+			srv.Tunnels[tIdx].SpoofWG = cur
+			_ = saveConfig(configPath(), appCfg)
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur.LastError = ""
+		msg = outMsg
+
+	case "down", "stop":
+		stopLinuxSpoofAndWGServices(cur)
+		cur.LastError = ""
+		msg = "Spoof + WireGuard services stopped"
+
+	case "restart":
+		msg = "Spoof + WireGuard carrier listener restarted"
+
+	case "tester_start":
+		if req.TesterReq == nil {
+			stateMu.Unlock()
+			http.Error(w, "tester_req is required", http.StatusBadRequest)
+			return
+		}
+		tReq := *req.TesterReq
+		if tReq.DstIP == "" {
+			tReq.DstIP = cur.PeerPublicIP
+		}
+		if err := startSpoofTesterProcess(tReq); err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msg = fmt.Sprintf("Spoof IP Tester started in %s mode (%s)", tReq.Mode, strings.ToUpper(tReq.Protocol))
+
+	case "tester_stop":
+		stopSpoofTesterProcess()
+		msg = "Spoof IP Tester stopped"
+
+	case "tester_clear":
+		clearSpoofTesterStatus()
+		msg = "Spoof IP Tester results cleared"
+
+	default:
+		stateMu.Unlock()
+		http.Error(w, "unknown action", http.StatusBadRequest)
+		return
+	}
+
+	cur.Health = querySpoofWGRuntimeHealth(cur)
+	cur.Tester = getSpoofTesterStatusView()
+	srv.Tunnels[tIdx].SpoofWG = cur
+	peerCopy := *srv
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	if action == "up" || action == "apply" || action == "import" || action == "restart" {
+		syncServerListeners(peerCopy)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK      bool              `json:"ok"`
+		Message string            `json:"message"`
+		Bundle  string            `json:"bundle,omitempty"`
+		SpoofWG *SpoofWGConfig    `json:"spoof_wg"`
+		Health  SpoofWGHealth     `json:"health"`
+		Tester  SpoofTesterStatus `json:"tester"`
+	}{
+		OK:      true,
+		Message: msg,
+		Bundle:  bundleOut,
+		SpoofWG: cur,
+		Health:  cur.Health,
+		Tester:  cur.Tester,
+	})
+}
+
+func handleSpoofNativeAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID    string              `json:"server_id"`
+		Action      string              `json:"action"`
+		Bundle      string              `json:"bundle,omitempty"`
+		SpoofNative *SpoofNativeConfig  `json:"spoof_native,omitempty"`
+		TesterReq   *SpoofTesterRequest `json:"tester_req,omitempty"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+
+	var installedMsg string
+	if action == "install_binary" {
+		m, err := installOfficialSpoofBinary()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		installedMsg = m
+	}
+
+	stateMu.Lock()
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	tIdx := -1
+	for i := range srv.Tunnels {
+		if srv.Tunnels[i].ID == 27 {
+			tIdx = i
+			break
+		}
+	}
+	if tIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "Method 27 (Native Spoof Engine) not found", http.StatusNotFound)
+		return
+	}
+
+	cur := normalizeSpoofNativeConfig(srv.Tunnels[tIdx].SpoofNative)
+	if req.SpoofNative != nil {
+		edited := *req.SpoofNative
+		if edited.WGPrivKey == "" {
+			edited.WGPrivKey = cur.WGPrivKey
+		}
+		if edited.WGPubKey == "" {
+			edited.WGPubKey = cur.WGPubKey
+		}
+		if edited.WGPeerPriv == "" {
+			edited.WGPeerPriv = cur.WGPeerPriv
+		}
+		if edited.WGPeerPub == "" {
+			edited.WGPeerPub = cur.WGPeerPub
+		}
+		if edited.NoisePrivKey == "" {
+			edited.NoisePrivKey = cur.NoisePrivKey
+		}
+		if edited.NoisePubKey == "" {
+			edited.NoisePubKey = cur.NoisePubKey
+		}
+		if edited.NoisePeerPriv == "" {
+			edited.NoisePeerPriv = cur.NoisePeerPriv
+		}
+		if edited.NoisePeerPub == "" {
+			edited.NoisePeerPub = cur.NoisePeerPub
+		}
+		cur = normalizeSpoofNativeConfig(&edited)
+	}
+	if cur.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+		cur.PeerPublicIP = srv.IP
+	}
+
+	var msg string
+	var bundleOut string
+	needVerifyProbe := false
+
+	switch action {
+	case "save":
+		msg = fmt.Sprintf("Method 27 (%s) settings saved", strings.ToUpper(cur.Mode))
+
+	case "install_binary":
+		msg = installedMsg
+
+	case "bundle":
+		bStr, err := makeSpoofNativeBundle(cur, "")
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bundleOut = bStr
+		msg = fmt.Sprintf("Generated Method 27 (%s) m27spf1_ bundle", strings.ToUpper(cur.Mode))
+
+	case "import":
+		imported, err := importSpoofNativeBundle(req.Bundle, cur)
+		if err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.SpoofNative != nil && len(req.SpoofNative.SpoofIPs) > 0 {
+			imported.SpoofIPs = cleanSpoofIPs(req.SpoofNative.SpoofIPs)
+		}
+		cur = imported
+		bundleOut = cur.LastBundle
+		msg = fmt.Sprintf("Imported Method 27 bundle (Mode: %s, %s/%s)",
+			strings.ToUpper(cur.Mode), cur.SendTransport, cur.RecvTransport)
+
+	case "up", "apply":
+		outMsg, err := applyLinuxSpoofNativeServices(cur)
+		if err != nil {
+			cur.LastError = err.Error()
+			srv.Tunnels[tIdx].SpoofNative = cur
+			_ = saveConfig(configPath(), appCfg)
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		cur.LastError = ""
+		msg = outMsg
+		needVerifyProbe = true
+
+	case "down", "stop":
+		stopLinuxSpoofNativeServices(cur)
+		cur.LastError = ""
+		recordSpoofNativeVerification(srv.ID, cur.Mode, "", 0, 100, "Stopped by user")
+		msg = "Method 27 (spoof-core-m27) services stopped"
+
+	case "restart":
+		msg = "Method 27 adapter listener restarted"
+		needVerifyProbe = true
+
+	case "verify_pipe":
+		needVerifyProbe = true
+		msg = "Running end-to-end Spoof Pipe verification..."
+
+	case "tester_start":
+		if req.TesterReq == nil {
+			stateMu.Unlock()
+			http.Error(w, "tester_req is required", http.StatusBadRequest)
+			return
+		}
+		tReq := *req.TesterReq
+		if tReq.DstIP == "" {
+			tReq.DstIP = cur.PeerPublicIP
+		}
+		if err := startSpoofM27TesterProcess(tReq); err != nil {
+			stateMu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		msg = fmt.Sprintf("Method 27 Spoof IP Tester started in %s mode (%s)", tReq.Mode, strings.ToUpper(tReq.Protocol))
+
+	case "tester_stop":
+		stopSpoofM27TesterProcess()
+		msg = "Method 27 Spoof IP Tester stopped"
+
+	case "tester_clear":
+		clearSpoofM27TesterStatus()
+		msg = "Method 27 Spoof IP Tester results cleared"
+
+	default:
+		stateMu.Unlock()
+		http.Error(w, "unknown Method 27 action", http.StatusBadRequest)
+		return
+	}
+
+	srv.Tunnels[tIdx].SpoofNative = cur
+	peerCopy := *srv
+	tcCopy := srv.Tunnels[tIdx]
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	if action == "up" || action == "apply" || action == "import" || action == "restart" || action == "save" {
+		syncServerListeners(peerCopy)
+	}
+
+	if needVerifyProbe {
+		res := probeSpoofNative(peerCopy, tcCopy, appCfg.NodeID)
+		stateMu.Lock()
+		for i := range appCfg.Servers {
+			if appCfg.Servers[i].ID == peerCopy.ID {
+				for j := range appCfg.Servers[i].Tunnels {
+					if appCfg.Servers[i].Tunnels[j].ID == 27 {
+						appCfg.Servers[i].Tunnels[j].LastDiscovery = res
+						break
+					}
+				}
+				_ = saveConfig(configPath(), appCfg)
+				break
+			}
+		}
+		stateMu.Unlock()
+		if action == "verify_pipe" {
+			if res.Success {
+				msg = fmt.Sprintf("End-to-End Spoof Pipe Verified (%dms RTT)", res.LatencyMS)
+			} else {
+				msg = fmt.Sprintf("Spoof Pipe Verification Failed: %s", res.ErrorReason)
+			}
+		}
+	}
+
+	cur.Health = querySpoofNativeRuntimeHealth(peerCopy.ID, cur)
+	cur.Tester = getSpoofM27TesterStatusView()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK          bool               `json:"ok"`
+		Message     string             `json:"message"`
+		Bundle      string             `json:"bundle,omitempty"`
+		SpoofNative *SpoofNativeConfig `json:"spoof_native"`
+		Health      SpoofNativeHealth  `json:"health"`
+		Tester      SpoofTesterStatus  `json:"tester"`
+	}{
+		OK:          true,
+		Message:     msg,
+		Bundle:      bundleOut,
+		SpoofNative: cur,
+		Health:      cur.Health,
+		Tester:      cur.Tester,
+	})
+}
+
+func handleTunnelsUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string       `json:"server_id"`
+		Tunnel   TunnelConfig `json:"tunnel"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.Lock()
+	if appCfg.Role != "master" {
+		stateMu.Unlock()
+		http.Error(w, "tunnels are read-only on agent nodes", http.StatusForbidden)
+		return
+	}
+
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	for i := range srv.Tunnels {
+		if srv.Tunnels[i].ID == req.Tunnel.ID {
+			prevDiscovery := srv.Tunnels[i].LastDiscovery
+			updated := req.Tunnel
+			if updated.ListenPort < 1024 || updated.ListenPort > 65535 {
+				updated.ListenPort = srv.Tunnels[i].ListenPort
+			}
+			if updated.ID == 25 && updated.GREFRP != nil {
+				if updated.GREFRP.FRPServerPort >= 1024 && updated.GREFRP.FRPServerPort <= 65535 {
+					updated.ListenPort = updated.GREFRP.FRPServerPort
+				} else {
+					updated.GREFRP.FRPServerPort = updated.ListenPort
+				}
+				if err := validateGREFRPConfiguration(updated.GREFRP, updated.ListenPort); err != nil {
+					stateMu.Unlock()
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				updated.ForwardPorts = syncForwardPortsCSVFromRules(updated.GREFRP)
+				updated.GREFRP = normalizeGREFRPConfig(updated.GREFRP, updated.ListenPort, updated.ForwardPorts)
+			}
+			if updated.ID == 26 {
+				prevSpoof := normalizeSpoofWGConfig(srv.Tunnels[i].SpoofWG)
+				if updated.SpoofWG != nil {
+					if updated.SpoofWG.WGPrivKey == "" {
+						updated.SpoofWG.WGPrivKey = prevSpoof.WGPrivKey
+					}
+					if updated.SpoofWG.WGPeerPriv == "" {
+						updated.SpoofWG.WGPeerPriv = prevSpoof.WGPeerPriv
+					}
+				}
+				updated.SpoofWG = normalizeSpoofWGConfig(updated.SpoofWG)
+				if updated.SpoofWG.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					updated.SpoofWG.PeerPublicIP = srv.IP
+				}
+				updated.SpoofWG.Health = querySpoofWGRuntimeHealth(updated.SpoofWG)
+				updated.SpoofWG.Tester = getSpoofTesterStatusView()
+			}
+			if updated.ID == 27 {
+				prevNat := normalizeSpoofNativeConfig(srv.Tunnels[i].SpoofNative)
+				if updated.SpoofNative != nil {
+					if updated.SpoofNative.WGPrivKey == "" {
+						updated.SpoofNative.WGPrivKey = prevNat.WGPrivKey
+					}
+					if updated.SpoofNative.WGPeerPriv == "" {
+						updated.SpoofNative.WGPeerPriv = prevNat.WGPeerPriv
+					}
+					if updated.SpoofNative.NoisePrivKey == "" {
+						updated.SpoofNative.NoisePrivKey = prevNat.NoisePrivKey
+					}
+					if updated.SpoofNative.NoisePeerPriv == "" {
+						updated.SpoofNative.NoisePeerPriv = prevNat.NoisePeerPriv
+					}
+				}
+				updated.SpoofNative = normalizeSpoofNativeConfig(updated.SpoofNative)
+				if updated.SpoofNative.PeerPublicIP == "" && isValidIPv4String(srv.IP) {
+					updated.SpoofNative.PeerPublicIP = srv.IP
+				}
+				updated.SpoofNative.Health = querySpoofNativeRuntimeHealth(srv.ID, updated.SpoofNative)
+				updated.SpoofNative.Tester = getSpoofM27TesterStatusView()
+			}
+			if strings.TrimSpace(updated.SpeedLimitMBps) == "" {
+				updated.SpeedLimitMBps = "0"
+			}
+			updated.Name = srv.Tunnels[i].Name
+			updated.Security = srv.Tunnels[i].Security
+			updated.TrafficType = srv.Tunnels[i].TrafficType
+			updated.Implemented = srv.Tunnels[i].Implemented
+			updated.LastDiscovery = prevDiscovery
+			srv.Tunnels[i] = updated
+			if srv.ActiveMethodID == updated.ID {
+				srv.ActivePort = updated.ListenPort
+			}
+			break
+		}
+	}
+
+	srv.ConfigVersion++
+	srv.SyncState = "pending_sync"
+	if tok, err := generatePeerToken(appCfg, *srv); err == nil {
+		srv.Token = tok
+	}
+	newVer := srv.ConfigVersion
+	newToken := srv.Token
+	peerCopy := *srv
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	syncServerListeners(peerCopy)
+	go func() {
+		for _, tc := range peerCopy.Tunnels {
+			if tc.Implemented {
+				if pushParitySyncOverMethod(peerCopy, tc, peerCopy.ActiveLatencyMS) {
+					return
+				}
+			}
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK            bool   `json:"ok"`
+		ConfigVersion int    `json:"config_version"`
+		Token         string `json:"token"`
+	}{
+		OK:            true,
+		ConfigVersion: newVer,
+		Token:         newToken,
+	})
+}
+
+type batchPortItem struct {
+	ID           int    `json:"id"`
+	ListenPort   int    `json:"listen_port"`
+	ForwardPorts string `json:"forward_ports,omitempty"`
+}
+
+func handleBatchPortsUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ServerID string          `json:"server_id"`
+		Items    []batchPortItem `json:"items"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.Lock()
+	if appCfg.Role != "master" {
+		stateMu.Unlock()
+		http.Error(w, "ports can only be edited on the master node", http.StatusForbidden)
+		return
+	}
+
+	sIdx := -1
+	for i := range appCfg.Servers {
+		if appCfg.Servers[i].ID == req.ServerID {
+			sIdx = i
+			break
+		}
+	}
+	if sIdx < 0 {
+		stateMu.Unlock()
+		http.Error(w, "server not found", http.StatusNotFound)
+		return
+	}
+
+	byID := make(map[int]batchPortItem, len(req.Items))
+	for _, item := range req.Items {
+		byID[item.ID] = item
+	}
+
+	srv := &appCfg.Servers[sIdx]
+	for i := range srv.Tunnels {
+		tid := srv.Tunnels[i].ID
+		if upd, ok := byID[tid]; ok {
+			if upd.ListenPort >= 1024 && upd.ListenPort <= 65535 {
+				srv.Tunnels[i].ListenPort = upd.ListenPort
+				if srv.Tunnels[i].ID == 25 && srv.Tunnels[i].GREFRP != nil {
+					srv.Tunnels[i].GREFRP.FRPServerPort = upd.ListenPort
+				}
+				if srv.ActiveMethodID == tid {
+					srv.ActivePort = upd.ListenPort
+				}
+			}
+			if strings.TrimSpace(upd.ForwardPorts) != "" {
+				srv.Tunnels[i].ForwardPorts = strings.TrimSpace(upd.ForwardPorts)
+			}
+		}
+	}
+
+	srv.ConfigVersion++
+	srv.SyncState = "pending_sync"
+	if tok, err := generatePeerToken(appCfg, *srv); err == nil {
+		srv.Token = tok
+	}
+	newVer := srv.ConfigVersion
+	newToken := srv.Token
+	peerCopy := *srv
+	_ = saveConfig(configPath(), appCfg)
+	stateMu.Unlock()
+
+	syncServerListeners(peerCopy)
+	go func() {
+		for _, tc := range peerCopy.Tunnels {
+			if tc.Implemented {
+				if pushParitySyncOverMethod(peerCopy, tc, peerCopy.ActiveLatencyMS) {
+					return
+				}
+			}
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		OK            bool   `json:"ok"`
+		ConfigVersion int    `json:"config_version"`
+		Token         string `json:"token"`
+	}{
+		OK:            true,
+		ConfigVersion: newVer,
+		Token:         newToken,
+	})
+}
+
+func handleAnalytics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sampleAnalyticsTick()
+	analyticsMu.Lock()
+	days := make([]DailyUsage, len(analyticsData.Days))
+	copy(days, analyticsData.Days)
+	analyticsMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(struct {
+		Days []DailyUsage `json:"days"`
+	}{Days: days})
+}
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isHTTPS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.WriteString(w, `{"status":"ok"}`)
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "unknown"
+	}
+	peerIP := net.ParseIP(host)
+	if peerIP == nil {
+		return "unknown"
+	}
+	if peerIP.IsLoopback() {
+		forwarded := r.Header.Get("X-Forwarded-For")
+		if forwarded != "" {
+			candidate := strings.TrimSpace(strings.Split(forwarded, ",")[0])
+			if ip := net.ParseIP(candidate); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	return peerIP.String()
+}
+
+func allowLogin(ip string) bool {
+	loginMu.Lock()
+	defer loginMu.Unlock()
+
+	now := time.Now()
+	recent := make([]time.Time, 0)
+	for _, t := range loginAttempts[ip] {
+		if now.Sub(t) < 10*time.Minute {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= 5 {
+		loginAttempts[ip] = recent
+		return false
+	}
+	recent = append(recent, now)
+	loginAttempts[ip] = recent
+
+	for key, attempts := range loginAttempts {
+		if key == ip {
+			continue
+		}
+		active := false
+		for _, attempt := range attempts {
+			if now.Sub(attempt) < 10*time.Minute {
+				active = true
+				break
+			}
+		}
+		if !active {
+			delete(loginAttempts, key)
+		}
+	}
+	return true
+}
+
+func createSession() (string, error) {
+	token, err := randomHex(32)
+	if err != nil {
+		return "", err
+	}
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	now := time.Now()
+	for key, session := range sessions {
+		if now.After(session.ExpiresAt) {
+			delete(sessions, key)
+		}
+	}
+	sessions[token] = Session{ExpiresAt: now.Add(sessionTTL)}
+	return token, nil
+}
+
+func validSession(r *http.Request) bool {
+	cookie, err := r.Cookie("sahand_session")
+	if err != nil {
+		return false
+	}
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
+	session, ok := sessions[cookie.Value]
+	if !ok {
+		return false
+	}
+	if time.Now().After(session.ExpiresAt) {
+		delete(sessions, cookie.Value)
+		return false
+	}
+	return true
+}
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !validSession(r) {
+			if strings.HasPrefix(r.URL.Path, "/api/") {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if validSession(r) {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, loginHTML)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ip := clientIP(r)
+	if !allowLogin(ip) {
+		http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+
+	cfg, _, err := loadExistingConfig(configPath())
+	if err != nil {
+		http.Error(w, "configuration error", http.StatusInternalServerError)
+		return
+	}
+
+	username := r.FormValue("username")
+	password := r.FormValue("password")
+	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(cfg.AdminUsername)) == 1
+	passOK := verifyPassword(password, cfg.AdminSalt, cfg.AdminHash)
+	if !userOK || !passOK {
+		time.Sleep(500 * time.Millisecond)
+		http.Error(w, "invalid username or password", http.StatusUnauthorized)
+		return
+	}
+
+	token, err := createSession()
+	if err != nil {
+		http.Error(w, "could not create session", http.StatusInternalServerError)
+		return
+	}
+	secure := isHTTPS(r)
+	http.SetCookie(w, &http.Cookie{
+		Name: "sahand_session", Value: token, Path: "/",
+		HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode,
+		Expires: time.Now().Add(sessionTTL), MaxAge: int(sessionTTL.Seconds()),
+	})
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if cookie, err := r.Cookie("sahand_session"); err == nil {
+		sessionsMu.Lock()
+		delete(sessions, cookie.Value)
+		sessionsMu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: "sahand_session", Value: "", Path: "/",
+		HttpOnly: true, Secure: isHTTPS(r),
+		SameSite: http.SameSiteStrictMode, MaxAge: -1,
+	})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+func handleDashboard(w http.ResponseWriter, r *http.Request, dist fs.FS) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	index, err := fs.ReadFile(dist, "index.html")
+	if err != nil {
+		http.Error(w, "dashboard frontend is unavailable", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(index)
+}
+
+const loginHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sahand Tunnel - Login</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#eef2ff;font-family:Arial,sans-serif}
+.card{width:min(420px,92%);padding:34px;background:#151d32;border:1px solid #293653;border-radius:18px}
+h1{margin:0 0 8px;font-size:25px}
+p{color:#aab6ce;margin-bottom:26px}
+label{display:block;margin:16px 0 7px;color:#cbd5e1;font-size:14px}
+input{width:100%;padding:13px;border-radius:9px;border:1px solid #34435f;background:#0c1427;color:white;font-size:15px}
+button{width:100%;margin-top:24px;padding:13px;border:0;border-radius:9px;background:#3977f6;color:white;font-weight:bold;font-size:15px;cursor:pointer}
+.small{margin-top:20px;text-align:center;font-size:12px;color:#7787a6}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Sahand Tunnel</h1>
+<p>Sign in to your server dashboard.</p>
+<form method="post" action="/login">
+<label>Username</label>
+<input name="username" autocomplete="username" required>
+<label>Password</label>
+<input name="password" type="password" autocomplete="current-password" required>
+<button type="submit">Sign in</button>
+</form>
+<div class="small">Server management</div>
+</div>
+</body>
+</html>`
