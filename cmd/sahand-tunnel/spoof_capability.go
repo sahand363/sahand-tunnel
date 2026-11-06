@@ -199,14 +199,16 @@ func buildSpoofProbeSuite(realSenderIP string, candidateIPs []string) []string {
 	var list []string
 
 	for _, raw := range candidateIPs {
-		ip := cleanSpoofHost(raw)
-		if isValidIPv4String(ip) && !seen[ip] {
-			seen[ip] = true
-			list = append(list, ip)
+		for _, part := range strings.Split(raw, ",") {
+			ip := cleanSpoofHost(part)
+			if isValidIPv4String(ip) && !seen[ip] {
+				seen[ip] = true
+				list = append(list, ip)
+			}
 		}
 	}
 
-	defaults := []string{"8.8.8.8", "1.1.1.1", "172.67.150.10", deriveSameSlash24NeighborIP(own)}
+	defaults := []string{"172.67.150.10", "1.1.1.1", "8.8.8.8", deriveSameSlash24NeighborIP(own)}
 	for _, d := range defaults {
 		if isValidIPv4String(d) && !seen[d] {
 			seen[d] = true
@@ -242,7 +244,7 @@ func runExactIptablesSNATPingTest(targetIP, spoofIP string) int {
 		_ = exec.Command("iptables", delRule...).Run()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
 	defer cancel()
 	_ = exec.CommandContext(ctx, pingBin, "-c", "2", "-i", "0.2", "-W", "1", targetIP).Run()
 	return 2
@@ -297,8 +299,12 @@ func sendMultiMethodCapabilityProbes(candidates []string, targetIP string, targe
 		}
 	}
 
-	for _, ipStr := range candidates {
-		sent += runExactIptablesSNATPingTest(targetIP, ipStr)
+	maxSNAT := 3
+	if len(candidates) < maxSNAT {
+		maxSNAT = len(candidates)
+	}
+	for i := 0; i < maxSNAT; i++ {
+		sent += runExactIptablesSNATPingTest(targetIP, candidates[i])
 	}
 
 	return sent
@@ -332,7 +338,7 @@ func captureMultiProtocolProbes(uConn *net.UDPConn, magicPrefix string, candidat
 		if ip != "" && !ipSet[ip] {
 			ipSet[ip] = true
 			res.WorkingSpoofIPs = append(res.WorkingSpoofIPs, ip)
-			if strings.Contains(ip, ".233") || strings.Contains(ip, ".234") {
+			if strings.HasSuffix(ip, ".233") || strings.HasSuffix(ip, ".234") {
 				res.SameSub24Supported = true
 			} else {
 				res.ExternalSupported = true
@@ -527,6 +533,7 @@ func openTemporaryUDPVerifyListener(preferredPort int) (*net.UDPConn, int, func(
 
 type spoofCapWireMsg struct {
 	Step         string               `json:"step"`
+	SpoofIP      string               `json:"spoof_ip,omitempty"`
 	CandidateIPs []string             `json:"candidate_ips,omitempty"`
 	ProbePort    int                  `json:"probe_port,omitempty"`
 	MagicHex     string               `json:"magic_hex,omitempty"`
@@ -615,7 +622,8 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 	}
 	defer cleanup()
 
-	candidates := buildSpoofProbeSuite(remoteMasterIP, initMsg.CandidateIPs)
+	inList := append([]string{initMsg.SpoofIP}, initMsg.CandidateIPs...)
+	candidates := buildSpoofProbeSuite(remoteMasterIP, inList)
 	magicPrefix1 := "SPFV1_" + initMsg.MagicHex
 
 	capCh1 := make(chan multiProtoCaptureResult, 1)
@@ -651,7 +659,8 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 		targetMasterIP = cleanSpoofHost(remoteMasterIP)
 	}
 	agentOwnIP := resolveOutboundInterfaceIP(targetMasterIP).String()
-	candidates2 := buildSpoofProbeSuite(agentOwnIP, phase2Msg.CandidateIPs)
+	inList2 := append([]string{phase2Msg.SpoofIP}, phase2Msg.CandidateIPs...)
+	candidates2 := buildSpoofProbeSuite(agentOwnIP, inList2)
 	magicPrefix2 := "SPFV2_" + phase2Msg.MagicHex
 
 	sent2 := sendMultiMethodCapabilityProbes(candidates2, targetMasterIP, phase2Msg.ProbePort, magicPrefix2)
@@ -663,7 +672,16 @@ func handleSpoofCapAgentSession(conn net.Conn, remoteMasterIP string, rt *spoofW
 	})
 }
 
-func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []string) (SpoofCapabilityReport, error) {
+// Accepts `rawSpoofIPs string` (single IP or comma-separated list of IPs)
+// so it compiles cleanly with `server.go`'s `RunBidirectionalSpoofCapabilityVerify(*peerSnapshot, spoofIP)`.
+func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, rawSpoofIPs string) (SpoofCapabilityReport, error) {
+	var candidateIPs []string
+	for _, p := range strings.Split(rawSpoofIPs, ",") {
+		if clean := cleanSpoofHost(p); isValidIPv4String(clean) {
+			candidateIPs = append(candidateIPs, clean)
+		}
+	}
+
 	var tc26 TunnelConfig
 	found := false
 	for _, t := range peer.Tunnels {
@@ -739,6 +757,7 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []strin
 
 	if err := enc.Encode(spoofCapWireMsg{
 		Step:         "init",
+		SpoofIP:      rawSpoofIPs,
 		CandidateIPs: candidates1,
 		MagicHex:     magicHex1,
 	}); err != nil {
@@ -754,6 +773,7 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []strin
 	if tc26.SpoofWG != nil && isValidIPv4String(tc26.SpoofWG.LocalPublicIP) {
 		masterPubIP = cleanSpoofHost(tc26.SpoofWG.LocalPublicIP)
 	}
+	candidates1 = buildSpoofProbeSuite(masterPubIP, candidateIPs)
 	magicPrefix1 := "SPFV1_" + magicHex1
 
 	sent1 := sendMultiMethodCapabilityProbes(candidates1, strings.TrimSpace(peer.IP), readyMsg.ProbePort, magicPrefix1)
@@ -780,7 +800,7 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []strin
 
 	magicHex2, _ := randomHex(6)
 	magicPrefix2 := "SPFV2_" + magicHex2
-	candidates2 := buildSpoofProbeSuite(masterPubIP, candidateIPs)
+	candidates2 := buildSpoofProbeSuite(strings.TrimSpace(peer.IP), candidateIPs)
 
 	capCh2 := make(chan multiProtoCaptureResult, 1)
 	go func() {
@@ -789,6 +809,7 @@ func RunBidirectionalSpoofCapabilityVerify(peer ServerPeer, candidateIPs []strin
 
 	if err := enc.Encode(spoofCapWireMsg{
 		Step:         "send_now",
+		SpoofIP:      rawSpoofIPs,
 		CandidateIPs: candidates2,
 		ProbePort:    boundPort2,
 		MagicHex:     magicHex2,
